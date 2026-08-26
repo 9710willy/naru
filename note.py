@@ -5,6 +5,8 @@
     note search "context budget"
     note outline
     note show 12 18
+    note prune [days] [--dry-run]   # default 30; deletes older rows + index
+    note gc                          # remove orphaned blob dirs
 
 Notes and hook-spilled tool output share ~/.scroll/log.db (override with
 SCROLL_DB). Recall prints
@@ -15,7 +17,7 @@ session costs a few hundred tokens instead of everything you ever wrote.
 import os
 import pathlib
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from ms import DEFAULT_DB, MemorySurface
@@ -102,6 +104,55 @@ def main(argv):
             print(f"--- [{r.seq}] {r.created_at} | {r.session_id}")
             print(r.content)
 
+    elif cmd == "prune":
+        days = int(args[0]) if args and args[0].isdigit() else 30
+        dry = "--dry-run" in args or "-n" in args
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+        doomed = ms.sql_query(
+            "SELECT COUNT(*) n, COALESCE(SUM(LENGTH(content)),0) b FROM"
+            " conversation_history WHERE created_at IS NOT NULL AND"
+            " created_at < ?",
+            (cutoff,),
+        )[0]
+        kept = ms.sql_query(
+            "SELECT COUNT(*) n FROM conversation_history WHERE created_at IS"
+            " NULL OR created_at >= ?",
+            (cutoff,),
+        )[0]
+        print(f"cutoff {cutoff[:10]} (older than {days} days)")
+        print(f"  would remove : {doomed.n} rows, {doomed.b:,} chars")
+        print(f"  would keep   : {kept.n} rows")
+        if dry:
+            print("  --dry-run: nothing deleted")
+            return 0
+        if not doomed.n:
+            return 0
+        removed = ms.prune(cutoff)
+        print(f"  removed {removed} rows, index cleaned, database vacuumed")
+
+    elif cmd == "gc":
+        # Orphaned blob directories from before the hook stopped writing them.
+        import shutil
+        import tempfile
+
+        live = {
+            r.payload_path
+            for r in ms.sql_query(
+                "SELECT payload_path FROM conversation_history"
+                " WHERE payload_path IS NOT NULL"
+            )
+        }
+        freed = n = 0
+        for d in pathlib.Path(tempfile.gettempdir()).glob("scroll-blobs-*"):
+            if not d.is_dir():
+                continue
+            if any(str(f) in live for f in d.iterdir()):
+                continue  # still referenced by a row
+            freed += sum(f.stat().st_size for f in d.iterdir() if f.is_file())
+            shutil.rmtree(d, ignore_errors=True)
+            n += 1
+        print(f"removed {n} orphaned blob dir(s), freed {freed / 1024:.0f} KB")
+
     else:
         print(f"unknown command {cmd!r}\n{__doc__}", file=sys.stderr)
         return 2
@@ -156,6 +207,27 @@ def demo():
     # unknown command and empty input are rejected, not silently accepted
     assert main(["bogus"]) == 2
     assert main(["add"]) == 2
+
+    # prune removes old rows AND their FTS entries; recent rows survive
+    old = ms.append("tool", "ANCIENTMARKER payload", kind="tool_result",
+                    created_at="2000-01-01T00:00:00")
+    assert ms.search("ANCIENTMARKER"), "should be findable before prune"
+    removed = ms.prune("2001-01-01T00:00:00")
+    assert removed == 1, removed
+    assert ms.search("ANCIENTMARKER") == [], "FTS index not cleaned by prune"
+    assert ms.expand(old) == [], "row survived prune"
+    assert ms.search("eviction"), "prune must not touch recent rows"
+
+    # a missing blob must not break recovery — content column is authoritative
+    import tempfile as _tf
+    ms2 = MemorySurface(str(pathlib.Path(_tf.mkdtemp()) / "b.db"))
+    big = "FULLTEXT " + "z" * 5000
+    s2 = ms2.append("tool", big, created_at="2026-01-01T00:00", payload=big)
+    row = ms2.sql_query("SELECT payload_path FROM conversation_history WHERE seq=?",
+                        (s2,))[0]
+    pathlib.Path(row.payload_path).unlink()          # simulate a /var/folders purge
+    got = ms2.expand(s2)[0].content
+    assert got.startswith("FULLTEXT"), "recovery broke when the blob vanished"
 
     print("ok — note checks passed")
 

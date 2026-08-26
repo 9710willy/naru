@@ -87,14 +87,38 @@ class MemorySurface:
                 content    TEXT,
                 payload_path TEXT         -- externalized big payloads
             );
-            CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(content, content='');
+            CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
+                content, content='conversation_history', content_rowid='seq');
         """)
+        self._migrate_fts()
         # per-instance by default: bench.py runs questions in parallel
         # threads and a shared dir would collide on blobs/<seq>.txt
         self.blobs = pathlib.Path(
             blobs or pathlib.Path(tempfile.gettempdir()) / f"scroll-blobs-{id(self):x}"
         )
         self.blob_threshold = blob_threshold
+
+    def _migrate_fts(self):
+        """Upgrade a store created with a contentless FTS table.
+
+        The original schema used content='' , which SQLite refuses to DELETE
+        from, so the index could never be pruned. An external-content table
+        reads text from conversation_history, which makes both DELETE and
+        'rebuild' available. The content column is authoritative, so rebuilding
+        the index loses nothing.
+        """
+        sql = self.db.execute(
+            "SELECT sql FROM sqlite_master WHERE name='fts'"
+        ).fetchone()
+        if not sql or "content='conversation_history'" in (sql["sql"] or ""):
+            return
+        self.db.executescript("""
+            DROP TABLE IF EXISTS fts;
+            CREATE VIRTUAL TABLE fts USING fts5(
+                content, content='conversation_history', content_rowid='seq');
+        """)
+        self.db.execute("INSERT INTO fts(fts) VALUES('rebuild')")
+        self.db.commit()
 
     # ---- ingest -----------------------------------------------------------
     def append(
@@ -209,10 +233,55 @@ class MemorySurface:
         out = []
         for r in rows:
             row = Row(r)
-            if row.get("payload_path"):
-                row["content"] = pathlib.Path(row["payload_path"]).read_text()
+            p = row.get("payload_path")
+            if p:
+                # The row's own content column is authoritative; a blob is an
+                # optimization. Never let a missing blob break recovery — the
+                # whole promise is that nothing is lost.
+                try:
+                    row["content"] = pathlib.Path(p).read_text()
+                except OSError:
+                    pass
             out.append(row)
         return out
+
+    def prune(self, before_iso, drop_blobs=True):
+        """Delete rows created before `before_iso`. Returns rows removed.
+
+        The FTS table is contentless, so its rows must be deleted explicitly —
+        a plain DELETE on conversation_history leaves the index holding orphan
+        entries that occupy space forever. Blob files are removed too.
+        """
+        doomed = self.db.execute(
+            "SELECT seq, payload_path FROM conversation_history"
+            " WHERE created_at IS NOT NULL AND created_at < ?",
+            (before_iso,),
+        ).fetchall()
+        if not doomed:
+            return 0
+        seqs = [r["seq"] for r in doomed]
+        if drop_blobs:
+            for r in doomed:
+                if r["payload_path"]:
+                    try:
+                        f = pathlib.Path(r["payload_path"])
+                        f.unlink(missing_ok=True)
+                        if f.parent.name.startswith("scroll-blobs-") and not any(
+                            f.parent.iterdir()
+                        ):
+                            f.parent.rmdir()
+                    except OSError:
+                        pass
+        marks = ",".join("?" * len(seqs))
+        self.db.execute(
+            f"DELETE FROM conversation_history WHERE seq IN ({marks})", seqs
+        )
+        # Rebuild rather than delete row-by-row: the index is derived from the
+        # base table, so one rebuild is simpler and self-heals any drift.
+        self.db.execute("INSERT INTO fts(fts) VALUES('rebuild')")
+        self.db.commit()
+        self.db.execute("VACUUM")
+        return len(seqs)
 
     # ---- COMPUTE (read-only SQL) -----------------------------------------
     def sql_query(self, sql, params=()):

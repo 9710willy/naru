@@ -104,7 +104,9 @@ def main():
             + " "
             + str(event.get("tool_name", "tool")),
             created_at=datetime.now().isoformat(timespec="seconds"),
-            payload=text,
+            # No payload=: the content column already holds the full text.
+            # Passing it would store the same bytes twice and leave the copy in
+            # a temp directory macOS may purge, breaking recovery.
         )
     except Exception as e:  # never break the user's tool call over a spill
         print(f"scroll spill failed, output left inline: {e}", file=sys.stderr)
