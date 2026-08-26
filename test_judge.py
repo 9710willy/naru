@@ -77,8 +77,29 @@ CASES = [
         "with basil and mint, like a caprese-style spread.",
         True,
     ),
+    # --- abstention (_abs) questions: 6% of the benchmark. Gold says the fact
+    # is absent AND names the near-miss. A candidate that correctly abstains
+    # must pass even if it does not reproduce the near-miss detail.
+    ("What is the name of my hamster?",
+     "You did not mention this information. You mentioned your cat Luna but not your hamster.",
+     "You never mentioned a hamster in our conversations.", True),
+    ("What is the name of my hamster?",
+     "You did not mention this information. You mentioned your cat Luna but not your hamster.",
+     "I don't have that - you've mentioned a cat named Luna, but never a hamster.", True),
+    ("How long have I been collecting vintage films?",
+     "You did not mention this information. You mentioned collecting vintage cameras but not vintage films.",
+     "There's no mention of vintage films. You did talk about collecting vintage cameras.", True),
+    # confabulating an answer to an abstention question must be WRONG
+    ("What is the name of my hamster?",
+     "You did not mention this information. You mentioned your cat Luna but not your hamster.",
+     "Your hamster is named Luna.", False),
+    ("How many engineers do I lead as Software Engineer Manager?",
+     "The information provided is not enough. You mentioned starting the role as Senior Software Engineer but not Software Engineer Manager.",
+     "You lead 5 engineers.", False),
+    # abstaining on a question that DOES have an answer stays WRONG
+    ("How many new postcards have I added?", "25",
+     "You never mentioned how many postcards you added.", False),
 ]
-
 
 def main():
     be = Backend(model=HAIKU)

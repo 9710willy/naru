@@ -25,6 +25,11 @@ _BARE = [
     # 'tool_use'. We want a plain text completion.
     "--allowed-tools",
     "",
+    # Every call here is a full Claude Code session, so it fires the USER's
+    # hooks. With a Stop hook wired to a notifier, one n=48 run means 600+
+    # desktop notifications. A backend must not touch the user's environment.
+    "--settings",
+    json.dumps({"disableAllHooks": True}),
 ]
 
 

@@ -129,6 +129,14 @@ WRONG when the candidate:
     says it is absent
   - only names the topic without giving the asked-for fact
 
+ABSENCE GOLD. Some gold answers say the information was never provided, e.g.
+"You did not mention this information. You mentioned your cat Luna but not your
+hamster." For these the gold FACT is only the absence. A candidate is CORRECT as
+soon as it conveys that the asked-for thing was never mentioned. It does NOT
+need to reproduce the near-miss detail (the cat, the other role, the related
+item) — that is explanation, not the fact. A candidate that instead supplies a
+made-up value is WRONG.
+
 Grade the FACT, not the prose. Do not require the candidate's wording to
 resemble the gold answer's wording.
 
