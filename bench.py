@@ -174,6 +174,11 @@ def one(q, arm, model, judge_model, max_turns, budget, verbose, rubric=True):
         "seconds": round(elapsed, 1),
         "billed_input": be.usage.billed_input,
         "fresh_input": be.usage.input_tokens,
+        # cache creation bills ~1.25x base, cache reads ~0.1x — the full-context
+        # arm writes a fresh 124k history per question and never reuses it,
+        # which is where its cost actually goes.
+        "cache_creation": be.usage.cache_creation,
+        "cache_read": be.usage.cache_read,
         "output": be.usage.output_tokens,
         "cost": round(be.usage.cost_usd, 4),
         "judge_cost": round(jb.usage.cost_usd, 4),
