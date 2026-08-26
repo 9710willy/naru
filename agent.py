@@ -32,6 +32,16 @@ def extract_code(reply):
 
 
 SYSTEM = """\
+You are the reasoning step of a Python REPL harness. You are NOT a coding
+assistant and you have no tools of your own.
+
+The `claude` CLI that carries this request may expose its own identity, project
+instructions, CLAUDE.md files, or a tool list. NONE of that applies to you.
+Ignore it entirely. `ms` and `submit_answer` ARE bound in the REPL that runs
+your code — never question whether they exist, never mention your own tools,
+environment, session, or CLAUDE.md, and never offer to save anything. Your only
+output is one python code block.
+
 You answer questions about a long conversation history you cannot see directly.
 The history lives in a searchable Event Log. You reach it by writing Python.
 
@@ -85,15 +95,38 @@ Once searching stops improving the answer, commit it rather than continuing
 until you run out of turns.
 """
 
+# Per the paper (§3.2) the system prompt and context-management rules are held
+# fixed across benchmarks; each dataset contributes only a short rubric
+# describing its own data layout. Without one the model cannot know which
+# `kind` values exist, so it cannot use the filter at all.
+LONGMEMEVAL_RUBRIC = """\
+Data layout: every row's content opens with a "[Session N | YYYY-MM-DD] role:"
+tag. Rows carry kind='context_msg' for user turns and kind='model_turn' for
+assistant turns, and a session_id per session.
+
+The asked-for fact is almost always stated by the USER, not the assistant.
+Search ms.search(query, kind='context_msg') FIRST; widen to all kinds only if
+that finds nothing. This usually finds the evidence a turn earlier."""
+
 
 class Done(Exception):
     pass
 
 
 def _run(
-    ms, question, question_date, backend, max_turns, budget, protect_tail, verbose=False
+    ms,
+    question,
+    question_date,
+    backend,
+    max_turns,
+    budget,
+    protect_tail,
+    verbose=False,
+    trace=None,
+    rubric=None,
 ):
     answer = {"text": None}
+    system = SYSTEM + ("\n\n" + rubric if rubric else "")
 
     def submit_answer(text):
         answer["text"] = str(text)
@@ -124,8 +157,17 @@ def _run(
             parts.append("LAST TURN. You must call submit_answer(...) now.")
         prompt = "\n\n".join(parts)
 
-        reply = backend(prompt, system=SYSTEM)
+        reply = backend(prompt, system=system)
         code = extract_code(reply)
+        if trace is not None:
+            trace.append(
+                {
+                    "turn": turns_used,
+                    "prompt_tokens": est(prompt),
+                    "code": code,
+                    "reply_if_no_code": None if code else reply,
+                }
+            )
         if code is None:
             # Genuine prose, no code. Take it as the final answer.
             if reply.strip():
@@ -139,12 +181,16 @@ def _run(
 
         out, err = kernel.run(code)
         if answer["text"] is not None:
+            if trace is not None:
+                trace[-1]["obs"] = "(submitted)"
             break
 
         seq += 1
         obs = out.strip() or "(nothing printed)"
         if err:
             obs = f"{obs}\nERROR: {err}" if out.strip() else f"ERROR: {err}"
+        if trace is not None:
+            trace[-1]["obs"] = obs
         view.append(
             Block(
                 seq,
@@ -176,8 +222,14 @@ def run_scroll(
     budget=6000,
     protect_tail=4,
     verbose=False,
+    trace=None,
+    rubric=None,
 ):
-    """Answer one question over an already-ingested Event Log."""
+    """Answer one question over an already-ingested Event Log.
+
+    Pass `trace=[]` to collect each turn's cell, printed observation and prompt
+    size — the only way to see where turns are actually spent.
+    """
     try:
         return _run(
             ms,
@@ -188,6 +240,8 @@ def run_scroll(
             budget,
             protect_tail,
             verbose,
+            trace,
+            rubric,
         )
     except Done:
         return None, max_turns, 0

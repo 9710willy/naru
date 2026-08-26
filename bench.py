@@ -15,7 +15,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from agent import run_scroll
+from agent import LONGMEMEVAL_RUBRIC, run_scroll
 from backend import HAIKU, Backend, measure_floor
 from eviction import est
 from ms import MemorySurface
@@ -133,7 +133,7 @@ def judge(q, response, backend):
     return v.startswith("CORRECT")
 
 
-def one(q, arm, model, judge_model, max_turns, budget, verbose):
+def one(q, arm, model, judge_model, max_turns, budget, verbose, rubric=True):
     """Run a single question through one arm. Returns a result record."""
     be = Backend(model=model)
     t0 = time.time()
@@ -148,6 +148,7 @@ def one(q, arm, model, judge_model, max_turns, budget, verbose):
             max_turns=max_turns,
             budget=budget,
             verbose=verbose,
+            rubric=LONGMEMEVAL_RUBRIC if rubric else None,
         )
     else:
         hist = history_text(q)
@@ -235,6 +236,9 @@ def main():
     )
     ap.add_argument("--tag", default="run")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument(
+        "--no-rubric", action="store_true", help="ablate the per-dataset layout rubric"
+    )
     a = ap.parse_args()
 
     if a.harness_floor is None:
@@ -255,7 +259,15 @@ def main():
     with ThreadPoolExecutor(max_workers=a.workers) as ex:
         futs = {
             ex.submit(
-                one, q, arm, a.model, a.judge_model, a.max_turns, a.budget, a.verbose
+                one,
+                q,
+                arm,
+                a.model,
+                a.judge_model,
+                a.max_turns,
+                a.budget,
+                a.verbose,
+                not a.no_rubric,
             ): (q, arm)
             for q, arm in jobs
         }
