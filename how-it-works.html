@@ -1,0 +1,786 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Scroll — how the build works</title>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --panel: #171a21;
+        --panel2: #1f232c;
+        --line: #2a2f3a;
+        --ink: #e7eaf0;
+        --muted: #9aa4b2;
+        --dim: #6b7482;
+        --accent: #5b9dff;
+        --good: #3fbf8f;
+        --bad: #e0685f;
+        --warn: #e6b455;
+        --purple: #a78bfa;
+        --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        --sans:
+          system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial,
+          sans-serif;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f6f7f9;
+          --panel: #fff;
+          --panel2: #f0f2f5;
+          --line: #e2e6ec;
+          --ink: #1a1d23;
+          --muted: #5a6472;
+          --dim: #8b95a3;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font: 16px/1.65 var(--sans);
+        -webkit-font-smoothing: antialiased;
+      }
+      .wrap {
+        max-width: 940px;
+        margin: 0 auto;
+        padding: 44px 24px 90px;
+      }
+      .kicker {
+        color: var(--accent);
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        font-size: 12px;
+        margin-bottom: 8px;
+      }
+      h1 {
+        font-size: 32px;
+        line-height: 1.15;
+        margin: 0 0 10px;
+        letter-spacing: -0.02em;
+      }
+      h2 {
+        font-size: 21px;
+        margin: 46px 0 6px;
+        letter-spacing: -0.01em;
+      }
+      .sub {
+        color: var(--muted);
+        font-size: 14px;
+        margin: 0 0 14px;
+      }
+      h3 {
+        font-size: 12px;
+        margin: 0 0 10px;
+        color: var(--muted);
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .lede {
+        font-size: 18px;
+        color: var(--muted);
+        max-width: 72ch;
+      }
+      p {
+        max-width: 74ch;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 20px 22px;
+        margin: 16px 0;
+      }
+      .cols {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 14px;
+      }
+      .cols3 {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 14px;
+      }
+      @media (max-width: 700px) {
+        .cols,
+        .cols3 {
+          grid-template-columns: 1fr;
+        }
+      }
+      code {
+        font-family: var(--mono);
+        font-size: 0.9em;
+        background: var(--panel2);
+        padding: 1px 5px;
+        border-radius: 4px;
+        border: 1px solid var(--line);
+      }
+      pre {
+        background: var(--panel2);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 15px;
+        overflow: auto;
+        font-family: var(--mono);
+        font-size: 12.5px;
+        line-height: 1.55;
+        margin: 0;
+      }
+      pre code {
+        background: none;
+        border: none;
+        padding: 0;
+      }
+      .cmt {
+        color: var(--dim);
+      }
+      .kw {
+        color: var(--accent);
+      }
+      .str {
+        color: var(--good);
+      }
+      .hl {
+        color: var(--warn);
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 14px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 8px 11px;
+        border-bottom: 1px solid var(--line);
+      }
+      th {
+        color: var(--muted);
+        font-weight: 600;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      td.num {
+        font-family: var(--mono);
+        text-align: right;
+      }
+      .win {
+        color: var(--good);
+        font-weight: 700;
+      }
+      .lose {
+        color: var(--bad);
+      }
+      .note {
+        font-size: 13px;
+        color: var(--dim);
+        margin-top: 8px;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 7px 0;
+      }
+      .row .lbl {
+        width: 118px;
+        flex: none;
+        font-size: 12.5px;
+        color: var(--muted);
+        text-align: right;
+      }
+      .barwrap {
+        flex: 1;
+        display: flex;
+        align-items: center;
+      }
+      .bar {
+        height: 20px;
+        border-radius: 4px;
+        min-width: 2px;
+        position: relative;
+      }
+      .bar span {
+        position: absolute;
+        right: -8px;
+        top: 50%;
+        transform: translate(100%, -50%);
+        font-family: var(--mono);
+        font-size: 12px;
+        white-space: nowrap;
+        color: var(--ink);
+      }
+      .step {
+        display: flex;
+        gap: 12px;
+        align-items: flex-start;
+        margin: 12px 0;
+      }
+      .step .n {
+        flex: none;
+        width: 26px;
+        height: 26px;
+        border-radius: 50%;
+        background: var(--panel2);
+        border: 1px solid var(--line);
+        color: var(--accent);
+        font-family: var(--mono);
+        font-size: 12px;
+        display: grid;
+        place-items: center;
+        font-weight: 600;
+      }
+      .step .b {
+        font-size: 14.5px;
+      }
+      .step .b b {
+        color: var(--ink);
+      }
+      .pill {
+        display: inline-block;
+        font-family: var(--mono);
+        font-size: 11px;
+        padding: 2px 7px;
+        border-radius: 20px;
+        border: 1px solid var(--line);
+        background: var(--panel2);
+        color: var(--muted);
+      }
+      .pill.g {
+        color: var(--good);
+        border-color: var(--good);
+      }
+      .pill.r {
+        color: var(--bad);
+        border-color: var(--bad);
+      }
+      .box {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 13px 15px;
+        background: var(--panel2);
+      }
+      .box.out {
+        border-style: dashed;
+        opacity: 0.95;
+      }
+      .box h4 {
+        margin: 0 0 8px;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        font-weight: 600;
+      }
+      .mini {
+        font-size: 13.5px;
+        color: var(--muted);
+        line-height: 1.55;
+      }
+      .mini b {
+        color: var(--ink);
+      }
+      .mini code {
+        font-size: 12px;
+      }
+      .flowarrow {
+        text-align: center;
+        color: var(--dim);
+        font-family: var(--mono);
+        font-size: 12px;
+        margin: 8px 0;
+      }
+      .track {
+        display: flex;
+        gap: 0;
+        align-items: stretch;
+        margin: 14px 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+      }
+      .track div {
+        padding: 9px 8px;
+        font-size: 12px;
+        text-align: center;
+        flex: 1;
+        font-family: var(--mono);
+        border-right: 1px solid var(--line);
+      }
+      .track div:last-child {
+        border-right: none;
+      }
+      footer {
+        margin-top: 52px;
+        padding-top: 18px;
+        border-top: 1px solid var(--line);
+        color: var(--dim);
+        font-size: 13px;
+      }
+      a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+      .big {
+        font-family: var(--mono);
+        font-size: 26px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="kicker">What we built · /Users/willee1/work/scroll</div>
+      <h1>Scroll, explained by what the code actually does</h1>
+      <p class="lede">
+        One idea: the conversation history never enters the prompt. It lives in
+        a database. The model writes Python to reach it, and only what it prints
+        comes back.
+      </p>
+
+      <!-- ============ 1. THE MENTAL MODEL ============ -->
+      <h2>1 · The mental model</h2>
+      <p class="sub">
+        Two zones. Everything hinges on which zone your data sits in.
+      </p>
+
+      <div class="card">
+        <div class="cols">
+          <div class="box out">
+            <h4>Outside the prompt — free</h4>
+            <div class="mini">
+              <p>
+                <b>Event Log</b> — SQLite table, one row per turn, each with a
+                stable address <code>seq</code>. Full-text searchable.
+              </p>
+              <pre><code>seq 1  user  "I drive a blue Subaru"
+seq 2  asst  "Nice car!"
+ …  487 turns, 47 sessions …</code></pre>
+              <p style="margin-top: 10px">
+                <b>Python kernel</b> — variables survive between model calls.
+              </p>
+              <pre><code>flights = [ …1,200 rows… ]
+bulk    = [ …40 hits… ]</code></pre>
+            </div>
+          </div>
+          <div class="box">
+            <h4>Inside the prompt — you pay, every turn</h4>
+            <div class="mini">
+              <pre><code>Question: What car do I drive?
+
+<span class="cmt">resident: bulk: list[40]</span>   <span class="hl">← digest, not data</span>
+
+[obs 2]
+&lt;seq 1 user: I drive a blue Subaru&gt;
+
+<span class="cmt">--- evicted ---</span>
+  [3-18] ms.expand(3,18)   <span class="hl">← pointer</span></code></pre>
+              <p style="margin-top: 12px">
+                <span class="pill g">97 tokens</span> instead of 124,609.
+              </p>
+            </div>
+          </div>
+        </div>
+        <p class="note">
+          The kernel holds a 40-row result. The prompt learns only that it
+          exists and how big it is. That single gap is the whole technique.
+        </p>
+      </div>
+
+      <!-- ============ 2. WHY IT SAVES ============ -->
+      <h2>2 · Why this saves anything</h2>
+      <p class="sub">
+        Because an LLM call is stateless — the harness re-sends the whole
+        conversation every single turn.
+      </p>
+
+      <div class="card">
+        <h3>A 7,000-token page read once, on turn 5</h3>
+        <div class="row">
+          <div class="lbl">turn 5 · read</div>
+          <div class="barwrap">
+            <div class="bar" style="width: 72%; background: var(--bad)">
+              <span>7k</span>
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="lbl">turn 6 · re-sent</div>
+          <div class="barwrap">
+            <div class="bar" style="width: 72%; background: var(--bad)">
+              <span>7k</span>
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="lbl">turn 7 · re-sent</div>
+          <div class="barwrap">
+            <div class="bar" style="width: 72%; background: var(--bad)">
+              <span>7k</span>
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="lbl">…all session</div>
+          <div class="barwrap">
+            <div class="bar" style="width: 72%; background: var(--bad)">
+              <span>7k …</span>
+            </div>
+          </div>
+        </div>
+        <div style="height: 14px"></div>
+        <div class="row">
+          <div class="lbl" style="color: var(--good)">with Scroll</div>
+          <div class="barwrap">
+            <div class="bar" style="width: 3%; background: var(--good)">
+              <span>~300 · flat</span>
+            </div>
+          </div>
+        </div>
+        <p class="note">
+          It also stops the context <i>window</i> filling with stale text — the
+          harder limit, and the one that quietly wrecks accuracy.
+        </p>
+      </div>
+
+      <!-- ============ 3. THE TURN LOOP ============ -->
+      <h2>3 · One turn, start to finish</h2>
+      <p class="sub">
+        This loop is <code>agent.py</code>. Four moves, repeated.
+      </p>
+
+      <div class="card">
+        <div class="step">
+          <div class="n">1</div>
+          <div class="b">
+            <b>Build a small working view.</b> Question + what's resident in the
+            kernel + the last few observations + the eviction index. Typically
+            100–1,500 tokens.
+          </div>
+        </div>
+        <div class="step">
+          <div class="n">2</div>
+          <div class="b">
+            <b>Model replies with one Python cell.</b> No prose, just code.
+          </div>
+        </div>
+        <div class="step">
+          <div class="n">3</div>
+          <div class="b">
+            <b>The kernel runs it.</b> Searches hit the log. Big results bind to
+            <i>variables</i> and stay there.
+          </div>
+        </div>
+        <div class="step">
+          <div class="n">4</div>
+          <div class="b">
+            <b>Only <code>print()</code> output returns</b> as the next
+            observation. Loop until the model calls
+            <code>submit_answer()</code>.
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>What the model writes — the four verbs</h3>
+        <pre><code><span class="cmt"># LOCATE — BM25 over the log, falls back to OR if AND finds nothing</span>
+hits = ms.<span class="kw">search</span>(<span class="str">"Subaru"</span>, k=<span class="kw">5</span>)
+
+<span class="cmt"># NAVIGATE — when the question's words don't appear in the history at all</span>
+<span class="kw">print</span>(ms.<span class="kw">outline</span>())          <span class="cmt"># 47 sessions, 1 line each</span>
+
+<span class="cmt"># MATERIALIZE — recover an exact span, verbatim, from any address</span>
+turns = ms.<span class="kw">expand</span>(<span class="kw">87</span>, <span class="kw">912</span>)
+
+<span class="cmt"># COMPUTE — plain Python; nothing here costs a token</span>
+best = min(turns, key=<span class="kw">lambda</span> t: t.created_at)
+
+<span class="cmt"># EXPOSE — the ONLY line that costs anything</span>
+<span class="kw">print</span>(best.content)</code></pre>
+      </div>
+
+      <!-- ============ 4. EVICTION ============ -->
+      <h2>4 · The part that isn't just "summarize"</h2>
+      <p class="sub">
+        Eviction shrinks the <i>view</i>, never the <i>record</i>.
+      </p>
+
+      <div class="card">
+        <div class="cols">
+          <div>
+            <h3 class="lose">Compaction (everyone else)</h3>
+            <div class="mini">
+              <pre><code>turns 3-18  ──►  "user discussed
+                  travel plans"
+
+original text: <span style="color:var(--bad)">GONE</span></code></pre>
+              <p style="margin-top: 10px">
+                You chose what mattered <b>before</b> you knew the question.
+                Wrong guess = unrecoverable.
+              </p>
+            </div>
+          </div>
+          <div>
+            <h3 class="win">Scroll's eviction</h3>
+            <div class="mini">
+              <pre><code>turns 3-18  ──►  [3-18] travel plans
+                 ms.expand(3,18)
+
+original text: <span style="color:var(--good)">still in the log</span></code></pre>
+              <p style="margin-top: 10px">
+                The pointer is the point. Any evicted span is one call from
+                coming back <b>verbatim</b>.
+              </p>
+            </div>
+          </div>
+        </div>
+        <p class="note">
+          The index is tiered so it can't grow linearly. Measured in
+          <code>eviction.py</code>:
+          <b>60 evictions → 10 index entries, 4 tiers</b>.
+        </p>
+      </div>
+
+      <!-- ============ 5. HILLCLIMB ============ -->
+      <h2>5 · Hillclimbing it on LongMemEval</h2>
+      <p class="sub">
+        Real runs, real judge. 12 questions, oracle split, Haiku 4.5.
+      </p>
+
+      <div class="card">
+        <div class="row">
+          <div class="lbl">v1 baseline</div>
+          <div class="barwrap">
+            <div class="bar" style="width: 50%; background: var(--bad)">
+              <span>50.0%</span>
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="lbl">v2 plumbing</div>
+          <div class="barwrap">
+            <div class="bar" style="width: 50%; background: var(--warn)">
+              <span>50.0%</span>
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="lbl">v3 navigation</div>
+          <div class="barwrap">
+            <div class="bar" style="width: 83.3%; background: var(--good)">
+              <span>83.3%</span>
+            </div>
+          </div>
+        </div>
+
+        <table style="margin-top: 20px">
+          <tr>
+            <th>Version</th>
+            <th>What changed</th>
+            <th class="num">Score</th>
+          </tr>
+          <tr>
+            <td>v1</td>
+            <td>first working end-to-end run</td>
+            <td class="num">50.0%</td>
+          </tr>
+          <tr>
+            <td>v2</td>
+            <td>retry empty CLI replies; execute unfenced code cells</td>
+            <td class="num">50.0%</td>
+          </tr>
+          <tr>
+            <td>v3</td>
+            <td>
+              <b>+ <code>ms.outline()</code></b
+              >, + auto-OR search fallback
+            </td>
+            <td class="num win">83.3%</td>
+          </tr>
+        </table>
+        <p class="note">
+          v2 fixed real bugs but moved the score zero — it traded old failures
+          for new ones. Honest result, kept in the record.
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>The find that produced the jump</h3>
+        <div class="mini">
+          <p>
+            Three questions failed with the agent insisting the fact wasn't
+            there. It was. The question said <b>"homegrown ingredients"</b>; the
+            conversation said <b>"basil"</b> and <b>"cherry tomatoes"</b>.
+          </p>
+          <pre><code>ms.search(<span class="str">"homegrown"</span>)   <span class="cmt">→ 0 hits   (word never appears)</span>
+ms.search(<span class="str">"basil"</span>)       <span class="cmt">→ 3 hits</span>
+ms.outline()             <span class="cmt">→ "…recipe ideas that use fresh</span>
+                         <span class="cmt">    basil and mint…"  ← found it</span></code></pre>
+          <p style="margin-top: 10px">
+            Lexical search can't bridge a vocabulary gap. So we gave it a
+            structural map instead — the same outline-then-expand move the paper
+            calls <i>navigation anchors</i>. <b>+33 points.</b>
+          </p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>What's still failing, and why it's not the harness</h3>
+        <div class="mini">
+          <p>
+            2 of 12 remain. One is a flaky empty reply from the CLI. The other:
+            the agent claimed <code>search('Kg2')</code> and
+            <code>search('Bd5')</code> returned nothing, then gave up.
+          </p>
+          <pre><code>ms.search(<span class="str">"Kg2"</span>) → <span class="hl">3 hits</span>    <span class="cmt">the agent said 0</span>
+ms.search(<span class="str">"Bd5"</span>) → <span class="hl">3 hits</span>    <span class="cmt">the agent said 0</span></code></pre>
+          <p style="margin-top: 10px">
+            The search layer was correct. The model hallucinated the failure.
+            That is the paper's own finding — weaker backbones
+            <i>"commit more execution errors or terminate prematurely"</i> — not
+            a bug we can patch in the harness.
+          </p>
+        </div>
+      </div>
+
+      <!-- ============ 6. HONEST SCOREBOARD ============ -->
+      <h2>6 · Where Scroll wins, and where it doesn't</h2>
+
+      <div class="card">
+        <h3>Oracle split — history is only 5.6k tokens</h3>
+        <table>
+          <tr>
+            <th>Arm</th>
+            <th class="num">Accuracy</th>
+            <th class="num">Net input / q</th>
+            <th class="num">View size</th>
+          </tr>
+          <tr>
+            <td>full context</td>
+            <td class="num win">100%</td>
+            <td class="num">15,140</td>
+            <td class="num">5,669t</td>
+          </tr>
+          <tr>
+            <td>scroll (v3)</td>
+            <td class="num">83.3%</td>
+            <td class="num lose">100,206</td>
+            <td class="num win">1,310t</td>
+          </tr>
+        </table>
+        <p class="note">
+          <b>Full context wins here, and it should.</b> A 5.6k history fits in
+          one prompt with room to spare, so there is no pressure to relieve —
+          and Scroll pays for multiple turns to reach the same facts. Reporting
+          this is the point: a technique that only ever looks good is being
+          measured wrong.
+        </p>
+      </div>
+
+      <div class="card" style="border-color: var(--accent)">
+        <h3>Where the claim actually lives — the <code>_s</code> split</h3>
+        <div class="mini">
+          <div class="track">
+            <div>history<br /><b style="color: var(--bad)">124,609t</b></div>
+            <div>487 turns<br />47 sessions</div>
+            <div>outline<br /><b style="color: var(--good)">1,444t</b></div>
+            <div>ratio<br /><b style="color: var(--good)">86× smaller</b></div>
+          </div>
+          <p>
+            Every question carries ~125k tokens of history. Full context must
+            ship all of it, every turn. Scroll ships an outline and a few
+            printed lines. <b>This run is executing now</b> — numbers land when
+            it finishes.
+          </p>
+        </div>
+      </div>
+
+      <!-- ============ 7. FILES ============ -->
+      <h2>7 · The code</h2>
+      <div class="card">
+        <table>
+          <tr>
+            <th>File</th>
+            <th>Job</th>
+            <th>Its own check</th>
+          </tr>
+          <tr>
+            <td><code>ms.py</code></td>
+            <td>Event Log: search / outline / expand / sql_query</td>
+            <td class="win">passes</td>
+          </tr>
+          <tr>
+            <td><code>kernel.py</code></td>
+            <td>persistent namespace, exec, print capture</td>
+            <td class="win">passes</td>
+          </tr>
+          <tr>
+            <td><code>eviction.py</code></td>
+            <td>Algorithm 1 + tiered index</td>
+            <td class="win">passes</td>
+          </tr>
+          <tr>
+            <td><code>agent.py</code></td>
+            <td>the turn loop + system prompt</td>
+            <td class="win">passes</td>
+          </tr>
+          <tr>
+            <td><code>backend.py</code></td>
+            <td>model calls via the <code>claude</code> CLI</td>
+            <td class="win">live</td>
+          </tr>
+          <tr>
+            <td><code>bench.py</code></td>
+            <td>LongMemEval ingest → judge → score</td>
+            <td class="win">running</td>
+          </tr>
+        </table>
+        <p class="note">
+          Stdlib only — no pip install. Every file runs its own check with
+          <code>python3 &lt;file&gt;</code>; the first four need no network.
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>Swapping the model</h3>
+        <div class="mini">
+          <p>
+            Only <code>backend.py</code> knows about Claude, and its whole
+            contract is one function:
+          </p>
+          <pre><code><span class="kw">def</span> backend(prompt: str, system: str | <span class="kw">None</span>) -> str</code></pre>
+          <p style="margin-top: 10px">
+            Codex CLI (<code>codex exec</code>), an OpenAI or Gemini SDK call, a
+            local Ollama endpoint — anything matching that signature drops in.
+            The paper swaps six different backbones with the harness held fixed.
+          </p>
+        </div>
+      </div>
+
+      <footer>
+        Implementation of
+        <i
+          >Context as an Environment: Programmatic Context Management for
+          Long-Horizon Agents</i
+        >, Lin et al.,
+        <a href="https://arxiv.org/abs/2608.21690">arXiv&nbsp;2608.21690</a>.
+        Benchmark:
+        <a href="https://github.com/xiaowu0162/LongMemEval">LongMemEval</a>
+        (ICLR&nbsp;2025). Scores above are from our own runs with Haiku&nbsp;4.5
+        and an LLM judge that is <b>not</b> the benchmark's official judge
+        prompt — they are indicative of our own progress, not comparable to
+        published leaderboard numbers.
+      </footer>
+    </div>
+  </body>
+</html>

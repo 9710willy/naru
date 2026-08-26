@@ -1,0 +1,6 @@
+data/
+results/
+__pycache__/
+.ruff_cache/
+blobs/
+*.db
