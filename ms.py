@@ -15,10 +15,19 @@ Interface follows the Appendix-C spec of arXiv 2608.21690:
 Stdlib only. No embeddings, no service, deterministic.
 """
 
+import os
 import pathlib
 import sqlite3
 import tempfile
 from datetime import date
+
+# ONE Event Log for everything the session wants to recall later: notes written
+# by `note add`, and tool output spilled by the PostToolUse hook. They differ
+# only by `kind`. Two stores would mean the recovery handle a spill prints
+# (`note show N`) points at a database `note` does not read.
+DEFAULT_DB = pathlib.Path(
+    os.environ.get("SCROLL_DB", pathlib.Path.home() / ".scroll" / "log.db")
+)
 
 
 class Row(dict):

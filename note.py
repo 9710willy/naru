@@ -6,7 +6,8 @@
     note outline
     note show 12 18
 
-Notes go to ~/.scroll/notes.db (override with SCROLL_NOTES). Recall prints
+Notes and hook-spilled tool output share ~/.scroll/log.db (override with
+SCROLL_DB). Recall prints
 matching lines only, never the whole store, so pulling a fact back into a
 session costs a few hundred tokens instead of everything you ever wrote.
 """
@@ -17,11 +18,9 @@ import sys
 from datetime import datetime
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from ms import MemorySurface
+from ms import DEFAULT_DB, MemorySurface
 
-DB = pathlib.Path(
-    os.environ.get("SCROLL_NOTES", pathlib.Path.home() / ".scroll" / "notes.db")
-)
+DB = pathlib.Path(os.environ.get("SCROLL_NOTES", DEFAULT_DB))
 
 
 def store():

@@ -24,14 +24,14 @@ import json
 import os
 import pathlib
 import sys
+from datetime import datetime
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from ms import DEFAULT_DB
 
 THRESHOLD = int(os.environ.get("SCROLL_SPILL_THRESHOLD", "2000"))  # chars
 KEEP = int(os.environ.get("SCROLL_SPILL_PREVIEW", "600"))  # chars kept inline
-DB = pathlib.Path(
-    os.environ.get("SCROLL_SPILL_DB", pathlib.Path.home() / ".scroll" / "spill.db")
-)
+DB = pathlib.Path(os.environ.get("SCROLL_SPILL_DB", DEFAULT_DB))
 
 # Text-bearing fields, in the order tools tend to use them.
 TEXT_FIELDS = ("stdout", "content", "output", "text", "result", "stderr")
@@ -65,9 +65,22 @@ def outline(text, every=40):
 
 def main():
     try:
-        event = json.load(sys.stdin)
+        raw = sys.stdin.read()
+        event = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return 0  # not our business; pass through untouched
+
+    # SCROLL_SPILL_DEBUG=<path> records the real event shape. Claude Code's
+    # per-tool response schemas are not documented, and a replacement that does
+    # not match the tool's schema is discarded silently, so the shape has to be
+    # observed rather than assumed.
+    dbg = os.environ.get("SCROLL_SPILL_DEBUG")
+    if dbg:
+        try:
+            with open(dbg, "a") as fh:
+                fh.write(raw[:20000] + "\n---\n")
+        except OSError:
+            pass
 
     resp = event.get("tool_response")
     found = find_text(resp)
@@ -90,7 +103,7 @@ def main():
             session_id=str(event.get("session_id", "?"))[:16]
             + " "
             + str(event.get("tool_name", "tool")),
-            created_at=None,
+            created_at=datetime.now().isoformat(timespec="seconds"),
             payload=text,
         )
     except Exception as e:  # never break the user's tool call over a spill
