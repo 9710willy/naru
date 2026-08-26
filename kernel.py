@@ -10,13 +10,30 @@ import io
 import traceback
 
 
+def _provenance(v):
+    """Which Event Log addresses a resident value derives from.
+
+    Section 2.2 requires resident objects to carry "type, size, and provenance
+    metadata identifying the events it derives from". Log rows expose .seq, so
+    a container of rows reports its seq range and the model can go straight
+    back to the source without re-searching.
+    """
+    items = list(v)[:200] if isinstance(v, (list, tuple)) else []
+    seqs = [i["seq"] for i in items
+            if isinstance(i, dict) and isinstance(i.get("seq"), int)]
+    if not seqs:
+        return ""
+    lo, hi = min(seqs), max(seqs)
+    return f" from seq {lo}" if lo == hi else f" from seq {lo}-{hi}"
+
+
 def _shape(v):
     """Compact type+size description for the namespace digest."""
     t = type(v).__name__
     if isinstance(v, (str, bytes)):
         return f"{t}[{len(v)}]"
     if isinstance(v, (list, tuple, set, dict)):
-        return f"{t}[{len(v)}]"
+        return f"{t}[{len(v)}]{_provenance(v)}"
     if isinstance(v, (int, float, bool)) or v is None:
         return f"{t}={v!r}"[:40]
     return t

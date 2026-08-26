@@ -81,6 +81,7 @@ class MemorySurface:
             CREATE TABLE IF NOT EXISTS conversation_history(
                 seq        INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT,
+                agent_id   TEXT,
                 role       TEXT,
                 kind       TEXT,
                 created_at TEXT,          -- ISO-8601, lexically sortable
@@ -128,6 +129,7 @@ class MemorySurface:
         *,
         kind=None,
         session_id=None,
+        agent_id=None,
         created_at=None,
         payload=None,
     ):
@@ -141,9 +143,9 @@ class MemorySurface:
         big = payload is not None and len(payload) > self.blob_threshold
         cur = self.db.execute(
             "INSERT INTO conversation_history"
-            "(session_id, role, kind, created_at, content, payload_path)"
-            " VALUES(?,?,?,?,?,?)",
-            (session_id, role, kind, created_at, content, None),
+            "(session_id, agent_id, role, kind, created_at, content, payload_path)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (session_id, agent_id, role, kind, created_at, content, None),
         )
         seq = cur.lastrowid
 
@@ -151,7 +153,14 @@ class MemorySurface:
             self.blobs.mkdir(parents=True, exist_ok=True)
             path = str(self.blobs / f"{seq}.txt")
             pathlib.Path(path).write_text(payload)
-            content = f"{content}\n[payload {len(payload)} chars -> ms.expand({seq})]"
+            # Section 2.2: an externalized payload leaves the ROW holding a
+            # bounded preview and a recovery pointer — not the whole payload.
+            # Keeping both stored the same bytes twice.
+            preview = payload[: self.blob_threshold].rstrip()
+            content = (
+                f"{preview}\n[payload {len(payload)} chars, preview only "
+                f"-> ms.expand({seq})]"
+            )
             self.db.execute(
                 "UPDATE conversation_history SET content=?, payload_path=? WHERE seq=?",
                 (content, path, seq),
@@ -161,8 +170,19 @@ class MemorySurface:
         self.db.commit()
         return seq
 
+    def readonly(self):
+        """A capability-restricted view for the kernel.
+
+        The paper (section 2.2) requires the Event Log to be read-only from the
+        kernel. Handing the model the MemorySurface itself does not satisfy
+        that: `ms.db.execute("DELETE FROM conversation_history")` destroys the
+        history the whole design promises is recoverable. This facade exposes
+        only the four Table-1 operations and carries no database handle.
+        """
+        return ReadOnly(self)
+
     # ---- LOCATE -----------------------------------------------------------
-    def search(self, query, k=5, kind=None):
+    def search(self, query, k=5, kind=None, since=None, until=None):
         """BM25 full-text search over the log. Returns hits ranked best-first,
         each a Row carrying the full turn plus its seq/role/metadata.
 
@@ -171,18 +191,27 @@ class MemorySurface:
         the turn that answers it, and a silent zero-hit AND is the single
         biggest source of lost evidence.
         """
-        hits = self._match(_to_match(query), k, kind)
+        hits = self._match(_to_match(query), k, kind, since, until)
         terms = [t for t in query.split() if t not in ("OR", "AND", "NOT")]
         if not hits and len(terms) > 1:
-            hits = self._match(" OR ".join(_to_match(t) for t in terms), k, kind)
+            hits = self._match(
+                " OR ".join(_to_match(t) for t in terms), k, kind, since, until
+            )
         return hits
 
-    def _match(self, match_expr, k, kind):
+    def _match(self, match_expr, k, kind, since=None, until=None):
         where = ["fts MATCH ?"]
         params = [match_expr]
         if kind is not None:
             where.append("c.kind = ?")
             params.append(kind)
+        # created_at is ISO-8601, so lexical comparison is date comparison
+        if since is not None:
+            where.append("c.created_at >= ?")
+            params.append(str(since))
+        if until is not None:
+            where.append("c.created_at <= ?")
+            params.append(str(until))
         params.append(k)
         sql = (
             f"SELECT c.* FROM fts JOIN conversation_history c ON c.seq = fts.rowid "
@@ -303,6 +332,43 @@ class MemorySurface:
         return abs((b - a).days)
 
 
+
+class ReadOnly:
+    """Capability-restricted Event Log view handed to the kernel.
+
+    Section 2.2: "Model-authored code runs in a fail-closed sandbox: the Event
+    Log is read-only from the kernel." Exposes exactly the Table-1 operations
+    plus the documented helpers, and deliberately carries no `db` attribute, so
+    model code has no path to a writable connection.
+    """
+
+    __slots__ = ("_ms",)
+
+    def __init__(self, ms):
+        object.__setattr__(self, "_ms", ms)
+
+    def search(self, query, k=5, kind=None, since=None, until=None):
+        return self._ms.search(query, k=k, kind=kind, since=since, until=until)
+
+    def expand(self, lo, hi=None):
+        return self._ms.expand(lo, hi)
+
+    def outline(self, preview=90):
+        return self._ms.outline(preview=preview)
+
+    def sql_query(self, sql, params=()):
+        return self._ms.sql_query(sql, params)
+
+    def days_between(self, d1, d2):
+        return MemorySurface.days_between(d1, d2)
+
+    def __setattr__(self, k, v):
+        raise AttributeError("the Event Log is read-only from the kernel")
+
+    def __repr__(self):
+        return "<ms: read-only Event Log (search/expand/outline/sql_query)>"
+
+
 # ---------------------------------------------------------------------------
 def demo():
     """Runnable self-check. Fails loudly if any core behavior breaks."""
@@ -401,6 +467,39 @@ def demo():
 
     # date helper
     assert ms.days_between("2024-07-01", "2024-07-31") == 30
+
+    # Table 1: time filters on LOCATE
+    assert ms.search("economy", since="2024-07-01")[0].seq == 1
+    assert ms.search("economy", since="2024-08-01") == [], "since= not applied"
+    assert ms.search("toll", until="2024-07-01") == [], "until= not applied"
+    assert ms.search("toll", until="2024-12-31"), "until= too strict"
+
+    # section 2.2: agent/session identifiers are recorded
+    a = ms.append("user", "multi-agent turn", agent_id="agent-7",
+                  session_id="s2", created_at="2024-08-01T00:00:00")
+    assert ms.expand(a)[0].agent_id == "agent-7"
+
+    # section 2.2: the Event Log is READ-ONLY from the kernel
+    ro = ms.readonly()
+    assert ro.search("economy")[0].seq == 1
+    assert ro.expand(1)[0].content
+    assert not hasattr(ro, "db"), "read-only view must not expose a connection"
+    assert not hasattr(ro, "append"), "read-only view must not expose append"
+    for attempt in ("db", "append", "anything"):
+        try:
+            setattr(ro, attempt, 1)
+            raise AssertionError(f"managed to set {attempt} on the read-only view")
+        except AttributeError:
+            pass
+
+    # section 2.2: an externalized payload leaves a BOUNDED PREVIEW in the row,
+    # not a second full copy
+    huge = "P" * 40000
+    hs = ms.append("tool", "ignored", payload=huge, created_at="2024-08-02T00:00:00")
+    row_len = ms.sql_query(
+        "SELECT LENGTH(content) c FROM conversation_history WHERE seq=?", (hs,))[0].c
+    assert row_len < len(huge) / 4, f"row still holds {row_len} of {len(huge)} chars"
+    assert len(ms.expand(hs)[0].content) == len(huge), "full payload not recoverable"
 
     # repr stays small (token-frugal)
     assert len(repr(hits[0])) < 140

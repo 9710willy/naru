@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from agent import LONGMEMEVAL_RUBRIC, run_scroll
 from backend import HAIKU, Backend, measure_floor
-from eviction import est
+from eviction import est, rollup
 from ms import MemorySurface
 
 DATA = pathlib.Path(__file__).parent / "data"
@@ -66,24 +66,55 @@ def sessions(q):
     )
 
 
-def ingest(q):
-    """Build the Event Log for one question: every haystack session, in
-    chronological order, one row per turn."""
+def ingest(q, build_index=True):
+    """Build the Event Log for one question, session by session.
+
+    Section 3.3: "we ingest each conversation history into Scroll session by
+    session, in chronological order. At each session boundary, the raw context
+    is cleared, and only Scroll's internal state (the eviction index and the
+    Event Log) is carried forward."
+
+    Returns (ms, index). The index is the tiered eviction index built as each
+    session's raw context is cleared — the landmarks the agent starts with,
+    rather than starting blind. Passing build_index=False reproduces the
+    earlier behaviour, for ablation.
+    """
     ms = MemorySurface(":memory:")
+    index = []
     for i, (date, sid, turns) in enumerate(sessions(q), 1):
         stamp = iso(date)
+        lo = hi = None
+        first_user = None
         for t in turns:
             role = t.get("role", "user")
             # session/date tag inline so lexical search can hit it too
             body = f"[Session {i} | {stamp[:10]}] {role}: {t.get('content', '')}"
-            ms.append(
+            seq = ms.append(
                 role,
                 body,
                 kind="context_msg" if role == "user" else "model_turn",
                 session_id=sid,
                 created_at=stamp,
             )
-    return ms
+            lo = seq if lo is None else lo
+            hi = seq
+            if first_user is None and role == "user":
+                first_user = t.get("content", "")
+
+        if build_index and lo is not None:
+            # Session boundary: the raw context is cleared and its landmark
+            # enters the eviction index, anchored to the exact seq span.
+            index.append([]) if not index else None
+            index[0].append(
+                {
+                    "lo": lo,
+                    "hi": hi,
+                    "headline": f"session {i} | {stamp[:10]} | "
+                    f"{first_user.strip()[:70] if first_user else ''}",
+                }
+            )
+            rollup(index, 4)
+    return ms, index
 
 
 def history_text(q):
@@ -167,13 +198,14 @@ def judge(q, response, backend, votes=3):
     return yes > (votes // 2)
 
 
-def one(q, arm, model, judge_model, max_turns, budget, verbose, rubric=True):
+def one(q, arm, model, judge_model, max_turns, budget, verbose, rubric=True,
+        no_index=False):
     """Run a single question through one arm. Returns a result record."""
     be = Backend(model=model)
     t0 = time.time()
 
     if arm == "scroll":
-        ms = ingest(q)
+        ms, index = ingest(q, build_index=not no_index)
         ans, turns, peak = run_scroll(
             ms,
             q["question"],
@@ -183,6 +215,7 @@ def one(q, arm, model, judge_model, max_turns, budget, verbose, rubric=True):
             budget=budget,
             verbose=verbose,
             rubric=LONGMEMEVAL_RUBRIC if rubric else None,
+            index=index,
         )
     else:
         hist = history_text(q)
@@ -307,6 +340,7 @@ def main():
                 a.budget,
                 a.verbose,
                 not a.no_rubric,
+                a.no_index,
             ): (q, arm)
             for q, arm in jobs
         }

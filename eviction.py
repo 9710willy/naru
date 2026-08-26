@@ -6,6 +6,8 @@ agent aware of history it can no longer see, anchored to the exact addresses it
 can re-materialize from.
 """
 
+import re
+
 TOK = 4  # chars per token, rough
 
 
@@ -72,10 +74,22 @@ def rollup(index, k):
             )
             lo = min(e["lo"] for e in old)
             hi = max(e["hi"] for e in old)
+            # "collapse to one line each and merge into the next tier" — one
+            # line still has to carry signal. A bare span count tells the agent
+            # nothing about whether a region is worth expanding, which defeats
+            # the purpose of a navigation anchor.
+            gist = "; ".join(
+                # drop any "N spans:" prefix a lower tier already added, or
+                # re-merging nests it: "3 spans: 3 spans: 3 spans: ..."
+                re.sub(r"^\d+ spans:\s*", "", e["headline"].split("|")[-1].strip())[:26]
+                for e in old
+            ).strip("; ")[:110]
             merged = {
                 "lo": lo,
                 "hi": hi,
-                "headline": f"{len(old)} spans, seq {lo}-{hi}",
+                "headline": f"{len(old)} spans: {gist}"
+                if gist
+                else f"{len(old)} spans, seq {lo}-{hi}",
             }
             if t + 1 == len(index):
                 index.append([])

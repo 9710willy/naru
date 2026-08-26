@@ -51,7 +51,9 @@ the kernel across turns, so bind large results to variables instead of printing
 them.
 
 Pre-bound API:
-  ms.search(query, k=5, kind=None)   -> list of hits, best-first (BM25).
+  ms.search(query, k=5, kind=None, since=None, until=None)
+        -> list of hits, best-first (BM25). since/until bound created_at
+        (ISO dates), e.g. ms.search('mass', since='2023-01-01').
         Terms AND-combine, falling back to OR if that finds nothing. Each hit
         already carries the FULL turn text plus .seq, .role, .created_at,
         .session_id.
@@ -132,6 +134,7 @@ def _run(
     verbose=False,
     trace=None,
     rubric=None,
+    index=None,
 ):
     answer = {"text": None}
     system = SYSTEM + ("\n\n" + rubric if rubric else "")
@@ -146,8 +149,16 @@ def _run(
         """Model-authored landmark for the current turn (paper section 2.4)."""
         landmark["text"] = format_headline(task, state, next_action, status)
 
-    kernel = Kernel(ms=ms, submit_answer=submit_answer, headline=headline)
-    view, index = [], []
+    # Section 2.2: the Event Log is read-only from the kernel.
+    kernel = Kernel(
+        ms=ms.readonly() if hasattr(ms, "readonly") else ms,
+        submit_answer=submit_answer,
+        headline=headline,
+    )
+    # Section 3.3: the eviction index built during ingestion is carried
+    # forward; the raw context starts empty.
+    view = []
+    index = [] if index is None else index
     seq = 0
     turns_used = 0
 
@@ -242,6 +253,7 @@ def run_scroll(
     verbose=False,
     trace=None,
     rubric=None,
+    index=None,
 ):
     """Answer one question over an already-ingested Event Log.
 
@@ -260,6 +272,7 @@ def run_scroll(
             verbose,
             trace,
             rubric,
+            index,
         )
     except Done:
         return None, max_turns, 0
