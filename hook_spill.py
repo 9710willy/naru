@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""PostToolUse hook: spill oversized tool output into the Scroll Event Log.
+
+Claude Code re-sends the whole conversation every turn, so one large tool
+result is paid for on every later turn and occupies the context window for the
+rest of the session. This hook intercepts the result at the harness boundary,
+stores it verbatim in a searchable Event Log, and replaces it in context with a
+bounded preview plus a retrieval handle.
+
+Nothing is lost: the full text stays addressable by `seq`.
+
+Enable per-project in .claude/settings.json:
+
+    {"hooks": {"PostToolUse": [{"matcher": "Bash|Read",
+      "hooks": [{"type": "command",
+                 "command": "python3 /Users/willee1/work/scroll/hook_spill.py"}]}]}}
+
+The replacement MUST match the tool's own output schema or Claude Code discards
+it and keeps the original, so we mutate the text field in place inside the
+response object rather than returning a bare string.
+"""
+
+import json
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+THRESHOLD = int(os.environ.get("SCROLL_SPILL_THRESHOLD", "2000"))  # chars
+KEEP = int(os.environ.get("SCROLL_SPILL_PREVIEW", "600"))  # chars kept inline
+DB = pathlib.Path(
+    os.environ.get("SCROLL_SPILL_DB", pathlib.Path.home() / ".scroll" / "spill.db")
+)
+
+# Text-bearing fields, in the order tools tend to use them.
+TEXT_FIELDS = ("stdout", "content", "output", "text", "result", "stderr")
+
+
+def find_text(resp):
+    """Return (container, key, text) for the largest text field, or None."""
+    if isinstance(resp, str):
+        return (None, None, resp)
+    if not isinstance(resp, dict):
+        return None
+    best = None
+    for k in TEXT_FIELDS:
+        v = resp.get(k)
+        if isinstance(v, str) and (best is None or len(v) > len(best[2])):
+            best = (resp, k, v)
+    return best
+
+
+def outline(text, every=40):
+    """Line-numbered signposts so the model can see what it can no longer read
+    and jump to the part it needs."""
+    lines = text.splitlines()
+    marks = [
+        f"  {i + 1:>6}  {lines[i].strip()[:70]}"
+        for i in range(0, len(lines), every)
+        if lines[i].strip()
+    ]
+    return "\n".join(marks[:12])
+
+
+def main():
+    try:
+        event = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        return 0  # not our business; pass through untouched
+
+    resp = event.get("tool_response")
+    found = find_text(resp)
+    if not found:
+        return 0
+    container, key, text = found
+    if len(text) <= THRESHOLD:
+        return 0  # small enough to keep inline
+
+    # Store verbatim, addressable by seq.
+    try:
+        from ms import MemorySurface
+
+        DB.parent.mkdir(parents=True, exist_ok=True)
+        ms = MemorySurface(str(DB))
+        seq = ms.append(
+            "tool",
+            text,
+            kind="tool_result",
+            session_id=str(event.get("session_id", "?"))[:16]
+            + " "
+            + str(event.get("tool_name", "tool")),
+            created_at=None,
+            payload=text,
+        )
+    except Exception as e:  # never break the user's tool call over a spill
+        print(f"scroll spill failed, output left inline: {e}", file=sys.stderr)
+        return 0
+
+    lines = len(text.splitlines())
+    replacement = (
+        f"{text[:KEEP]}\n"
+        f"\n[scroll: {len(text):,} chars / {lines:,} lines spilled to the Event "
+        f"Log as seq {seq}. Showing the first {KEEP} chars.]\n"
+        f"[signposts]\n{outline(text)}\n"
+        f"[recover: `note show {seq}` for the full text, or "
+        f'`note search "<terms>"` to find a part of it]'
+    )
+
+    if container is None:
+        updated = replacement
+    else:
+        updated = dict(container)
+        updated[key] = replacement
+
+    json.dump(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "updatedToolOutput": updated,
+            }
+        },
+        sys.stdout,
+    )
+    return 0
+
+
+def demo():
+    """Self-check: exercises the hook contract without Claude Code."""
+    import subprocess
+    import tempfile
+
+    global DB
+    DB = pathlib.Path(tempfile.mkdtemp()) / "s.db"
+    me = [sys.executable, str(pathlib.Path(__file__).resolve())]
+    env = {**os.environ, "SCROLL_SPILL_DB": str(DB)}
+
+    def run(payload):
+        p = subprocess.run(
+            me, input=json.dumps(payload), capture_output=True, text=True, env=env
+        )
+        assert p.returncode == 0, p.stderr
+        return json.loads(p.stdout) if p.stdout.strip() else None
+
+    # small output passes through untouched (no stdout at all)
+    assert run({"tool_name": "Bash", "tool_response": {"stdout": "hi"}}) is None
+
+    # large output is replaced, and the response SHAPE is preserved
+    big = "\n".join(f"line {i} " + "x" * 60 for i in range(400))
+    out = run(
+        {
+            "tool_name": "Bash",
+            "session_id": "abc",
+            "tool_response": {"stdout": big, "stderr": "", "interrupted": False},
+        }
+    )
+    upd = out["hookSpecificOutput"]["updatedToolOutput"]
+    assert out["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+    assert set(upd) == {"stdout", "stderr", "interrupted"}, upd.keys()
+    assert upd["interrupted"] is False, "non-text fields must survive"
+    assert len(upd["stdout"]) < len(big) / 4, "replacement should be much smaller"
+    assert "seq 1" in upd["stdout"] and "note show 1" in upd["stdout"]
+    assert "line 0" in upd["stdout"], "preview should show the head"
+    assert "line 200" in upd["stdout"], "signposts should reach the middle"
+
+    # the full text really is recoverable, verbatim
+    from ms import MemorySurface
+
+    ms = MemorySurface(str(DB))
+    assert ms.expand(1)[0].content == big, "spilled text not recovered verbatim"
+    assert ms.search("line", k=3), "spilled text not searchable"
+
+    # a bare-string response is handled too
+    out2 = run({"tool_name": "X", "tool_response": big})
+    assert isinstance(out2["hookSpecificOutput"]["updatedToolOutput"], str)
+
+    # malformed stdin must never break the tool call
+    p = subprocess.run(me, input="not json", capture_output=True, text=True, env=env)
+    assert p.returncode == 0 and not p.stdout.strip()
+
+    saved = len(big) - len(upd["stdout"])
+    print(
+        f"ok — hook checks passed ({len(big):,} chars -> "
+        f"{len(upd['stdout']):,}, {saved / len(big) * 100:.0f}% removed from "
+        f"context, full text recoverable at seq 1)"
+    )
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--selfcheck":
+        demo()
+    else:
+        sys.exit(main())
