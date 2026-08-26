@@ -27,6 +27,7 @@ import sys
 from datetime import datetime
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import metrics
 from ms import DEFAULT_DB
 
 THRESHOLD = int(os.environ.get("SCROLL_SPILL_THRESHOLD", "2000"))  # chars
@@ -88,6 +89,10 @@ def main():
         return 0
     container, key, text = found
     if len(text) <= THRESHOLD:
+        # Recorded too: without the skips there is no way to tell later whether
+        # the threshold is leaving savings on the table.
+        metrics.record("hook", tool=event.get("tool_name"), chars=len(text),
+                       spilled=False)
         return 0  # small enough to keep inline
 
     # Store verbatim, addressable by seq.
@@ -109,6 +114,8 @@ def main():
             # a temp directory macOS may purge, breaking recovery.
         )
     except Exception as e:  # never break the user's tool call over a spill
+        metrics.record("error", tool=event.get("tool_name"), chars=len(text),
+                       msg=f"{type(e).__name__}: {e}")
         print(f"scroll spill failed, output left inline: {e}", file=sys.stderr)
         return 0
 
@@ -127,6 +134,9 @@ def main():
     else:
         updated = dict(container)
         updated[key] = replacement
+
+    metrics.record("hook", tool=event.get("tool_name"), chars=len(text),
+                   kept=len(replacement), spilled=True, seq=seq)
 
     json.dump(
         {
@@ -148,7 +158,10 @@ def demo():
     global DB
     DB = pathlib.Path(tempfile.mkdtemp()) / "s.db"
     me = [sys.executable, str(pathlib.Path(__file__).resolve())]
-    env = {**os.environ, "SCROLL_SPILL_DB": str(DB)}
+    # Isolate metrics too: a self-check must not write into the user's
+    # real observability store.
+    env = {**os.environ, "SCROLL_SPILL_DB": str(DB),
+           "SCROLL_METRICS": str(DB.parent / "m.jsonl")}
 
     def run(payload):
         p = subprocess.run(

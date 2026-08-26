@@ -7,6 +7,7 @@
     note show 12 18
     note prune [days] [--dry-run]   # default 30; deletes older rows + index
     note gc                          # remove orphaned blob dirs
+    note stats [days]                # spill/recovery observability
 
 Notes and hook-spilled tool output share ~/.scroll/log.db (override with
 SCROLL_DB). Recall prints
@@ -20,6 +21,7 @@ import sys
 from datetime import datetime, timedelta
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import metrics
 from ms import DEFAULT_DB, MemorySurface
 
 DB = pathlib.Path(os.environ.get("SCROLL_NOTES", DEFAULT_DB))
@@ -69,6 +71,7 @@ def main(argv):
             else " ".join(args)
         )
         hits = ms.search(q, k=k)
+        metrics.record("search", q=q[:60], hits=len(hits))
         if not hits:
             print("no hits. try `note outline` and `note show LO HI` to browse.")
             return 1
@@ -100,6 +103,7 @@ def main(argv):
             return 2
         lo = int(args[0])
         hi = int(args[1]) if len(args) > 1 else None
+        metrics.record("show", seq=lo)
         for r in ms.expand(lo, hi):
             print(f"--- [{r.seq}] {r.created_at} | {r.session_id}")
             print(r.content)
@@ -129,6 +133,21 @@ def main(argv):
             return 0
         removed = ms.prune(cutoff)
         print(f"  removed {removed} rows, index cleaned, database vacuumed")
+        # metrics age out with the rows they describe
+        kept_ev = [e for e in metrics.read() if e.get("t", "") >= cutoff]
+        try:
+            import json as _j
+            metrics.PATH.write_text(
+                "".join(_j.dumps(e, separators=(",", ":")) + "\n"
+                        for e in kept_ev))
+            print(f"  metrics trimmed to {len(kept_ev)} event(s)")
+        except OSError:
+            pass
+
+    elif cmd == "stats":
+        days = int(args[0]) if args and args[0].isdigit() else None
+        thr = int(os.environ.get("SCROLL_SPILL_THRESHOLD", 10000))
+        print("\n".join(metrics.report(days=days, threshold=thr)))
 
     elif cmd == "gc":
         # Orphaned blob directories from before the hook stopped writing them.
@@ -165,6 +184,7 @@ def demo():
 
     global DB
     DB = pathlib.Path(tempfile.mkdtemp()) / "t.db"
+    metrics.PATH = DB.parent / "m.jsonl"   # never touch the real store
 
     assert (
         main(

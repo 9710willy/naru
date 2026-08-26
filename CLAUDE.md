@@ -48,6 +48,21 @@ same questions.
 - `note` and `hook_spill.py` must share one store (`ms.DEFAULT_DB`), or the
   recovery handle a spill prints points at a database `note` never opens.
 
+## Observability
+
+`note stats [days]` reads `~/.scroll/metrics.jsonl`, one appended line per hook
+invocation and per recovery. Two signals only exist there, not in the Event Log:
+
+- **skipped outputs** — the spilled/skipped size distribution is the only
+  evidence for whether `SCROLL_SPILL_THRESHOLD` is set right.
+- **recoveries** — if spills accumulate and `recoveries used` stays 0, the
+  retrieval handle is dead weight and the preview should carry more.
+
+Recording is fire-and-forget: every failure in `metrics.py` is swallowed, because
+a metrics problem must never break a tool call. Self-checks must point
+`SCROLL_METRICS` at a temp path — an earlier version wrote test events into the
+real store.
+
 ## Where this diverges from the paper
 
 Both are deliberate and ablatable; do not quietly drop either.
