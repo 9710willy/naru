@@ -48,6 +48,16 @@ same questions.
 - `note` and `hook_spill.py` must share one store (`ms.DEFAULT_DB`), or the
   recovery handle a spill prints points at a database `note` never opens.
 
+## Where this diverges from the paper
+
+Both are deliberate and ablatable; do not quietly drop either.
+
+- `ms.outline()` is ours, not the paper's. It exists because §3.3's
+  ingestion-time index collapses old sessions into coarse ranges, which suits a
+  long trajectory but not LongMemEval's uniformly-scattered evidence. `--no-index`
+  ablates the paper's version. See ADR 0003.
+- `search()` retries a failed multi-term AND as OR. The paper does not.
+
 ## Style
 
 Python: the `python-perf-guide` skill carries the standard. Its measurement
