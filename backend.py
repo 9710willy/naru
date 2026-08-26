@@ -66,7 +66,10 @@ class Usage:
 class Backend:
     model: str = HAIKU
     timeout: int = 300
-    retries: int = 3  # the CLI intermittently returns an empty result
+    # The CLI intermittently returns an empty result for a valid request. This
+    # penalizes multi-turn arms in proportion to their turn count, so a low
+    # retry budget silently biases the benchmark against Scroll.
+    retries: int = 6
     usage: Usage = field(default_factory=Usage)
 
     def __call__(self, prompt, system=None):
@@ -84,6 +87,9 @@ class Backend:
             if out.strip():
                 return out
             self.usage.empty_retries += 1
+        # Exhausting the budget loses a whole turn. Count it as the error it is
+        # rather than returning "" as if the model had nothing to say.
+        self.usage.errors += 1
         return ""
 
     def _once(self, prompt, system=None):
