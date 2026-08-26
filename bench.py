@@ -110,27 +110,53 @@ Reply with the answer only — no preamble, no reasoning."""
 
 JUDGE_SYSTEM = """\
 You grade a candidate answer against a gold answer for a question about a
-conversation history.
+conversation history. You are checking ONE thing: does the candidate state the
+gold fact?
 
-Correct means the candidate contains the same essential fact as the gold
-answer. Ignore wording, extra detail, formatting, and politeness. A candidate
-that states the gold fact plus harmless extra context is CORRECT. A candidate
-that omits, contradicts, or hedges away the gold fact is WRONG. An answer that
-refuses or says the information is absent is WRONG unless the gold answer also
-says the information is absent.
+CORRECT when the candidate states the gold fact, even if:
+  - worded differently, reordered, or paraphrased
+  - punctuated or formatted differently ("on January 2nd" vs "(January 2nd)")
+  - surrounded by extra correct context, reasoning, or supporting detail
+  - it gives one of several values the gold answer marks acceptable. A gold
+    answer may list alternatives, e.g. "30 days. 31 days (including the last
+    day) is also acceptable." — then EITHER value is CORRECT.
+  - the unit or currency is written differently ($12 vs 12 dollars)
+
+WRONG when the candidate:
+  - omits the gold fact, or states a different value for it
+  - contradicts the gold fact
+  - refuses, or says the information is absent — UNLESS the gold answer also
+    says it is absent
+  - only names the topic without giving the asked-for fact
+
+Grade the FACT, not the prose. Do not require the candidate's wording to
+resemble the gold answer's wording.
 
 Reply with exactly one word: CORRECT or WRONG."""
 
 
-def judge(q, response, backend):
+def judge(q, response, backend, votes=3):
+    """Grade one answer. Majority of `votes` independent gradings.
+
+    A single grading is unstable on paraphrase: two answers differing only in
+    punctuation were graded differently in replicate runs, which put harness
+    noise straight into the reported accuracy. Judge calls are small and cheap,
+    so voting is the cheapest available variance reduction.
+    """
     if not response or not response.strip():
         return False
     p = (
         f"Question: {q['question']}\n\nGold answer: {q['answer']}\n\n"
         f"Candidate answer: {response.strip()[:2000]}\n\nVerdict:"
     )
-    v = backend(p, system=JUDGE_SYSTEM).strip().upper()
-    return v.startswith("CORRECT")
+    yes = 0
+    for i in range(votes):
+        v = backend(p, system=JUDGE_SYSTEM).strip().upper()
+        yes += v.startswith("CORRECT")
+        # early exit once the outcome cannot change
+        if yes > votes // 2 or (i + 1 - yes) > votes // 2:
+            break
+    return yes > (votes // 2)
 
 
 def one(q, arm, model, judge_model, max_turns, budget, verbose, rubric=True):
