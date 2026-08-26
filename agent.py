@@ -9,7 +9,7 @@ them addressable.
 
 import re
 
-from eviction import Block, est, evict, render_index
+from eviction import Block, est, evict, format_headline, render_index
 from kernel import Kernel
 
 CODE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
@@ -65,9 +65,17 @@ Pre-bound API:
         created_at is ISO-8601 text, so substr(created_at,1,10) sorts and
         compares as a date.
   ms.days_between(d1, d2)            -> whole calendar days between two dates.
+  headline(task=, state=, next_action=, status=)
+        -> Record a landmark for THIS turn. Call it once per turn, first. It is
+        bound to this turn's address, so when the turn is later evicted from
+        your view you can still see what it was for and jump back to it by
+        address. Keep each field under ~10 words.
   submit_answer("...")               -> finish. Call this exactly once.
 
 Method:
+  0. Open every cell with headline(...) describing what this turn is doing and
+     what you have confirmed so far. That landmark is what lets you navigate
+     back to an evicted turn by position instead of by remembering its wording.
   1. Search with SHORT keyword or synonym queries. Start k=5; raise it only if
      the evidence is thin. Prefer one or two distinctive words.
   2. If several named things are asked about, search each SEPARATELY rather
@@ -132,7 +140,13 @@ def _run(
         answer["text"] = str(text)
         raise Done()
 
-    kernel = Kernel(ms=ms, submit_answer=submit_answer)
+    landmark = {"text": None}
+
+    def headline(task=None, state=None, next_action=None, status=None):
+        """Model-authored landmark for the current turn (paper section 2.4)."""
+        landmark["text"] = format_headline(task, state, next_action, status)
+
+    kernel = Kernel(ms=ms, submit_answer=submit_answer, headline=headline)
     view, index = [], []
     seq = 0
     turns_used = 0
@@ -175,11 +189,15 @@ def _run(
             break
 
         seq += 1
-        view.append(
-            Block(seq, "exec", f"[exec {seq}]\n{code.strip()}", headline=f"exec {seq}")
-        )
+        exec_block = Block(seq, "exec", f"[exec {seq}]\n{code.strip()}",
+                           headline=f"exec {seq}")
+        view.append(exec_block)
 
+        landmark["text"] = None
         out, err = kernel.run(code)
+        # Bind the landmark at append time, to the address this turn was given.
+        if landmark["text"]:
+            exec_block.headline = f"[{seq}] {landmark['text']}"
         if answer["text"] is not None:
             if trace is not None:
                 trace[-1]["obs"] = "(submitted)"
@@ -315,7 +333,9 @@ def demo():
     assert est(last) < 400, f"working view too big: {est(last)}t"
 
     # Eviction still fires when printed output genuinely overflows the budget.
-    noisy = ["```python\nprint('L%d ' + 'q'*2000)\n```" % i for i in range(6)]
+    noisy = ["```python\nheadline(task='probe %d', state='found nothing yet',"
+             " next_action='widen search', status='working')\n"
+             "print('L%d ' + 'q'*2000)\n```" % (i, i) for i in range(6)]
     noisy.append("```python\nsubmit_answer('done')\n```")
     n = {"i": 0, "prompts": []}
 
@@ -331,6 +351,9 @@ def demo():
     assert ans2 == "done", ans2
     over = n["prompts"][-1]
     assert "evicted" in over and "ms.expand" in over, over[:300]
+    # the paper's landmark shape, authored by the model, must reach the index
+    assert "task=probe" in over, f"model headline missing from index: {over[:400]}"
+    assert "status=working" in over, over[:400]
     assert est(over) < 1500, f"eviction failed to bound view: {est(over)}t"
 
     print(

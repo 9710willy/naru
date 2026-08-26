@@ -13,6 +13,24 @@ def est(text):
     return max(1, len(text) // TOK)
 
 
+def format_headline(task=None, state=None, next_action=None, status=None):
+    """The paper's landmark shape: task, verified state, next action, status.
+
+    Auto-derived headlines (truncated block text) only support recall by
+    wording, which is the failure lexical search already has. A model-authored
+    landmark supports POSITION-based navigation: it says what a span was for,
+    so the agent can decide to go back to it without remembering its words.
+    """
+    parts = [
+        ("task", task),
+        ("state", state),
+        ("next", next_action),
+        ("status", status),
+    ]
+    got = [f"{k}={str(v).strip()[:70]}" for k, v in parts if v]
+    return " | ".join(got)
+
+
 class Block:
     """One unit of the working view."""
 
@@ -22,6 +40,7 @@ class Block:
         self.seq = seq
         self.role = role
         self.text = text
+        # Fall back to truncated text only when the model wrote no landmark.
         self.headline = headline or (text.replace("\n", " ")[:60])
         self.is_payload = is_payload
 
