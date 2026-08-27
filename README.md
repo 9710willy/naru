@@ -6,6 +6,7 @@ Shared, human-approved context for coding agents.
 naru claim "<text>" [--key KEY] [--by AGENT]   propose a fact
 naru inbox                                     approve or reject pending claims
 naru inject [PATH]                             write the approved file
+naru promote SEQ --yes | drop SEQ --yes        decide without the prompt
 naru search QUERY | show SEQ | outline         read the log
 naru stats [DAYS] | prune [DAYS] | gc          maintenance
 ```
@@ -26,6 +27,18 @@ naru inject .cursorrules     # Cursor
 
 Any tool that can run a shell command can both file claims and read the result.
 There is no plugin API.
+
+`inject` splices the doc between `<!-- naru:begin -->` and `<!-- naru:end -->`
+markers and leaves the rest of the file alone, so pointing it at a CLAUDE.md you
+maintain by hand is safe.
+
+`promote` and `drop` refuse to run without a terminal unless you pass `--yes`.
+That stops a tool loop promoting by accident. It is not a security boundary —
+anything that can run this CLI can also pass `--yes`.
+
+To revise a promoted fact, retire the old one first: `naru drop <seq> --yes`,
+then claim and promote the replacement. Promoting a second value for the same
+key without retiring the first parks them both under `## Unresolved`.
 
 ## Install
 

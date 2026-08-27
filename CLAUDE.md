@@ -4,7 +4,7 @@ Implementation of _Context as an Environment_ (arXiv 2608.21690). The agent's
 history lives in a SQLite Event Log and a persistent Python kernel; the model
 writes code to reach it and only what it prints enters the next call.
 
-Read `docs/adr/` before changing anything — four decisions there are
+Read `docs/adr/` before changing anything — five decisions there are
 non-obvious and one of them (0002) exists because a hardcoded constant produced
 a wrong published result.
 

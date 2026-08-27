@@ -100,7 +100,7 @@ def main():
     try:
         from ms import MemorySurface
 
-        DB.parent.mkdir(parents=True, exist_ok=True)
+        DB.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         ms = MemorySurface(str(DB))
         seq = ms.append(
             "tool",
