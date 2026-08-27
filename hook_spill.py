@@ -31,7 +31,8 @@ import metrics
 from ms import DEFAULT_DB
 
 THRESHOLD = int(os.environ.get("NARU_SPILL_THRESHOLD", "2000"))  # chars
-KEEP = int(os.environ.get("NARU_SPILL_PREVIEW", "600"))  # chars kept inline
+KEEP = int(os.environ.get("NARU_SPILL_PREVIEW", "600"))
+SIGNPOST_EVERY = 40  # one signpost line per N lines of spilled text
 DB = pathlib.Path(os.environ.get("NARU_SPILL_DB", DEFAULT_DB))
 
 # Text-bearing fields, in the order tools tend to use them.
@@ -52,13 +53,13 @@ def find_text(resp):
     return best
 
 
-def outline(text, every=40):
+def outline(text):
     """Line-numbered signposts so the model can see what it can no longer read
     and jump to the part it needs."""
     lines = text.splitlines()
     marks = [
         f"  {i + 1:>6}  {lines[i].strip()[:70]}"
-        for i in range(0, len(lines), every)
+        for i in range(0, len(lines), SIGNPOST_EVERY)
         if lines[i].strip()
     ]
     return "\n".join(marks[:12])

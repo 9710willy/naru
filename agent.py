@@ -182,7 +182,12 @@ def _run(
             parts.append("LAST TURN. You must call submit_answer(...) now.")
         prompt = "\n\n".join(parts)
 
-        reply = backend(prompt, system=system)
+        # The retry nudge lives here, not in backend: a code-block reminder
+        # is right for a turn that must emit Python and wrong for a judge
+        # that must emit one word.
+        reply = backend(
+            prompt, system=system, nudge="(Reply with one ```python code block.)"
+        )
         code = extract_code(reply)
         if trace is not None:
             trace.append(
@@ -315,7 +320,7 @@ def demo():
     ]
     calls = {"n": 0, "prompts": []}
 
-    def fake(prompt, system=None):
+    def fake(prompt, system=None, nudge=None):
         calls["prompts"].append(prompt)
         r = script[min(calls["n"], len(script) - 1)]
         calls["n"] += 1
@@ -352,7 +357,7 @@ def demo():
     noisy.append("```python\nsubmit_answer('done')\n```")
     n = {"i": 0, "prompts": []}
 
-    def fake2(prompt, system=None):
+    def fake2(prompt, system=None, nudge=None):
         n["prompts"].append(prompt)
         r = noisy[min(n["i"], len(noisy) - 1)]
         n["i"] += 1

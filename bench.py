@@ -9,6 +9,7 @@ Reports accuracy, tokens billed, and cost for each.
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import sys
@@ -190,7 +191,11 @@ def judge(q, response, backend, votes=3):
     )
     yes = 0
     for i in range(votes):
-        v = backend(p, system=JUDGE_SYSTEM).strip().upper()
+        v = (
+            backend(p, system=JUDGE_SYSTEM, nudge="(Reply with exactly one word.)")
+            .strip()
+            .upper()
+        )
         yes += v.startswith("CORRECT")
         # early exit once the outcome cannot change
         if yes > votes // 2 or (i + 1 - yes) > votes // 2:
@@ -255,7 +260,10 @@ def one(
     }
 
 
-def report(rows, label, floor):
+def report(rows, label, floor, measured=True):
+    """Print one arm's results. `measured` is the backend's own reports_tokens:
+    a generic pipe never touches the token counters, so billed-in and cost are
+    zeros that would otherwise read as measurements."""
     if not rows:
         return
     n = len(rows)
@@ -273,15 +281,18 @@ def report(rows, label, floor):
     print(
         f"\n  {label:8} {bar} {acc * 100:5.1f}%  ({sum(r['correct'] for r in rows)}/{n})"
     )
-    print(
-        f"           billed-in {bi / n:>9,.0f}/q   net-of-harness "
-        + ("not measurable" if net is None else f"{net / n:>9,.0f}/q")
-    )
+    if measured:
+        print(
+            f"           billed-in {bi / n:>9,.0f}/q   net-of-harness "
+            + ("not measurable" if net is None else f"{net / n:>9,.0f}/q")
+        )
+    else:
+        print("           billed-in  not measurable   net-of-harness not measurable")
     print(
         f"           out {sum(r['output'] for r in rows) / n:>7,.0f}/q   "
         f"turns {sum(r['turns'] for r in rows) / n:>4.1f}   "
         f"view {sum(r['peak_view_tokens'] for r in rows) / n:>6,.0f}t   "
-        f"${cost:.2f} total"
+        + (f"${cost:.2f} total" if measured else "cost not measurable")
     )
     errs = sum(r["errors"] for r in rows)
     retries = sum(r.get("empty_retries", 0) for r in rows)
@@ -321,8 +332,14 @@ def main():
     ap.add_argument(
         "--no-rubric", action="store_true", help="ablate the per-dataset layout rubric"
     )
+    ap.add_argument(
+        "--no-index",
+        action="store_true",
+        help="ablate the ingestion-time eviction index (CLAUDE.md, ADR 0003)",
+    )
     a = ap.parse_args()
 
+    measured = get_backend(a.model).reports_tokens
     if a.harness_floor is None:
         a.harness_floor = measure_floor(a.model)
         if a.harness_floor is None:
@@ -392,11 +409,17 @@ def main():
     print()
 
     for arm in arms:
-        report([r for r in rows if r["arm"] == arm], arm, a.harness_floor)
+        report([r for r in rows if r["arm"] == arm], arm, a.harness_floor, measured)
 
     out = DATA.parent / "results" / f"{a.tag}_{a.split}_n{len(qs)}.json"
     out.parent.mkdir(exist_ok=True)
-    json.dump({"config": vars(a), "rows": rows}, open(out, "w"), indent=1)
+    # vars(a) records --model even when NARU_BACKEND replaced it, which made a
+    # `NARU_BACKEND=cat` run byte-identical to a real Haiku run that cost
+    # nothing. Stamp what actually answered, and whether the numbers are real.
+    cfg = dict(vars(a))
+    cfg["backend"] = os.environ.get("NARU_BACKEND") or "claude-cli"
+    cfg["tokens_measured"] = measured
+    json.dump({"config": cfg, "rows": rows}, open(out, "w"), indent=1)
     print(f"\nwrote {out}")
 
 

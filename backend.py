@@ -18,8 +18,6 @@ import sys
 from dataclasses import dataclass, field
 
 HAIKU = "claude-haiku-4-5-20251001"
-SONNET = "claude-sonnet-5"
-OPUS = "claude-opus-5"
 
 # Flags that strip the Claude Code persona/tooling so the model behaves as a
 # plain completion endpoint rather than a coding agent.
@@ -90,19 +88,24 @@ class _Retrying:
     # Whether `usage` means anything. A generic pipe cannot report tokens, and
     # a run must not print $0.000 as though the calls were free.
     reports_tokens = True
+    _warned_failure = False
 
-    def __call__(self, prompt, system=None):
-        """Send one prompt, return the model's text. Retries an empty reply,
-        which the CLI produces sporadically for an otherwise valid request."""
+    def __call__(self, prompt, system=None, nudge=None):
+        """Send one prompt, return the model's text.
+
+        Retries a genuinely empty reply, which the CLI produces sporadically
+        for a valid request. A HARD failure — timeout, non-zero exit,
+        unparseable output — is not retried: `_once` returns None for those,
+        and hammering a broken command six times only multiplies the wait.
+        `nudge` is appended on retry, because an identical retry tends to come
+        back empty again; the caller supplies it, since the right nudge for a
+        code-writing turn is the wrong one for a one-word judge verdict.
+        """
         for attempt in range(self.retries):
-            # Nudge the prompt on retry; an identical retry tends to come back
-            # empty again.
-            p = (
-                prompt
-                if attempt == 0
-                else (f"{prompt}\n\n(Reply with one ```python code block.)")
-            )
+            p = prompt if attempt == 0 or not nudge else f"{prompt}\n\n{nudge}"
             out = self._once(p, system)
+            if out is None:
+                return ""  # already counted as an error by _once
             if out.strip():
                 return out
             self.usage.empty_retries += 1
@@ -114,6 +117,39 @@ class _Retrying:
     def _once(self, prompt, system=None):
         raise NotImplementedError
 
+    def _run(self, argv, prompt, catch=(subprocess.TimeoutExpired,)):
+        """Run argv with `prompt` on stdin. Returns stdout, or None on failure.
+
+        One implementation of run-and-classify for both backends. On failure it
+        surfaces the command's own stderr ONCE per backend: `__post_init__`
+        exists so a bad NARU_BACKEND cannot become a silent run of empty
+        answers, and swallowing every runtime failure would put that back.
+        """
+        try:
+            p = subprocess.run(
+                argv,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except catch as e:
+            self.usage.errors += 1
+            self._complain(f"{type(e).__name__}: {e}")
+            return None
+        if p.returncode != 0:
+            self.usage.errors += 1
+            self._complain(f"exit {p.returncode}: {(p.stderr or '').strip()[:300]}")
+            return None
+        return p.stdout
+
+    def _complain(self, msg):
+        """First failure only. A benchmark makes hundreds of calls; the first
+        one explains the problem and the rest are noise."""
+        if not self._warned_failure:
+            self._warned_failure = True
+            print(f"backend failure (first only): {msg}", file=sys.stderr)
+
 
 @dataclass
 class Backend(_Retrying):
@@ -121,25 +157,23 @@ class Backend(_Retrying):
 
     model: str = HAIKU
 
+    @property
+    def label(self):
+        return self.model
+
     def _once(self, prompt, system=None):
         cmd = ["claude", "-p", "--model", self.model, *_BARE]
         if system:
             cmd += ["--system-prompt", system]
+        out = self._run(cmd, prompt)
+        if out is None:
+            return None
         try:
-            p = subprocess.run(
-                cmd, input=prompt, capture_output=True, text=True, timeout=self.timeout
-            )
-        except subprocess.TimeoutExpired:
-            self.usage.errors += 1
-            return ""
-        if p.returncode != 0:
-            self.usage.errors += 1
-            return ""
-        try:
-            d = json.loads(p.stdout)
+            d = json.loads(out)
         except json.JSONDecodeError:
             self.usage.errors += 1
-            return ""
+            self._complain("unparseable JSON on stdout")
+            return None
         self.usage.add(d.get("usage") or {}, d.get("total_cost_usd"))
         if d.get("is_error"):
             self.usage.errors += 1
@@ -172,25 +206,18 @@ class CommandBackend(_Retrying):
         if shutil.which(self.argv[0]) is None:
             raise FileNotFoundError(f"NARU_BACKEND command not found: {self.argv[0]!r}")
 
+    @property
+    def label(self):
+        return self.cmd
+
     def _once(self, prompt, system=None):
         if system:
             prompt = f"{system}\n\n{prompt}"
-        try:
-            p = subprocess.run(
-                self.argv,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            self.usage.errors += 1
-            return ""
-        if p.returncode != 0:
-            self.usage.errors += 1
-            return ""
+        out = self._run(self.argv, prompt, catch=(subprocess.TimeoutExpired, OSError))
+        if out is None:
+            return None
         self.usage.calls += 1
-        return p.stdout.strip()
+        return out.strip()
 
 
 _WARNED = set()
@@ -226,15 +253,20 @@ def measure_floor(model=HAIKU):
     Must be measured, never hardcoded: it moves whenever the CLI flags or its
     built-in system prompt change, and a stale value silently distorts every
     per-arm token comparison.
+
+    Returns None when the floor could not be measured — a generic pipe that
+    reports no usage at all, OR a probe call that failed. Never 0: a zero flows
+    into the net-of-harness subtraction and prints as though a floor had been
+    measured, which is exactly the wrong number ADR 0002 exists to prevent.
     """
     b = get_backend(model)
     if not b.reports_tokens:
-        # None, not 0. Zero would flow into the net-of-harness subtraction and
-        # print as though a floor had been measured — the same class of wrong
-        # number ADR 0002 exists to prevent. "Not measurable" must stay visible.
         return None
     b("Reply with one word: ok", system="You reply in one word.")
-    return b.usage.billed_input // max(1, b.usage.calls)
+    # `calls` only advances when usage was actually recorded. A nonzero exit,
+    # unparseable JSON, a timeout, expired auth or a rate limit all leave it at
+    # zero — and `// max(1, 0)` used to turn that into a confident 0.
+    return b.usage.billed_input // b.usage.calls if b.usage.calls else None
 
 
 def demo():

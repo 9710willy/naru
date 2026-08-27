@@ -17,9 +17,12 @@ Stdlib only. No embeddings, no service, deterministic.
 
 import os
 import pathlib
+import re
 import sqlite3
 import tempfile
 from datetime import date
+
+from eviction import est  # one owner for chars-per-token
 
 # ONE Event Log for everything the session wants to recall later: notes written
 # by `naru add`, and tool output spilled by the PostToolUse hook. They differ
@@ -28,6 +31,26 @@ from datetime import date
 DEFAULT_DB = pathlib.Path(
     os.environ.get("NARU_DB", pathlib.Path.home() / ".naru" / "log.db")
 )
+
+# Age is the right rule for spilled tool output and the wrong one for a
+# decision a human made. Anything else a prune would take, it still takes.
+PRUNE_KEEP = " AND NOT (kind = 'claim' AND promoted <> 0)"
+
+# Payloads over this go to disk. One value, no caller has ever varied it.
+BLOB_THRESHOLD = 4000
+# Session preview width in outline().
+OUTLINE_PREVIEW = 90
+
+
+def _oneline(text):
+    """Collapse a claim to a single line for rendering.
+
+    The doc is written into files other tools parse — CLAUDE.md, AGENTS.md, a
+    shell rc. A newline inside a claim would otherwise break out of its bullet
+    and become a top-level line in the host format, which is how agent-authored
+    text turns into a directive the host executes.
+    """
+    return re.sub(r"\s+", " ", (text or "").strip())
 
 
 class Row(dict):
@@ -66,17 +89,28 @@ def _to_match(query):
 
 
 class MemorySurface:
-    def __init__(self, db=":memory:", blobs=None, blob_threshold=4000):
+    def __init__(self, db=":memory:", blobs=None):
         # Several agents append while a human reads. WAL lets readers run
         # during a write; busy_timeout absorbs the overlap instead of raising
         # "database is locked" in whichever caller lost the race.
         self.db = sqlite3.connect(db, timeout=30)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
+        try:
+            # Converting a rollback-journal file to WAL needs an exclusive lock
+            # SQLite will NOT wait for: with another connection attached it
+            # returns BUSY immediately, ignoring busy_timeout. The mode is a
+            # persistent property of the file, so whoever wins sets it for
+            # everyone and the losers are already in the mode they wanted.
+            self.db.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass
         self.db.execute("PRAGMA busy_timeout=30000")
         try:
-            self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _probe USING fts5(x)")
-            self.db.execute("DROP TABLE _probe")
+            # temp.* is private to this connection. A shared `_probe` name
+            # races: two constructors interleave CREATE/CREATE/DROP/DROP and
+            # the loser's DROP raises, reported below as "SQLite lacks FTS5".
+            self.db.execute("CREATE VIRTUAL TABLE temp._probe USING fts5(x)")
+            self.db.execute("DROP TABLE temp._probe")
         except sqlite3.OperationalError as e:
             raise RuntimeError(
                 "SQLite build lacks FTS5; cannot back the Event Log"
@@ -107,7 +141,7 @@ class MemorySurface:
         self.blobs = pathlib.Path(
             blobs or pathlib.Path(tempfile.gettempdir()) / f"naru-blobs-{id(self):x}"
         )
-        self.blob_threshold = blob_threshold
+        self.blob_threshold = BLOB_THRESHOLD
 
     def _migrate_fts(self):
         """Upgrade a store created with a contentless FTS table.
@@ -147,9 +181,26 @@ class MemorySurface:
             ("base_seq", "INTEGER"),
         ):
             if name not in have:
-                self.db.execute(
-                    f"ALTER TABLE conversation_history ADD COLUMN {name} {decl}"
-                )
+                try:
+                    self.db.execute(
+                        f"ALTER TABLE conversation_history ADD COLUMN {name} {decl}"
+                    )
+                except sqlite3.OperationalError as e:
+                    # Another process migrated between our table_info read and
+                    # this ALTER. busy_timeout does not cover it — a duplicate
+                    # column is a schema error, not a lock. Losing is success.
+                    if "duplicate column" not in str(e).lower():
+                        raise
+        # Every curation query filters on promoted or groups by topic_key.
+        # Without these the doc costs a full scan of the whole Event Log.
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_promoted"
+            " ON conversation_history(promoted, seq)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_topic_key"
+            " ON conversation_history(topic_key, seq) WHERE topic_key IS NOT NULL"
+        )
         self.db.commit()
 
     # ---- ingest -----------------------------------------------------------
@@ -262,7 +313,24 @@ class MemorySurface:
         )
         return [Row(r) for r in self.db.execute(sql, params).fetchall()]
 
-    def outline(self, preview=90):
+    def session_ranges(self):
+        """One row per session_id: seq span, earliest date, turn count.
+
+        The aggregate behind both `outline()` and the CLI's `outline` listing.
+        They render it differently — the CLI shows session_id, this one shows a
+        preview of the first turn — but the query has one owner so the two
+        views cannot drift apart.
+        """
+        return [
+            Row(r)
+            for r in self.db.execute(
+                "SELECT session_id, MIN(seq) lo, MAX(seq) hi, MIN(created_at) at,"
+                " COUNT(*) n FROM conversation_history"
+                " GROUP BY session_id ORDER BY lo"
+            ).fetchall()
+        ]
+
+    def outline(self):
         """Structural map of the log: one line per session with its date, seq
         range and the opening of its first user turn.
 
@@ -270,11 +338,7 @@ class MemorySurface:
         wording may share no words with the turn that answers it, and then the
         only way in is to browse. Cheap: one short line per session.
         """
-        rows = self.db.execute(
-            "SELECT session_id, MIN(seq) lo, MAX(seq) hi, MIN(created_at) at,"
-            " COUNT(*) n FROM conversation_history"
-            " GROUP BY session_id ORDER BY lo"
-        ).fetchall()
+        rows = self.session_ranges()
         out = []
         for r in rows:
             # Prefer the first user turn (it states the topic in a chat log),
@@ -289,7 +353,7 @@ class MemorySurface:
             head = head.split("] ", 1)[-1]  # drop the [Session N | date] tag
             out.append(
                 f"seq {r['lo']}-{r['hi']} | {(r['at'] or '')[:10]} | "
-                f"{r['n']} turns | {head[:preview]}"
+                f"{r['n']} turns | {head[:OUTLINE_PREVIEW]}"
             )
         return "\n".join(out)
 
@@ -317,8 +381,13 @@ class MemorySurface:
             out.append(row)
         return out
 
-    def prune(self, before_iso, drop_blobs=True):
+    def prune(self, before_iso):
         """Delete rows created before `before_iso`. Returns rows removed.
+
+        A DECIDED claim is never pruned by age. Claims are stamped with the
+        wall clock at `naru claim` time, so an age-only predicate gives every
+        human promotion a 30-day shelf life and silently empties the doc. Age
+        is the right rule for spilled tool output, not for a curated decision.
 
         The FTS table is contentless, so its rows must be deleted explicitly —
         a plain DELETE on conversation_history leaves the index holding orphan
@@ -326,13 +395,13 @@ class MemorySurface:
         """
         doomed = self.db.execute(
             "SELECT seq, payload_path FROM conversation_history"
-            " WHERE created_at IS NOT NULL AND created_at < ?",
+            " WHERE created_at IS NOT NULL AND created_at < ?" + PRUNE_KEEP,
             (before_iso,),
         ).fetchall()
         if not doomed:
             return 0
         seqs = [r["seq"] for r in doomed]
-        if drop_blobs:
+        if True:
             for r in doomed:
                 if r["payload_path"]:
                     try:
@@ -372,20 +441,54 @@ class MemorySurface:
         ]
 
     def decide(self, seq, keep):
-        """Promote or drop one PENDING claim. Returns rows changed, so 0 means
-        the seq was not a claim or was already decided — never a silent no-op.
+        """Promote a pending claim, or retire any claim that is not already
+        dropped. Returns rows changed, so 0 is never a silent no-op.
+
+        Promotion requires promoted=0: deciding the same claim twice is a
+        mistake worth reporting. Retiring does NOT, because otherwise a
+        promoted fact could never be revised — superseding it would leave both
+        versions promoted and park the key under `## Unresolved` forever,
+        which loses the fact the doc used to state.
 
         ponytail: the verdict is a column on the claim, not an event of its
         own, so it does not record who decided or when. Make it a
         kind='verdict' row if that audit trail is ever needed.
         """
         cur = self.db.execute(
-            "UPDATE conversation_history SET promoted=? WHERE seq=?"
-            " AND kind='claim' AND promoted=0",
+            "UPDATE conversation_history SET promoted=? WHERE seq=? AND kind='claim'"
+            + (" AND promoted=0" if keep else " AND promoted<>-1"),
             (1 if keep else -1, seq),
         )
         self.db.commit()
         return cur.rowcount
+
+    def doc_version(self):
+        """Highest promoted seq — the version of the doc a reader last saw.
+
+        Deliberately not MAX(seq) over the whole log: an unrelated note or a
+        spilled tool result must not read as "the doc moved under you".
+        """
+        return self.db.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM conversation_history WHERE promoted=1"
+        ).fetchone()[0]
+
+    def _promoted(self):
+        """Every promoted claim, grouped by topic_key. One query, one snapshot.
+
+        `conflicts()` and `doc()` both need this. Reading it twice let a
+        promotion land between them and render a doc that never existed.
+        """
+        keyed, loose = {}, []
+        for r in self.db.execute(
+            "SELECT * FROM conversation_history WHERE promoted=1"
+            " ORDER BY topic_key IS NULL, topic_key, seq"
+        ).fetchall():
+            (
+                loose
+                if r["topic_key"] is None
+                else keyed.setdefault(r["topic_key"], [])
+            ).append(Row(r))
+        return keyed, loose
 
     def conflicts(self):
         """Topic keys carrying more than one promoted claim, key -> [rows].
@@ -393,24 +496,8 @@ class MemorySurface:
         Two agents can both be promoted on one key. Silently taking the newer
         one is how the doc starts lying, so surface it and let a human decide.
         """
-        keys = [
-            r["topic_key"]
-            for r in self.db.execute(
-                "SELECT topic_key FROM conversation_history WHERE promoted=1"
-                " AND topic_key IS NOT NULL GROUP BY topic_key HAVING COUNT(*) > 1"
-            ).fetchall()
-        ]
-        return {
-            key: [
-                Row(r)
-                for r in self.db.execute(
-                    "SELECT * FROM conversation_history WHERE promoted=1"
-                    " AND topic_key=? ORDER BY seq",
-                    (key,),
-                ).fetchall()
-            ]
-            for key in keys
-        }
+        keyed, _ = self._promoted()
+        return {k: v for k, v in keyed.items() if len(v) > 1}
 
     def doc(self):
         """Render the promoted subset. This is what enters a model call.
@@ -418,22 +505,18 @@ class MemorySurface:
         Deliberately not a render of the log: the log is unbounded, and a doc
         that grows with it is just the whole-history prompt wearing a hat.
         """
-        clashing = self.conflicts()
-        settled = [
-            Row(r)
-            for r in self.db.execute(
-                "SELECT * FROM conversation_history WHERE promoted=1 ORDER BY seq"
-            ).fetchall()
-            if r["topic_key"] not in clashing
-        ]
-        head = self.db.execute(
-            "SELECT COALESCE(MAX(seq), 0) FROM conversation_history"
-        ).fetchone()[0]
+        keyed, loose = self._promoted()
+        clashing = {k: v for k, v in keyed.items() if len(v) > 1}
+        settled = sorted(
+            loose + [v[0] for k, v in keyed.items() if len(v) == 1],
+            key=lambda r: r.seq,
+        )
+        head = max([r.seq for r in loose] + [v[-1].seq for v in keyed.values()] or [0])
 
         lines = []
         if settled:
             lines.append("## Decisions")
-            lines += [f"- {r.content.strip()}" for r in settled]
+            lines += [f"- {_oneline(r.content)}" for r in settled]
         if clashing:
             if lines:
                 lines.append("")
@@ -441,10 +524,11 @@ class MemorySurface:
             for key, rows in clashing.items():
                 lines.append(f"▲ {key} — {len(rows)} versions")
                 lines += [
-                    f"  · {r.agent_id or 'unknown'}: {r.content.strip()}" for r in rows
+                    f"  · {r.agent_id or 'unknown'}: {_oneline(r.content)}"
+                    for r in rows
                 ]
         body = "\n".join(lines) or "(nothing promoted yet)"
-        return f"# naru · seq {head} · ~{max(1, len(body) // 4)} tokens\n\n{body}\n"
+        return f"# naru · seq {head} · ~{est(body)} tokens\n\n{body}\n"
 
     # ---- COMPUTE (read-only SQL) -----------------------------------------
     def sql_query(self, sql, params=()):
@@ -486,8 +570,8 @@ class ReadOnly:
     def expand(self, lo, hi=None):
         return self._ms.expand(lo, hi)
 
-    def outline(self, preview=90):
-        return self._ms.outline(preview=preview)
+    def outline(self):
+        return self._ms.outline()
 
     def sql_query(self, sql, params=()):
         return self._ms.sql_query(sql, params)
@@ -679,6 +763,87 @@ def demo():
 
     # decide() only moves claims — it must not touch ordinary log rows
     assert ms.decide(s1, True) == 0, "decide() reached a non-claim row"
+
+    # a promoted fact must be revisable: retire the loser, conflict clears
+    assert ms.decide(rival, False) == 1, "a promoted claim must be retirable"
+    assert ms.conflicts() == {}, "retiring one side must clear the conflict"
+    assert "Store is SQLite" in ms.doc(), "the surviving fact must come back"
+    assert ms.decide(rival, False) == 0, "retiring twice must report 0"
+    assert ms.decide(c1, True) == 0, "promoting an already-promoted claim reports 0"
+
+    # doc_version tracks the DOC, not the log: an unrelated append must not
+    # read as "the doc moved under you"
+    v = ms.doc_version()
+    ms.append("note", "unrelated", kind="note", created_at="2026-08-27T11:00:00")
+    assert ms.doc_version() == v, "an unrelated row advanced the doc version"
+
+    # a newline inside a claim must not become a second top-level line
+    nl = ms.append(
+        "agent",
+        "line one\nline two",
+        kind="claim",
+        agent_id="codex",
+        created_at="2026-08-27T10:04:00",
+    )
+    ms.decide(nl, True)
+    body = ms.doc().split("\n\n", 1)[1]
+    assert "line one line two" in body, body
+    assert not any(ln.strip().startswith("line two") for ln in body.splitlines()), (
+        "a claim broke out of its bullet"
+    )
+
+    # prune is age-only for ordinary rows and must NEVER take a decided claim
+    old = ms.append(
+        "agent",
+        "ancient decided claim",
+        kind="claim",
+        agent_id="x",
+        created_at="2000-01-01T00:00:00",
+    )
+    ms.decide(old, True)
+    stale_note = ms.append(
+        "note", "ancient note", kind="note", created_at="2000-01-01T00:00:00"
+    )
+    removed = ms.prune("2001-01-01T00:00:00")
+    assert removed == 1, f"expected only the note to go, removed {removed}"
+    assert ms.expand(old), "prune deleted a promoted claim"
+    assert ms.expand(stale_note) == [], "prune left the ordinary old row"
+    assert "ancient decided claim" in ms.doc()
+
+    # the curation columns are indexed, or every doc render is a full scan
+    idx = {
+        r["name"]
+        for r in ms.db.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    }
+    assert {"ix_promoted", "ix_topic_key"} <= idx, idx
+
+    # ---- migration: a store created BEFORE the curation columns existed ----
+    # Without this the ALTER TABLE branch never runs in the suite, because a
+    # fresh store always gets the columns from CREATE TABLE.
+    legacy_dir = pathlib.Path(tempfile.mkdtemp())
+    legacy = legacy_dir / "legacy.db"
+    old_db = sqlite3.connect(str(legacy))
+    old_db.executescript("""
+        CREATE TABLE conversation_history(
+            seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, agent_id TEXT, role TEXT, kind TEXT,
+            created_at TEXT, content TEXT, payload_path TEXT);
+        CREATE VIRTUAL TABLE fts USING fts5(content, content='');
+    """)
+    old_db.execute(
+        "INSERT INTO conversation_history(role, kind, created_at, content)"
+        " VALUES('user','context_msg','2024-01-01T00:00:00','legacy row here')"
+    )
+    old_db.commit()
+    old_db.close()
+
+    m3 = MemorySurface(str(legacy))
+    cols = {r["name"] for r in m3.db.execute("PRAGMA table_info(conversation_history)")}
+    assert {"promoted", "topic_key", "base_seq"} <= cols, cols
+    assert m3.expand(1)[0].content == "legacy row here", "migration lost a row"
+    assert m3.search("legacy"), "migration lost the FTS index"
+    assert m3.expand(1)[0].promoted == 0, "migrated rows must default to pending"
+    MemorySurface(str(legacy))  # re-opening a migrated store must be a no-op
 
     # section 2.2: the Event Log is READ-ONLY from the kernel
     ro = ms.readonly()

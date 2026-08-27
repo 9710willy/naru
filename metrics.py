@@ -28,12 +28,11 @@ MAX_BYTES = int(os.environ.get("NARU_METRICS_MAX", 2_000_000))  # ~20k events
 def record(event, **fields):
     """Append one event. Silent on any failure — this is never load-bearing."""
     try:
-        PATH.parent.mkdir(parents=True, exist_ok=True)
-        # Cheap bound: truncate rather than grow without limit. Losing old
-        # metrics is acceptable; blocking a tool call is not.
-        if PATH.exists() and PATH.stat().st_size > MAX_BYTES:
-            keep = PATH.read_text(errors="replace").splitlines()[-5000:]
-            PATH.write_text("\n".join(keep) + "\n")
+        PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # No trimming here. The hook runs as one process per tool call and
+        # Claude Code fires them in parallel, so a read-modify-write races and
+        # drops whatever another process appended in between — NEW events, not
+        # old ones. `naru prune` owns the trim; this path only appends.
         line = {"t": datetime.now().isoformat(timespec="seconds"), "e": event}
         line.update(fields)
         with PATH.open("a") as fh:

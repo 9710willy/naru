@@ -50,7 +50,7 @@ same questions.
 
 ## Observability
 
-`note stats [days]` reads `~/.naru/metrics.jsonl`, one appended line per hook
+`naru stats [days]` reads `~/.naru/metrics.jsonl`, one appended line per hook
 invocation and per recovery. Two signals only exist there, not in the Event Log:
 
 - **skipped outputs** — the spilled/skipped size distribution is the only
@@ -73,6 +73,21 @@ Three columns carry it, and each exists for a failure the design cannot prevent:
   never auto-resolve. Picking the newer one silently is how the doc starts lying.
 - `base_seq` — staleness is undetectable without it and unpreventable with it.
   `inbox` shows how far the log moved while the author worked.
+
+Invariants that cost real time to rediscover:
+
+- **`naru inject` splices between markers.** It must never `write_text()` a
+  whole file — the documented path points at a CLAUDE.md the user maintains.
+- **`prune` never takes a decided claim.** Claims are stamped with the wall
+  clock, so an age-only predicate gives every promotion a 30-day shelf life.
+- **`decide(keep=False)` works on a promoted claim.** Without that, superseding
+  a fact parks its key under `## Unresolved` forever.
+- **`base_seq` is the DOC version, not the log head** (`ms.doc_version()`), or
+  an unrelated note reads as "the doc moved under you".
+- **`measure_floor` returns None, never 0**, when the probe call fails as well
+  as when the backend reports no usage.
+- **Self-checks must not read ambient stdin.** `naru.demo()` closes it; the
+  pre-commit command used to hang forever on a terminal.
 
 **The doc is a promoted subset, never a render of the log.** If `naru inject`
 ever grows with the log, the `full` arm has been rebuilt by accident.
