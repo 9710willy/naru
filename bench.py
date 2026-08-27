@@ -198,8 +198,9 @@ def judge(q, response, backend, votes=3):
     return yes > (votes // 2)
 
 
-def one(q, arm, model, judge_model, max_turns, budget, verbose, rubric=True,
-        no_index=False):
+def one(
+    q, arm, model, judge_model, max_turns, budget, verbose, rubric=True, no_index=False
+):
     """Run a single question through one arm. Returns a result record."""
     be = get_backend(model)
     t0 = time.time()
@@ -260,13 +261,22 @@ def report(rows, label, floor):
     n = len(rows)
     acc = sum(r["correct"] for r in rows) / n
     bi = sum(r["billed_input"] for r in rows)
-    net = sum(max(0, r["billed_input"] - floor * r["turns"]) for r in rows)
+    # floor is None when the backend reports no usage at all. Subtracting 0 and
+    # printing the result would present "not measured" as a measurement.
+    net = (
+        None
+        if floor is None
+        else sum(max(0, r["billed_input"] - floor * r["turns"]) for r in rows)
+    )
     cost = sum(r["cost"] + r["judge_cost"] for r in rows)
     bar = "#" * round(acc * 28) + "." * (28 - round(acc * 28))
     print(
         f"\n  {label:8} {bar} {acc * 100:5.1f}%  ({sum(r['correct'] for r in rows)}/{n})"
     )
-    print(f"           billed-in {bi / n:>9,.0f}/q   net-of-harness {net / n:>9,.0f}/q")
+    print(
+        f"           billed-in {bi / n:>9,.0f}/q   net-of-harness "
+        + ("not measurable" if net is None else f"{net / n:>9,.0f}/q")
+    )
     print(
         f"           out {sum(r['output'] for r in rows) / n:>7,.0f}/q   "
         f"turns {sum(r['turns'] for r in rows) / n:>4.1f}   "
@@ -315,7 +325,13 @@ def main():
 
     if a.harness_floor is None:
         a.harness_floor = measure_floor(a.model)
-        print(f"measured harness floor: {a.harness_floor:,} input tok/call")
+        if a.harness_floor is None:
+            print(
+                "harness floor NOT measurable with this backend — token columns "
+                "will read as zero and net-of-harness is omitted, not reported as 0"
+            )
+        else:
+            print(f"measured harness floor: {a.harness_floor:,} input tok/call")
 
     qs = load(a.split, a.n, qtype=a.qtype)
     arms = a.arms.split(",")

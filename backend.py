@@ -12,6 +12,7 @@ claim is that the view stays small.
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -158,18 +159,31 @@ class CommandBackend(_Retrying):
     cmd: str = ""
     reports_tokens = False
 
+    def __post_init__(self):
+        """Validate once, here, at the trust boundary.
+
+        Parsing per call and swallowing the error would turn one typo in
+        NARU_BACKEND — an unbalanced quote, a binary that isn't installed —
+        into a whole benchmark run of empty answers with nothing raised.
+        """
+        self.argv = shlex.split(self.cmd)
+        if not self.argv:
+            raise ValueError("NARU_BACKEND is empty; expected a command to run")
+        if shutil.which(self.argv[0]) is None:
+            raise FileNotFoundError(f"NARU_BACKEND command not found: {self.argv[0]!r}")
+
     def _once(self, prompt, system=None):
         if system:
             prompt = f"{system}\n\n{prompt}"
         try:
             p = subprocess.run(
-                shlex.split(self.cmd),
+                self.argv,
                 input=prompt,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
             )
-        except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        except (subprocess.TimeoutExpired, OSError):
             self.usage.errors += 1
             return ""
         if p.returncode != 0:
@@ -206,10 +220,10 @@ def measure_floor(model=HAIKU):
     """
     b = get_backend(model)
     if not b.reports_tokens:
-        # Nothing to subtract: this backend reports no tokens at all. Returning
-        # a plausible-looking number here would be exactly the hardcoded
-        # constant ADR 0002 exists to prevent.
-        return 0
+        # None, not 0. Zero would flow into the net-of-harness subtraction and
+        # print as though a floor had been measured — the same class of wrong
+        # number ADR 0002 exists to prevent. "Not measurable" must stay visible.
+        return None
     b("Reply with one word: ok", system="You reply in one word.")
     return b.usage.billed_input // max(1, b.usage.calls)
 
@@ -222,10 +236,14 @@ def demo():
     echo = CommandBackend(cmd="cat")
     assert echo("PING", system="SYS") == "SYS\n\nPING", "system prompt not prepended"
     assert not echo.reports_tokens, "a generic pipe must not claim token counts"
-    gone = CommandBackend(cmd="definitely-not-a-real-binary", retries=1)
-    assert gone("hi") == "" and gone.usage.errors, (
-        "a missing binary must count as error"
-    )
+    # A bad NARU_BACKEND must fail at construction, not yield a silent run of
+    # empty answers that reads as "the model had nothing to say".
+    for bad in ("definitely-not-a-real-binary", "", 'sh -c "unbalanced'):
+        try:
+            CommandBackend(cmd=bad)
+            raise AssertionError(f"accepted a bad backend command: {bad!r}")
+        except (ValueError, FileNotFoundError):
+            pass
     print("ok — generic command backend (offline)")
 
     b = Backend(model=HAIKU)
