@@ -193,6 +193,9 @@ class CommandBackend(_Retrying):
         return p.stdout.strip()
 
 
+_WARNED = set()
+
+
 def get_backend(model=HAIKU):
     """The backend for this machine.
 
@@ -203,11 +206,17 @@ def get_backend(model=HAIKU):
     cmd = os.environ.get("NARU_BACKEND")
     if not cmd:
         return Backend(model=model)
-    print(
-        f"backend: {cmd!r} — a generic pipe reports no usage, so token and "
-        "cost columns will read as zero rather than as measured",
-        file=sys.stderr,
-    )
+    # Once per command, not once per construction. bench.py builds a backend
+    # per question per arm, so warning unguarded here put ~200 identical lines
+    # on stderr for a single n=48 run. The check-then-add races under bench.py's
+    # thread pool; losing that race prints the line twice, which is harmless.
+    if cmd not in _WARNED:
+        _WARNED.add(cmd)
+        print(
+            f"backend: {cmd!r} — a generic pipe reports no usage, so token and "
+            "cost columns will read as zero rather than as measured",
+            file=sys.stderr,
+        )
     return CommandBackend(cmd=cmd)
 
 
@@ -244,6 +253,23 @@ def demo():
             raise AssertionError(f"accepted a bad backend command: {bad!r}")
         except (ValueError, FileNotFoundError):
             pass
+
+    # The "no usage" warning is per command, not per construction. bench.py
+    # builds one backend per question per arm, so this is the difference
+    # between one line of stderr and roughly two hundred.
+    import contextlib
+    import io
+
+    os.environ["NARU_BACKEND"] = "cat"
+    _WARNED.discard("cat")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        for _ in range(20):
+            assert isinstance(get_backend(), CommandBackend)
+    assert err.getvalue().count("generic pipe") == 1, (
+        f"warned {err.getvalue().count('generic pipe')} times, expected 1"
+    )
+    os.environ.pop("NARU_BACKEND", None)
     print("ok — generic command backend (offline)")
 
     b = Backend(model=HAIKU)
