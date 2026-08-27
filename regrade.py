@@ -14,7 +14,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from backend import HAIKU, Backend
+from backend import HAIKU, get_backend
 from bench import judge, load
 
 
@@ -38,7 +38,7 @@ def main(paths, model=HAIKU, workers=6):
         rows = d["rows"]
 
         def one(r):
-            be = Backend(model=model)
+            be = get_backend(model)
             q = {"question": questions.get(r["qid"], ""), "answer": r["gold"]}
             new = judge(q, r.get("answer") or "", be)
             return r, new, be.usage.cost_usd

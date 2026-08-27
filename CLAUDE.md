@@ -1,10 +1,10 @@
-# Scroll
+# Naru
 
 Implementation of _Context as an Environment_ (arXiv 2608.21690). The agent's
 history lives in a SQLite Event Log and a persistent Python kernel; the model
 writes code to reach it and only what it prints enters the next call.
 
-Read `docs/adr/` before changing anything — three decisions there are
+Read `docs/adr/` before changing anything — four decisions there are
 non-obvious and one of them (0002) exists because a hardcoded constant produced
 a wrong published result.
 
@@ -14,7 +14,7 @@ Every module has a runnable self-check. The first four need no network:
 
 ```bash
 python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
-python3 note.py --selfcheck && python3 hook_spill.py --selfcheck
+python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
 python3 backend.py    # live: 2 cheap calls, prints the harness token floor
 ```
 
@@ -22,7 +22,7 @@ Stdlib only. No dependencies — do not add one for something a few lines cover.
 
 ## Benchmark rules
 
-`bench.py` is the only source of numbers. Two arms (`full`, `scroll`) over the
+`bench.py` is the only source of numbers. Two arms (`full`, `naru`) over the
 same questions.
 
 - **Never hardcode a measured constant.** `--harness-floor` is measured at
@@ -34,12 +34,12 @@ same questions.
 - The judge is not LongMemEval's official prompt, so numbers are internal
   progress only — never present them as leaderboard-comparable.
 - Multi-turn arms take more exposure to per-call flakiness than single-turn
-  ones. A low retry budget silently biases against `scroll`.
+  ones. A low retry budget silently biases against `naru`.
 
 ## Gotchas that cost real time
 
 - `claude -p` needs `--allowed-tools ""`; without it the model tries to call a
-  tool and every scroll question errors on `stop_reason: tool_use` (ADR 0001).
+  tool and every naru question errors on `stop_reason: tool_use` (ADR 0001).
 - The CLI leaks its own identity and CLAUDE.md into the agent. The system
   prompt overrides this explicitly — do not remove that paragraph (ADR 0003).
 - A `PostToolUse` `updatedToolOutput` that does not match the tool's own output
@@ -50,18 +50,35 @@ same questions.
 
 ## Observability
 
-`note stats [days]` reads `~/.scroll/metrics.jsonl`, one appended line per hook
+`note stats [days]` reads `~/.naru/metrics.jsonl`, one appended line per hook
 invocation and per recovery. Two signals only exist there, not in the Event Log:
 
 - **skipped outputs** — the spilled/skipped size distribution is the only
-  evidence for whether `SCROLL_SPILL_THRESHOLD` is set right.
+  evidence for whether `NARU_SPILL_THRESHOLD` is set right.
 - **recoveries** — if spills accumulate and `recoveries used` stays 0, the
   retrieval handle is dead weight and the preview should carry more.
 
 Recording is fire-and-forget: every failure in `metrics.py` is swallowed, because
 a metrics problem must never break a tool call. Self-checks must point
-`SCROLL_METRICS` at a temp path — an earlier version wrote test events into the
+`NARU_METRICS` at a temp path — an earlier version wrote test events into the
 real store.
+
+## The curation layer (ours, not the paper's)
+
+Agents write claims; a human promotes them; only promoted claims reach the doc.
+Three columns carry it, and each exists for a failure the design cannot prevent:
+
+- `promoted` — a decision never deletes. A dropped claim stays addressable.
+- `topic_key` — two promoted claims on one key is a contradiction. Show both,
+  never auto-resolve. Picking the newer one silently is how the doc starts lying.
+- `base_seq` — staleness is undetectable without it and unpreventable with it.
+  `inbox` shows how far the log moved while the author worked.
+
+**The doc is a promoted subset, never a render of the log.** If `naru inject`
+ever grows with the log, the `full` arm has been rebuilt by accident.
+
+`naru inject <path>` is the whole harness integration. Do not add a per-harness
+plugin API — anything that runs a shell command is already supported (ADR 0004).
 
 ## Where this diverges from the paper
 

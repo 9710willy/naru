@@ -1,4 +1,4 @@
-"""The Scroll agent loop.
+"""The Naru agent loop.
 
 History lives in the Session Environment (Event Log + kernel), never in the
 prompt. Each turn the model writes a Python cell; the cell searches and
@@ -242,7 +242,7 @@ def _run(
     return answer["text"], turns_used, peak
 
 
-def run_scroll(
+def run_naru(
     ms,
     question,
     backend,
@@ -321,7 +321,7 @@ def demo():
         calls["n"] += 1
         return r
 
-    ans, turns, peak = run_scroll(
+    ans, turns, peak = run_naru(
         ms,
         "What car do I drive?",
         fake,
@@ -358,7 +358,7 @@ def demo():
         n["i"] += 1
         return r
 
-    ans2, _, _ = run_scroll(
+    ans2, _, _ = run_naru(
         ms, "noisy?", fake2, max_turns=8, budget=500, protect_tail=2
     )
     assert ans2 == "done", ans2

@@ -164,18 +164,18 @@ def demo():
         return str(p)
 
     # identical runs => zero spread, zero flips
-    same = {"scroll": {"q1": True, "q2": True, "q3": False, "q4": True}}
+    same = {"naru": {"q1": True, "q2": True, "q3": False, "q4": True}}
     a, b = write("runA", same), write("runB", same)
     assert main([a, b]) == 0
 
     # two flips in OPPOSITE directions cancel in accuracy but must still show
-    r1 = {"scroll": {"q1": True, "q2": False, "q3": True, "q4": True}}
-    r2 = {"scroll": {"q1": False, "q2": True, "q3": True, "q4": True}}
+    r1 = {"naru": {"q1": True, "q2": False, "q3": True, "q4": True}}
+    r2 = {"naru": {"q1": False, "q2": True, "q3": True, "q4": True}}
     c, e = write("runC", r1), write("runE", r2)
     runs = [("c", load(c)), ("e", load(e))]
-    accs = [100 * sum(v["scroll"].values()) / 4 for _, v in runs]
+    accs = [100 * sum(v["naru"].values()) / 4 for _, v in runs]
     assert accs[0] == accs[1], "accuracy should be identical here"
-    flipped = [q for q in r1["scroll"] if r1["scroll"][q] != r2["scroll"][q]]
+    flipped = [q for q in r1["naru"] if r1["naru"][q] != r2["naru"][q]]
     assert len(flipped) == 2, flipped
     print("ok — noise checks passed (equal accuracy still reports 2 flips)")
 

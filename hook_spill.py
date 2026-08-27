@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: spill oversized tool output into the Scroll Event Log.
+"""PostToolUse hook: spill oversized tool output into the Naru Event Log.
 
 Claude Code re-sends the whole conversation every turn, so one large tool
 result is paid for on every later turn and occupies the context window for the
@@ -13,7 +13,7 @@ Enable per-project in .claude/settings.json:
 
     {"hooks": {"PostToolUse": [{"matcher": "Bash|Read",
       "hooks": [{"type": "command",
-                 "command": "python3 /Users/willee1/work/scroll/hook_spill.py"}]}]}}
+                 "command": "python3 /path/to/naru/hook_spill.py"}]}]}}
 
 The replacement MUST match the tool's own output schema or Claude Code discards
 it and keeps the original, so we mutate the text field in place inside the
@@ -30,9 +30,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import metrics
 from ms import DEFAULT_DB
 
-THRESHOLD = int(os.environ.get("SCROLL_SPILL_THRESHOLD", "2000"))  # chars
-KEEP = int(os.environ.get("SCROLL_SPILL_PREVIEW", "600"))  # chars kept inline
-DB = pathlib.Path(os.environ.get("SCROLL_SPILL_DB", DEFAULT_DB))
+THRESHOLD = int(os.environ.get("NARU_SPILL_THRESHOLD", "2000"))  # chars
+KEEP = int(os.environ.get("NARU_SPILL_PREVIEW", "600"))  # chars kept inline
+DB = pathlib.Path(os.environ.get("NARU_SPILL_DB", DEFAULT_DB))
 
 # Text-bearing fields, in the order tools tend to use them.
 TEXT_FIELDS = ("stdout", "content", "output", "text", "result", "stderr")
@@ -71,11 +71,11 @@ def main():
     except (json.JSONDecodeError, ValueError):
         return 0  # not our business; pass through untouched
 
-    # SCROLL_SPILL_DEBUG=<path> records the real event shape. Claude Code's
+    # NARU_SPILL_DEBUG=<path> records the real event shape. Claude Code's
     # per-tool response schemas are not documented, and a replacement that does
     # not match the tool's schema is discarded silently, so the shape has to be
     # observed rather than assumed.
-    dbg = os.environ.get("SCROLL_SPILL_DEBUG")
+    dbg = os.environ.get("NARU_SPILL_DEBUG")
     if dbg:
         try:
             with open(dbg, "a") as fh:
@@ -116,17 +116,17 @@ def main():
     except Exception as e:  # never break the user's tool call over a spill
         metrics.record("error", tool=event.get("tool_name"), chars=len(text),
                        msg=f"{type(e).__name__}: {e}")
-        print(f"scroll spill failed, output left inline: {e}", file=sys.stderr)
+        print(f"naru spill failed, output left inline: {e}", file=sys.stderr)
         return 0
 
     lines = len(text.splitlines())
     replacement = (
         f"{text[:KEEP]}\n"
-        f"\n[scroll: {len(text):,} chars / {lines:,} lines spilled to the Event "
+        f"\n[naru: {len(text):,} chars / {lines:,} lines spilled to the Event "
         f"Log as seq {seq}. Showing the first {KEEP} chars.]\n"
         f"[signposts]\n{outline(text)}\n"
-        f"[recover: `note show {seq}` for the full text, or "
-        f'`note search "<terms>"` to find a part of it]'
+        f"[recover: `naru show {seq}` for the full text, or "
+        f'`naru search "<terms>"` to find a part of it]'
     )
 
     if container is None:
@@ -160,8 +160,8 @@ def demo():
     me = [sys.executable, str(pathlib.Path(__file__).resolve())]
     # Isolate metrics too: a self-check must not write into the user's
     # real observability store.
-    env = {**os.environ, "SCROLL_SPILL_DB": str(DB),
-           "SCROLL_METRICS": str(DB.parent / "m.jsonl")}
+    env = {**os.environ, "NARU_SPILL_DB": str(DB),
+           "NARU_METRICS": str(DB.parent / "m.jsonl")}
 
     def run(payload):
         p = subprocess.run(
@@ -187,7 +187,7 @@ def demo():
     assert set(upd) == {"stdout", "stderr", "interrupted"}, upd.keys()
     assert upd["interrupted"] is False, "non-text fields must survive"
     assert len(upd["stdout"]) < len(big) / 4, "replacement should be much smaller"
-    assert "seq 1" in upd["stdout"] and "note show 1" in upd["stdout"]
+    assert "seq 1" in upd["stdout"] and "naru show 1" in upd["stdout"]
     assert "line 0" in upd["stdout"], "preview should show the head"
     assert "line 200" in upd["stdout"], "signposts should reach the middle"
 

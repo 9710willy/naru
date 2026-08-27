@@ -2,7 +2,7 @@
 
 Runs two arms over the same data so the comparison is controlled:
   full     — the whole history stuffed into one prompt (the usual approach)
-  scroll   — history in the Session Environment, model writes code to reach it
+  naru   — history in the Session Environment, model writes code to reach it
 
 Reports accuracy, tokens billed, and cost for each.
 """
@@ -15,8 +15,8 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from agent import LONGMEMEVAL_RUBRIC, run_scroll
-from backend import HAIKU, Backend, measure_floor
+from agent import LONGMEMEVAL_RUBRIC, run_naru
+from backend import HAIKU, get_backend, measure_floor
 from eviction import est, rollup
 from ms import MemorySurface
 
@@ -201,12 +201,12 @@ def judge(q, response, backend, votes=3):
 def one(q, arm, model, judge_model, max_turns, budget, verbose, rubric=True,
         no_index=False):
     """Run a single question through one arm. Returns a result record."""
-    be = Backend(model=model)
+    be = get_backend(model)
     t0 = time.time()
 
-    if arm == "scroll":
+    if arm == "naru":
         ms, index = ingest(q, build_index=not no_index)
-        ans, turns, peak = run_scroll(
+        ans, turns, peak = run_naru(
             ms,
             q["question"],
             be,
@@ -226,7 +226,7 @@ def one(q, arm, model, judge_model, max_turns, budget, verbose, rubric=True,
         ans, turns, peak = be(prompt, system=FULL_SYSTEM), 1, est(prompt)
 
     elapsed = time.time() - t0
-    jb = Backend(model=judge_model)
+    jb = get_backend(judge_model)
     ok = judge(q, ans, jb)
 
     return {
@@ -293,7 +293,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="oracle", choices=["oracle", "s", "m"])
     ap.add_argument("-n", type=int, default=12)
-    ap.add_argument("--arms", default="full,scroll")
+    ap.add_argument("--arms", default="full,naru")
     ap.add_argument("--model", default=HAIKU)
     ap.add_argument("--judge-model", default=HAIKU)
     ap.add_argument("--max-turns", type=int, default=8)

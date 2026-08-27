@@ -7,8 +7,8 @@ conclusion once already.
 ## Context
 
 The `claude` CLI sends its own system prompt with every call, so each call
-bills input tokens before any of our prompt. To compare the `full` and `scroll`
-arms we must subtract that floor — `scroll` uses ~3.4 calls per question and
+bills input tokens before any of our prompt. To compare the `full` and `naru`
+arms we must subtract that floor — `naru` uses ~3.4 calls per question and
 `full` uses 1, so the floor is multiplied differently per arm.
 
 The floor was measured once at **13,231** and hardcoded. Then ADR 0001's flags
@@ -23,10 +23,10 @@ store the number in source.
 ## Why
 
 With the stale floor the `_s` result read as "net input is a wash". With the
-measured floor the same saved rows say `scroll` uses **17% fewer** net input
+measured floor the same saved rows say `naru` uses **17% fewer** net input
 tokens:
 
-| floor             | full net-in/q | scroll net-in/q |
+| floor             | full net-in/q | naru net-in/q |
 | ----------------- | ------------- | --------------- |
 | 13,231 (stale)    | 126,761       | 128,801         |
 | 22,616 (measured) | 117,376       | 96,892          |

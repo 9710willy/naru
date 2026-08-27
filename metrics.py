@@ -20,9 +20,9 @@ import sys
 from datetime import datetime
 
 PATH = pathlib.Path(
-    os.environ.get("SCROLL_METRICS", pathlib.Path.home() / ".scroll" / "metrics.jsonl")
+    os.environ.get("NARU_METRICS", pathlib.Path.home() / ".naru" / "metrics.jsonl")
 )
-MAX_BYTES = int(os.environ.get("SCROLL_METRICS_MAX", 2_000_000))  # ~20k events
+MAX_BYTES = int(os.environ.get("NARU_METRICS_MAX", 2_000_000))  # ~20k events
 
 
 def record(event, **fields):
@@ -85,7 +85,7 @@ def report(days=None, threshold=None):
     saved = sum(e.get("chars", 0) - e.get("kept", 0) for e in spills)
     L = []
     win = f"last {days}d" if days else "all time"
-    L.append(f"scroll observability ({win})   {PATH}")
+    L.append(f"naru observability ({win})   {PATH}")
     L.append("")
     L.append(f"  hook invocations   {len(calls):>7,}")
     L.append(
@@ -114,7 +114,7 @@ def report(days=None, threshold=None):
                 L.append(
                     f"    {len(near)} skipped output(s) above "
                     f"{int(threshold * 0.6):,} chars — consider lowering "
-                    f"SCROLL_SPILL_THRESHOLD"
+                    f"NARU_SPILL_THRESHOLD"
                 )
     L.append(
         f"  recoveries used    {len(recalls):>7,}"

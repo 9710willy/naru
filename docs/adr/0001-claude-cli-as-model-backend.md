@@ -6,7 +6,7 @@ runs with zero credential setup.
 
 ## Context
 
-Scroll needs a plain text-completion endpoint: send a prompt, get one Python
+Naru needs a plain text-completion endpoint: send a prompt, get one Python
 cell back. We had no API key and did not want to add one, or add the
 `anthropic` SDK (nothing else in the repo needs a dependency).
 
@@ -17,7 +17,7 @@ are load-bearing and non-obvious:
 
 - `--allowed-tools ""` — an **empty allowlist removes every tool**. Without it
   the model tries to _call_ a real tool instead of emitting a code block, the
-  run ends on `stop_reason: "tool_use"`, and every scroll question fails with
+  run ends on `stop_reason: "tool_use"`, and every naru question fails with
   `is_error: true`. This cost a whole benchmark round to diagnose.
 - `--exclude-dynamic-system-prompt-sections` plus `--system-prompt` — replaces
   the Claude Code persona so the model is not acting as a coding agent.

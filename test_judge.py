@@ -12,7 +12,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from backend import HAIKU, Backend
+from backend import HAIKU, get_backend
 from bench import judge
 
 # (question, gold, candidate, expected)
@@ -102,7 +102,7 @@ CASES = [
 ]
 
 def main():
-    be = Backend(model=HAIKU)
+    be = get_backend(HAIKU)
     bad = []
     for i, (q, gold, cand, want) in enumerate(CASES, 1):
         got = judge({"question": q, "answer": gold}, cand, be)

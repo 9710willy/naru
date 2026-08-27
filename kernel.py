@@ -49,7 +49,7 @@ class Kernel:
     MAX_OUT = 8000  # chars of printed output allowed into the working view
 
     def __init__(self, **preload):
-        self.ns = {"__name__": "__scroll__"}
+        self.ns = {"__name__": "__naru__"}
         self.ns.update(preload)
         self._preloaded = set(preload)
 

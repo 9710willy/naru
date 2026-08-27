@@ -1,13 +1,19 @@
-"""Model backend via the local `claude` CLI — no API key needed, reuses the
-CLI's own auth.
+"""Model backends. Defaults to the local `claude` CLI — no API key needed,
+reuses the CLI's own auth — and falls back to any command that reads a prompt
+on stdin, so the benchmark runs against a model this repo has never heard of.
+
+    NARU_BACKEND='codex exec -' python3 bench.py --split oracle -n 12
 
 Each call is stateless: we pass the full working view as one prompt, exactly as
-an API call would. That is the honest setup for measuring Scroll, whose whole
+an API call would. That is the honest setup for measuring Naru, whose whole
 claim is that the view stays small.
 """
 
 import json
+import os
+import shlex
 import subprocess
+import sys
 from dataclasses import dataclass, field
 
 HAIKU = "claude-haiku-4-5-20251001"
@@ -68,14 +74,21 @@ class Usage:
 
 
 @dataclass
-class Backend:
-    model: str = HAIKU
+class _Retrying:
+    """Shared call loop: one prompt in, the model's text out.
+
+    Subclasses supply `_once`. The retry budget lives here because a CLI
+    intermittently returns an empty result for a valid request, which penalizes
+    multi-turn arms in proportion to their turn count — a low budget silently
+    biases the benchmark against naru.
+    """
+
     timeout: int = 300
-    # The CLI intermittently returns an empty result for a valid request. This
-    # penalizes multi-turn arms in proportion to their turn count, so a low
-    # retry budget silently biases the benchmark against Scroll.
     retries: int = 6
     usage: Usage = field(default_factory=Usage)
+    # Whether `usage` means anything. A generic pipe cannot report tokens, and
+    # a run must not print $0.000 as though the calls were free.
+    reports_tokens = True
 
     def __call__(self, prompt, system=None):
         """Send one prompt, return the model's text. Retries an empty reply,
@@ -96,6 +109,16 @@ class Backend:
         # rather than returning "" as if the model had nothing to say.
         self.usage.errors += 1
         return ""
+
+    def _once(self, prompt, system=None):
+        raise NotImplementedError
+
+
+@dataclass
+class Backend(_Retrying):
+    """The local `claude` CLI. Reports real token counts and cost."""
+
+    model: str = HAIKU
 
     def _once(self, prompt, system=None):
         cmd = ["claude", "-p", "--model", self.model, *_BARE]
@@ -122,6 +145,58 @@ class Backend:
         return d.get("result") or ""
 
 
+@dataclass
+class CommandBackend(_Retrying):
+    """Any CLI that reads a prompt on stdin and writes the reply on stdout.
+
+        NARU_BACKEND='codex exec -'        NARU_BACKEND='ollama run llama3'
+
+    The system prompt is prepended to the user prompt rather than passed as a
+    flag: every model understands that, and no two CLIs spell the flag alike.
+    """
+
+    cmd: str = ""
+    reports_tokens = False
+
+    def _once(self, prompt, system=None):
+        if system:
+            prompt = f"{system}\n\n{prompt}"
+        try:
+            p = subprocess.run(
+                shlex.split(self.cmd),
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+            self.usage.errors += 1
+            return ""
+        if p.returncode != 0:
+            self.usage.errors += 1
+            return ""
+        self.usage.calls += 1
+        return p.stdout.strip()
+
+
+def get_backend(model=HAIKU):
+    """The backend for this machine.
+
+    Defaults to the `claude` CLI. NARU_BACKEND replaces it with any command
+    that reads a prompt on stdin, which is what makes the benchmark runnable
+    against a model this repo has never heard of.
+    """
+    cmd = os.environ.get("NARU_BACKEND")
+    if not cmd:
+        return Backend(model=model)
+    print(
+        f"backend: {cmd!r} — a generic pipe reports no usage, so token and "
+        "cost columns will read as zero rather than as measured",
+        file=sys.stderr,
+    )
+    return CommandBackend(cmd=cmd)
+
+
 def measure_floor(model=HAIKU):
     """Input tokens the CLI itself costs per call, before any of our prompt.
 
@@ -129,7 +204,12 @@ def measure_floor(model=HAIKU):
     built-in system prompt change, and a stale value silently distorts every
     per-arm token comparison.
     """
-    b = Backend(model=model)
+    b = get_backend(model)
+    if not b.reports_tokens:
+        # Nothing to subtract: this backend reports no tokens at all. Returning
+        # a plausible-looking number here would be exactly the hardcoded
+        # constant ADR 0002 exists to prevent.
+        return 0
     b("Reply with one word: ok", system="You reply in one word.")
     return b.usage.billed_input // max(1, b.usage.calls)
 
@@ -137,6 +217,17 @@ def measure_floor(model=HAIKU):
 def demo():
     """Live check — costs a couple of cheap calls. Also measures the harness
     token floor, so benchmark numbers can be read net of CLI overhead."""
+    # Offline first: any stdin->stdout command is a valid backend. `cat` echoes
+    # the prompt, which is enough to prove the plumbing without a network call.
+    echo = CommandBackend(cmd="cat")
+    assert echo("PING", system="SYS") == "SYS\n\nPING", "system prompt not prepended"
+    assert not echo.reports_tokens, "a generic pipe must not claim token counts"
+    gone = CommandBackend(cmd="definitely-not-a-real-binary", retries=1)
+    assert gone("hi") == "" and gone.usage.errors, (
+        "a missing binary must count as error"
+    )
+    print("ok — generic command backend (offline)")
+
     b = Backend(model=HAIKU)
 
     out = b("Reply with exactly one word: PONG", system="You reply in one word.")

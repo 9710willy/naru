@@ -1,4 +1,4 @@
-"""ms — the memory surface for a Scroll-style Session Environment.
+"""ms — the memory surface for a Naru-style Session Environment.
 
 An append-only Event Log (SQLite + FTS5) the model writes code against.
 Full history stays lossless and addressable by `seq`; only what the caller
@@ -22,11 +22,11 @@ import tempfile
 from datetime import date
 
 # ONE Event Log for everything the session wants to recall later: notes written
-# by `note add`, and tool output spilled by the PostToolUse hook. They differ
+# by `naru add`, and tool output spilled by the PostToolUse hook. They differ
 # only by `kind`. Two stores would mean the recovery handle a spill prints
-# (`note show N`) points at a database `note` does not read.
+# (`naru show N`) points at a database `naru` does not read.
 DEFAULT_DB = pathlib.Path(
-    os.environ.get("SCROLL_DB", pathlib.Path.home() / ".scroll" / "log.db")
+    os.environ.get("NARU_DB", pathlib.Path.home() / ".naru" / "log.db")
 )
 
 
@@ -67,8 +67,13 @@ def _to_match(query):
 
 class MemorySurface:
     def __init__(self, db=":memory:", blobs=None, blob_threshold=4000):
-        self.db = sqlite3.connect(db)
+        # Several agents append while a human reads. WAL lets readers run
+        # during a write; busy_timeout absorbs the overlap instead of raising
+        # "database is locked" in whichever caller lost the race.
+        self.db = sqlite3.connect(db, timeout=30)
         self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA busy_timeout=30000")
         try:
             self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _probe USING fts5(x)")
             self.db.execute("DROP TABLE _probe")
@@ -86,16 +91,21 @@ class MemorySurface:
                 kind       TEXT,
                 created_at TEXT,          -- ISO-8601, lexically sortable
                 content    TEXT,
-                payload_path TEXT         -- externalized big payloads
+                payload_path TEXT,        -- externalized big payloads
+                -- curation: a claim is pending (0), promoted (1) or dropped (-1)
+                promoted   INTEGER NOT NULL DEFAULT 0,
+                topic_key  TEXT,          -- same key, both promoted = contradiction
+                base_seq   INTEGER        -- doc version the author wrote against
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
                 content, content='conversation_history', content_rowid='seq');
         """)
         self._migrate_fts()
+        self._migrate_cols()
         # per-instance by default: bench.py runs questions in parallel
         # threads and a shared dir would collide on blobs/<seq>.txt
         self.blobs = pathlib.Path(
-            blobs or pathlib.Path(tempfile.gettempdir()) / f"scroll-blobs-{id(self):x}"
+            blobs or pathlib.Path(tempfile.gettempdir()) / f"naru-blobs-{id(self):x}"
         )
         self.blob_threshold = blob_threshold
 
@@ -121,6 +131,27 @@ class MemorySurface:
         self.db.execute("INSERT INTO fts(fts) VALUES('rebuild')")
         self.db.commit()
 
+    def _migrate_cols(self):
+        """Add the curation columns to a store created before they existed.
+
+        ADD COLUMN throws if the column is already there and SQLite has no
+        IF NOT EXISTS for it, so read the table shape first.
+        """
+        have = {
+            r["name"]
+            for r in self.db.execute("PRAGMA table_info(conversation_history)")
+        }
+        for name, decl in (
+            ("promoted", "INTEGER NOT NULL DEFAULT 0"),
+            ("topic_key", "TEXT"),
+            ("base_seq", "INTEGER"),
+        ):
+            if name not in have:
+                self.db.execute(
+                    f"ALTER TABLE conversation_history ADD COLUMN {name} {decl}"
+                )
+        self.db.commit()
+
     # ---- ingest -----------------------------------------------------------
     def append(
         self,
@@ -132,6 +163,8 @@ class MemorySurface:
         agent_id=None,
         created_at=None,
         payload=None,
+        topic_key=None,
+        base_seq=None,
     ):
         """Append one turn. Returns its stable `seq`. `created_at` is caller-
         supplied (the harness stamps it) so ingestion stays deterministic.
@@ -143,9 +176,19 @@ class MemorySurface:
         big = payload is not None and len(payload) > self.blob_threshold
         cur = self.db.execute(
             "INSERT INTO conversation_history"
-            "(session_id, agent_id, role, kind, created_at, content, payload_path)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (session_id, agent_id, role, kind, created_at, content, None),
+            "(session_id, agent_id, role, kind, created_at, content, payload_path,"
+            " topic_key, base_seq) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                session_id,
+                agent_id,
+                role,
+                kind,
+                created_at,
+                content,
+                None,
+                topic_key,
+                base_seq,
+            ),
         )
         seq = cur.lastrowid
 
@@ -295,7 +338,7 @@ class MemorySurface:
                     try:
                         f = pathlib.Path(r["payload_path"])
                         f.unlink(missing_ok=True)
-                        if f.parent.name.startswith("scroll-blobs-") and not any(
+                        if f.parent.name.startswith("naru-blobs-") and not any(
                             f.parent.iterdir()
                         ):
                             f.parent.rmdir()
@@ -311,6 +354,97 @@ class MemorySurface:
         self.db.commit()
         self.db.execute("VACUUM")
         return len(seqs)
+
+    # ---- CURATE -----------------------------------------------------------
+    # A claim is one agent's proposed fact, appended like any other row and
+    # marked kind='claim'. Only a promoted claim reaches the doc. That is the
+    # whole reason the doc stays small while the log grows without bound.
+
+    def pending(self, k=50):
+        """Claims still awaiting a human decision, oldest first."""
+        return [
+            Row(r)
+            for r in self.db.execute(
+                "SELECT * FROM conversation_history WHERE kind='claim'"
+                " AND promoted=0 ORDER BY seq LIMIT ?",
+                (k,),
+            ).fetchall()
+        ]
+
+    def decide(self, seq, keep):
+        """Promote or drop one PENDING claim. Returns rows changed, so 0 means
+        the seq was not a claim or was already decided — never a silent no-op.
+
+        ponytail: the verdict is a column on the claim, not an event of its
+        own, so it does not record who decided or when. Make it a
+        kind='verdict' row if that audit trail is ever needed.
+        """
+        cur = self.db.execute(
+            "UPDATE conversation_history SET promoted=? WHERE seq=?"
+            " AND kind='claim' AND promoted=0",
+            (1 if keep else -1, seq),
+        )
+        self.db.commit()
+        return cur.rowcount
+
+    def conflicts(self):
+        """Topic keys carrying more than one promoted claim, key -> [rows].
+
+        Two agents can both be promoted on one key. Silently taking the newer
+        one is how the doc starts lying, so surface it and let a human decide.
+        """
+        keys = [
+            r["topic_key"]
+            for r in self.db.execute(
+                "SELECT topic_key FROM conversation_history WHERE promoted=1"
+                " AND topic_key IS NOT NULL GROUP BY topic_key HAVING COUNT(*) > 1"
+            ).fetchall()
+        ]
+        return {
+            key: [
+                Row(r)
+                for r in self.db.execute(
+                    "SELECT * FROM conversation_history WHERE promoted=1"
+                    " AND topic_key=? ORDER BY seq",
+                    (key,),
+                ).fetchall()
+            ]
+            for key in keys
+        }
+
+    def doc(self):
+        """Render the promoted subset. This is what enters a model call.
+
+        Deliberately not a render of the log: the log is unbounded, and a doc
+        that grows with it is just the whole-history prompt wearing a hat.
+        """
+        clashing = self.conflicts()
+        settled = [
+            Row(r)
+            for r in self.db.execute(
+                "SELECT * FROM conversation_history WHERE promoted=1 ORDER BY seq"
+            ).fetchall()
+            if r["topic_key"] not in clashing
+        ]
+        head = self.db.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM conversation_history"
+        ).fetchone()[0]
+
+        lines = []
+        if settled:
+            lines.append("## Decisions")
+            lines += [f"- {r.content.strip()}" for r in settled]
+        if clashing:
+            if lines:
+                lines.append("")
+            lines.append("## Unresolved")
+            for key, rows in clashing.items():
+                lines.append(f"▲ {key} — {len(rows)} versions")
+                lines += [
+                    f"  · {r.agent_id or 'unknown'}: {r.content.strip()}" for r in rows
+                ]
+        body = "\n".join(lines) or "(nothing promoted yet)"
+        return f"# naru · seq {head} · ~{max(1, len(body) // 4)} tokens\n\n{body}\n"
 
     # ---- COMPUTE (read-only SQL) -----------------------------------------
     def sql_query(self, sql, params=()):
@@ -330,7 +464,6 @@ class MemorySurface:
         a = date.fromisoformat(str(d1)[:10])
         b = date.fromisoformat(str(d2)[:10])
         return abs((b - a).days)
-
 
 
 class ReadOnly:
@@ -475,9 +608,77 @@ def demo():
     assert ms.search("toll", until="2024-12-31"), "until= too strict"
 
     # section 2.2: agent/session identifiers are recorded
-    a = ms.append("user", "multi-agent turn", agent_id="agent-7",
-                  session_id="s2", created_at="2024-08-01T00:00:00")
+    a = ms.append(
+        "user",
+        "multi-agent turn",
+        agent_id="agent-7",
+        session_id="s2",
+        created_at="2024-08-01T00:00:00",
+    )
     assert ms.expand(a)[0].agent_id == "agent-7"
+
+    # ---- curation: nothing reaches the doc without a human decision --------
+    c1 = ms.append(
+        "agent",
+        "Store is SQLite, WAL on.",
+        kind="claim",
+        agent_id="claude-opus",
+        topic_key="store.engine",
+        created_at="2026-08-27T10:00:00",
+    )
+    c2 = ms.append(
+        "agent",
+        "Retry budget is 5, not 3.",
+        kind="claim",
+        agent_id="gpt-5",
+        topic_key="bench.retries",
+        created_at="2026-08-27T10:01:00",
+    )
+    c3 = ms.append(
+        "agent",
+        "Order rows by created_at.",
+        kind="claim",
+        agent_id="codex",
+        topic_key="store.ordering",
+        base_seq=1,
+        created_at="2026-08-27T10:02:00",
+    )
+
+    assert [r.seq for r in ms.pending()] == [c1, c2, c3]
+    assert "nothing promoted yet" in ms.doc(), "a pending claim must not reach the doc"
+
+    assert ms.decide(c1, True) == 1
+    assert ms.decide(c3, False) == 1
+    assert [r.seq for r in ms.pending()] == [c2], "decided claims must leave the inbox"
+
+    d = ms.doc()
+    assert "Store is SQLite" in d, d
+    assert "Retry budget" not in d, "pending claim leaked into the doc"
+    assert "Order rows by created_at" not in d, "dropped claim leaked into the doc"
+
+    # a decision is not a delete: the dropped claim is still addressable
+    assert "Order rows" in ms.expand(c3)[0].content
+    # and base_seq survives, so staleness stays computable after the fact
+    assert ms.expand(c3)[0].base_seq == 1
+
+    # same key promoted twice = contradiction. Never auto-resolved.
+    rival = ms.append(
+        "agent",
+        "Store is Postgres.",
+        kind="claim",
+        agent_id="gemini",
+        topic_key="store.engine",
+        created_at="2026-08-27T10:03:00",
+    )
+    ms.decide(rival, True)
+    assert set(ms.conflicts()) == {"store.engine"}, ms.conflicts()
+    d2 = ms.doc()
+    assert "## Unresolved" in d2 and "store.engine" in d2, d2
+    assert "gemini" in d2 and "claude-opus" in d2, "both sides must show"
+    assert "## Decisions" not in d2, "the only promoted key is in conflict"
+
+    # decide() only moves claims — it must not touch ordinary log rows
+    assert ms.decide(s1, True) == 0, "decide() reached a non-claim row"
 
     # section 2.2: the Event Log is READ-ONLY from the kernel
     ro = ms.readonly()
@@ -497,7 +698,8 @@ def demo():
     huge = "P" * 40000
     hs = ms.append("tool", "ignored", payload=huge, created_at="2024-08-02T00:00:00")
     row_len = ms.sql_query(
-        "SELECT LENGTH(content) c FROM conversation_history WHERE seq=?", (hs,))[0].c
+        "SELECT LENGTH(content) c FROM conversation_history WHERE seq=?", (hs,)
+    )[0].c
     assert row_len < len(huge) / 4, f"row still holds {row_len} of {len(huge)} chars"
     assert len(ms.expand(hs)[0].content) == len(huge), "full payload not recoverable"
 
