@@ -166,7 +166,12 @@ class MemorySurface:
         self.db.commit()
 
     def _migrate_cols(self):
-        """Add the curation columns to a store created before they existed.
+        """Add columns to a store created before they existed.
+
+        Every column added to CREATE TABLE after the first release needs an
+        entry here. agent_id did not have one, so every append() against a
+        store older than it failed with "no such column" — silently, because
+        the spill hook swallows its own errors.
 
         ADD COLUMN throws if the column is already there and SQLite has no
         IF NOT EXISTS for it, so read the table shape first.
@@ -176,6 +181,7 @@ class MemorySurface:
             for r in self.db.execute("PRAGMA table_info(conversation_history)")
         }
         for name, decl in (
+            ("agent_id", "TEXT"),
             ("promoted", "INTEGER NOT NULL DEFAULT 0"),
             ("topic_key", "TEXT"),
             ("base_seq", "INTEGER"),
@@ -826,7 +832,7 @@ def demo():
     old_db.executescript("""
         CREATE TABLE conversation_history(
             seq        INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, agent_id TEXT, role TEXT, kind TEXT,
+            session_id TEXT, role TEXT, kind TEXT,
             created_at TEXT, content TEXT, payload_path TEXT);
         CREATE VIRTUAL TABLE fts USING fts5(content, content='');
     """)
@@ -839,7 +845,7 @@ def demo():
 
     m3 = MemorySurface(str(legacy))
     cols = {r["name"] for r in m3.db.execute("PRAGMA table_info(conversation_history)")}
-    assert {"promoted", "topic_key", "base_seq"} <= cols, cols
+    assert {"agent_id", "promoted", "topic_key", "base_seq"} <= cols, cols
     assert m3.expand(1)[0].content == "legacy row here", "migration lost a row"
     assert m3.search("legacy"), "migration lost the FTS index"
     assert m3.expand(1)[0].promoted == 0, "migrated rows must default to pending"

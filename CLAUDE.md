@@ -47,6 +47,13 @@ same questions.
   response object; never return a bare string.
 - `note` and `hook_spill.py` must share one store (`ms.DEFAULT_DB`), or the
   recovery handle a spill prints points at a database `note` never opens.
+- **A new column in `CREATE TABLE` needs an entry in `_migrate_cols` too**, and
+  the migration self-check's legacy table must _omit_ it — otherwise the test
+  passes while every existing store fails `append()`. `agent_id` had neither,
+  and the spill hook swallowed the error, so 72 spills were lost in silence.
+- One owner for `NARU_SPILL_THRESHOLD`: the default in `hook_spill.py`. Setting
+  it inline on the hook command makes `naru stats` judge the distribution
+  against a threshold the hook never ran at.
 
 ## Observability
 

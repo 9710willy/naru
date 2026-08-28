@@ -30,7 +30,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import metrics
 from ms import DEFAULT_DB
 
-THRESHOLD = int(os.environ.get("NARU_SPILL_THRESHOLD", "2000"))  # chars
+# One owner for the number. It used to be set inline on the hook command in
+# settings.json, so `naru stats` (which imports THRESHOLD) judged the spill
+# distribution against 2000 while the hook actually ran at 10000.
+THRESHOLD = int(os.environ.get("NARU_SPILL_THRESHOLD", "10000"))  # chars
 KEEP = int(os.environ.get("NARU_SPILL_PREVIEW", "600"))
 SIGNPOST_EVERY = 40  # one signpost line per N lines of spilled text
 DB = pathlib.Path(os.environ.get("NARU_SPILL_DB", DEFAULT_DB))
@@ -92,8 +95,9 @@ def main():
     if len(text) <= THRESHOLD:
         # Recorded too: without the skips there is no way to tell later whether
         # the threshold is leaving savings on the table.
-        metrics.record("hook", tool=event.get("tool_name"), chars=len(text),
-                       spilled=False)
+        metrics.record(
+            "hook", tool=event.get("tool_name"), chars=len(text), spilled=False
+        )
         return 0  # small enough to keep inline
 
     # Store verbatim, addressable by seq.
@@ -115,8 +119,12 @@ def main():
             # a temp directory macOS may purge, breaking recovery.
         )
     except Exception as e:  # never break the user's tool call over a spill
-        metrics.record("error", tool=event.get("tool_name"), chars=len(text),
-                       msg=f"{type(e).__name__}: {e}")
+        metrics.record(
+            "error",
+            tool=event.get("tool_name"),
+            chars=len(text),
+            msg=f"{type(e).__name__}: {e}",
+        )
         print(f"naru spill failed, output left inline: {e}", file=sys.stderr)
         return 0
 
@@ -136,8 +144,14 @@ def main():
         updated = dict(container)
         updated[key] = replacement
 
-    metrics.record("hook", tool=event.get("tool_name"), chars=len(text),
-                   kept=len(replacement), spilled=True, seq=seq)
+    metrics.record(
+        "hook",
+        tool=event.get("tool_name"),
+        chars=len(text),
+        kept=len(replacement),
+        spilled=True,
+        seq=seq,
+    )
 
     json.dump(
         {
@@ -161,8 +175,11 @@ def demo():
     me = [sys.executable, str(pathlib.Path(__file__).resolve())]
     # Isolate metrics too: a self-check must not write into the user's
     # real observability store.
-    env = {**os.environ, "NARU_SPILL_DB": str(DB),
-           "NARU_METRICS": str(DB.parent / "m.jsonl")}
+    env = {
+        **os.environ,
+        "NARU_SPILL_DB": str(DB),
+        "NARU_METRICS": str(DB.parent / "m.jsonl"),
+    }
 
     def run(payload):
         p = subprocess.run(
