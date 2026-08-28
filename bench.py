@@ -16,6 +16,7 @@ import math
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -35,6 +36,18 @@ DATA = pathlib.Path(__file__).parent / "data"
 DATE_RE = re.compile(r"(\d{4})/(\d{2})/(\d{2})")
 # One owner for the arm names: main() validates against it, demo() asserts on it.
 ARMS = ("full", "rag", "naru")
+
+
+def backend_label(cmd):
+    """Provenance for a run: the program that answered, never its arguments.
+
+    NARU_BACKEND is documented as any command reading a prompt on stdin, so it
+    can carry a credential (`sh -c 'curl -H "Authorization: Bearer ..."'`).
+    results/published/ is committed to a public history, where rotating a key
+    that already shipped does not undo it. argv[0] is all the provenance the
+    field is for — telling a `cat` run apart from a real one.
+    """
+    return (shlex.split(cmd) or ["claude-cli"])[0] if cmd else "claude-cli"
 
 
 def unknown_arms(arms):
@@ -232,6 +245,29 @@ def rag_context(ms, question, k):
     return "\n".join(h["content"] for h in sorted(hits, key=lambda h: h["seq"]))
 
 
+def build_prompt(q, arm, rag_k=8):
+    """The prompt for a single-call arm. Pure: no backend, no judge, no clock.
+
+    Split out of one() so the arm dispatch is reachable from the self-check.
+    Inline, breaking it answered every rag question from the full 124k-token
+    history while the result row, the report and the published JSON all still
+    said "rag" — turning the headline comparison into full-vs-full.
+
+    `rag` uses FULL_SYSTEM, the same system prompt as `full`, on purpose: the
+    two single-call arms must differ in exactly one variable, which is what
+    goes in the prompt.
+    """
+    if arm == "rag":
+        ms, _ = ingest(q, build_index=False)
+        body = rag_context(ms, q["question"], rag_k)
+    else:
+        body = history_text(q)
+    return (
+        f"{body}\n\n=== Question (asked {q.get('question_date', '')}) ===\n"
+        f"{q['question']}"
+    )
+
+
 def one(
     q,
     arm,
@@ -262,19 +298,7 @@ def one(
             index=index,
         )
     else:
-        if arm == "rag":
-            # The control between the two: also one call, also a small prompt,
-            # but a fixed BM25 top-k picks its contents instead of the model.
-            # Same system prompt as `full` on purpose — the arms must differ in
-            # exactly one variable, which is what goes in the prompt.
-            ms, _ = ingest(q, build_index=False)
-            body = rag_context(ms, q["question"], rag_k)
-        else:
-            body = history_text(q)
-        prompt = (
-            f"{body}\n\n=== Question (asked {q.get('question_date', '')}) ===\n"
-            f"{q['question']}"
-        )
+        prompt = build_prompt(q, arm, rag_k)
         ans, turns, peak = be(prompt, system=FULL_SYSTEM), 1, est(prompt)
 
     elapsed = time.time() - t0
@@ -302,6 +326,10 @@ def one(
         "cost": round(be.usage.cost_usd, 4),
         "judge_cost": round(jb.usage.cost_usd, 4),
         "errors": be.usage.errors,
+        # A judge that times out returns "" for every vote, which reads as
+        # WRONG. Counted separately, it is the only call whose failure is
+        # indistinguishable from a real negative result.
+        "judge_errors": jb.usage.errors,
         "empty_retries": be.usage.empty_retries,
     }
 
@@ -374,9 +402,21 @@ def report(rows, label, floor, measured=True):
             f"cache-read {100 * cr / max(1, bi):.0f}% of billed input"
         )
     errs = sum(r["errors"] for r in rows)
+    # Rows written before judge_errors existed have no such key. Summing them
+    # to 0 would print "0 judge errors" for a run where nobody counted, which
+    # is ADR 0002's mistake in miniature: not measured rendered as measured.
+    jerrs = (
+        sum(r["judge_errors"] for r in rows)
+        if all("judge_errors" in r for r in rows)
+        else None
+    )
     retries = sum(r.get("empty_retries", 0) for r in rows)
-    if errs or retries:
-        print(f"           {errs} backend errors, {retries} empty-reply retries")
+    if errs or retries or jerrs:
+        judge_part = "judge errors not recorded" if jerrs is None else f"{jerrs} judge errors"
+        print(
+            f"           {errs} backend errors, {judge_part}, "
+            f"{retries} empty-reply retries"
+        )
     by = {}
     for r in rows:
         by.setdefault(r["type"], []).append(r["correct"])
@@ -410,7 +450,11 @@ def separability(rows, arms):
     verdicts, dropped = {}, {}
     for arm in arms:
         rs = [r for r in rows if r["arm"] == arm]
-        v = {r["qid"]: bool(r["correct"]) for r in rs if not r.get("errors")}
+        v = {
+            r["qid"]: bool(r["correct"])
+            for r in rs
+            if not r.get("errors") and not r.get("judge_errors")
+        }
         if v:
             verdicts[arm] = v
             dropped[arm] = len(rs) - len(v)
@@ -501,6 +545,12 @@ def main():
     unknown = unknown_arms(arms)
     if unknown:
         sys.exit(f"unknown arm(s): {unknown} — pick from {', '.join(ARMS)}")
+    # SQLite reads a negative LIMIT as NO limit, so --rag-k -1 pastes the whole
+    # history and the rag arm silently becomes a second full arm at ~50x the
+    # cost, still labelled rag. 0 is the mirror: empty context, every answer
+    # wrong, nothing in the output naming why.
+    if a.rag_k < 1:
+        sys.exit(f"--rag-k must be >= 1, got {a.rag_k}")
 
     measured = get_backend(a.model).reports_tokens
     if a.harness_floor is None:
@@ -583,7 +633,7 @@ def main():
     # `NARU_BACKEND=cat` run byte-identical to a real Haiku run that cost
     # nothing. Stamp what actually answered, and whether the numbers are real.
     cfg = dict(vars(a))
-    cfg["backend"] = os.environ.get("NARU_BACKEND") or "claude-cli"
+    cfg["backend"] = backend_label(os.environ.get("NARU_BACKEND"))
     cfg["tokens_measured"] = measured
     json.dump({"config": cfg, "rows": rows}, open(out, "w"), indent=1)
     print(f"\nwrote {out}")
@@ -693,8 +743,63 @@ def demo():
     assert "Bonferroni for 3 pairs" in out3, out3
     assert "REAL" not in out3, out3
     assert "p=0.031" in out3, out3
+    # A judge failure returns "" for every vote, which reads as WRONG. It must
+    # leave the pairing too, not just a hard backend error.
+    jrows = rows_for("full", 16, 24) + rows_for("naru", 19, 24)
+    for r in jrows:
+        if r["arm"] == "full" and r["qid"] == "q16":
+            r["judge_errors"] = 1
+    assert "full 1" in sep_out(jrows, both)
     # one arm alone has nothing to compare against and must print nothing
     assert sep_out(rows_for("rag", 5, 24), ["rag"]) == ""
+
+    # The arm dispatch itself, which used to be reachable only through a paid
+    # call: break it and every rag question is answered from the full history
+    # while the row, the report and the published JSON still say "rag".
+    synth = {
+        "question": "what did I say about kayaks",
+        "question_date": "2023/04/10 (Mon) 17:50",
+        "answer": "-",
+        "question_id": "synthetic",
+        "question_type": "t",
+        "haystack_dates": ["2023/01/01 (Sun) 10:00", "2023/02/01 (Wed) 10:00"],
+        "haystack_session_ids": ["s1", "s2"],
+        "haystack_sessions": [
+            [{"role": "user", "content": "I bought a kayak"}],
+            [{"role": "user", "content": "unrelated tarragon and bicycles"}],
+        ],
+    }
+    full_p = build_prompt(synth, "full")
+    rag_p = build_prompt(synth, "rag", rag_k=1)
+    assert "kayak" in rag_p and "kayak" in full_p
+    assert "tarragon" in full_p, "the full arm must carry the whole history"
+    assert "tarragon" not in rag_p, "the rag arm must carry retrieved hits only"
+    assert len(rag_p) < len(full_p)
+
+    # a run predating judge_errors must say so, not report zero of them
+    def rep_out(rows):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report(rows, "x", 0)
+        return buf.getvalue()
+
+    old_rows = rows_for("x", 1, 2)
+    for r in old_rows:
+        r.update(billed_input=1, output=1, turns=1, peak_view_tokens=1,
+                 cost=0.0, judge_cost=0.0, errors=1)
+    assert "judge errors not recorded" in rep_out(old_rows), rep_out(old_rows)
+    for r in old_rows:
+        r["judge_errors"] = 0
+    assert "0 judge errors" in rep_out(old_rows), rep_out(old_rows)
+
+    # NARU_BACKEND can hold a credential and results/published/ is committed,
+    # so the recorded provenance must be argv[0] and nothing after it.
+    leaky = "sh -c 'curl -H \"Authorization: Bearer sk-secret\"'"
+    assert backend_label(leaky) == "sh", backend_label(leaky)
+    assert "sk-secret" not in backend_label(leaky)
+    assert backend_label(None) == "claude-cli"
+    assert backend_label("   ") == "claude-cli", "blank must not IndexError"
+    assert backend_label("cat") == "cat"
     # arms sharing no question ids must say so rather than divide by zero
     disjoint = rows_for("full", 2, 3) + [
         {"arm": "rag", "qid": "elsewhere", "correct": True, "type": "t"}
@@ -715,6 +820,15 @@ def demo():
         env={**os.environ, "NARU_BACKEND": "cat"},
     )
     assert r.returncode != 0 and "nauru" in r.stderr, (r.returncode, r.stderr)
+    # same guard shape, same place: a negative k is SQLite's "no limit"
+    r = subprocess.run(
+        [sys.executable, __file__, "--rag-k", "-1"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "NARU_BACKEND": "cat"},
+    )
+    assert r.returncode != 0 and "rag-k" in r.stderr, (r.returncode, r.stderr)
 
     print(
         "ok — bench checks passed "
