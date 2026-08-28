@@ -337,22 +337,24 @@ class SandboxedKernel:
         # The reader thread is the reliable signal, not poll(). On a crash the
         # thread returns immediately on EOF, often before the OS has reaped the
         # child, so poll() still says None and the death reads as a timeout.
+        # The thread is the reliable signal. Alive means it is still blocked
+        # on readline, so the child is hung; finished with no reply means
+        # stdout hit EOF and the child is on its way out.
         hung = t.is_alive()
-        rc = None
+        cause, rc = "", None
         if not hung and self._proc:
+            # Drain stderr BEFORE wait(): an unread PIPE blocks wait(), which
+            # turned every crash back into a reported timeout. Safe here only
+            # because stdout already reached EOF, so stderr will too.
+            if self._proc.stderr:
+                try:
+                    cause = (self._proc.stderr.read() or "").strip()[-300:]
+                except (OSError, ValueError):
+                    cause = ""
             try:
                 rc = self._proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 hung = True
-        # Read stderr BEFORE close(), which drops the handle along with the
-        # process. Only on a death: on a hang the child still holds the pipe
-        # and this would block for as long as it stays alive.
-        cause = ""
-        if not hung and self._proc and self._proc.stderr:
-            try:
-                cause = (self._proc.stderr.read() or "").strip()[-300:]
-            except (OSError, ValueError):
-                cause = ""
         self.close()
         self._why = (
             f"exceeded {self.timeout}s wall clock"
