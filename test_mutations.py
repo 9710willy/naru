@@ -117,8 +117,8 @@ MUTATIONS = [
     (
         "a crashed child is reported as a timeout",
         "kernel.py",
-        'f"exceeded {self.timeout}s wall clock"\n            if rc is None',
-        'f"exceeded {self.timeout}s wall clock"\n            if rc is not None',
+        'f"exceeded {self.timeout}s wall clock"\n            if hung',
+        'f"exceeded {self.timeout}s wall clock"\n            if not hung',
     ),
     (
         "an in-memory log is accepted for a child process",
@@ -173,7 +173,7 @@ def main():
     for mutation in MUTATIONS:
         name, target, find, replace = mutation[:4]
         only_if = mutation[4] if len(mutation) > 4 else None
-        if only_if and not eval(only_if):  # noqa: S307 - our own literals
+        if only_if and not eval(only_if):
             print(f"  {'n/a':9} {name}  ({only_if})")
             skipped.append(name)
             continue

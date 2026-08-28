@@ -283,11 +283,21 @@ class SandboxedKernel:
             return result["reply"]
         # Died or hung, and the two need different words: a segfault reported
         # as a timeout sends someone hunting a slow cell that never existed.
-        rc = self._proc.poll() if self._proc else None
+        #
+        # The reader thread is the reliable signal, not poll(). On a crash the
+        # thread returns immediately on EOF, often before the OS has reaped the
+        # child, so poll() still says None and the death reads as a timeout.
+        hung = t.is_alive()
+        rc = None
+        if not hung and self._proc:
+            try:
+                rc = self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                hung = True
         self.close()
         self._why = (
             f"exceeded {self.timeout}s wall clock"
-            if rc is None
+            if hung
             else f"died (exit {rc})"
         )
         return None
