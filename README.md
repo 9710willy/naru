@@ -111,16 +111,17 @@ rather than printing a zero that looks measured.
 ```bash
 python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
 python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
-python3 noise.py --selfcheck
+python3 noise.py --selfcheck && python3 bench.py --selfcheck
 python3 backend.py      # live: two cheap calls, prints the harness token floor
 python3 test_judge.py   # live: judge regression cases
 ```
 
 ## Benchmark
 
-`bench.py` runs LongMemEval (ICLR 2025) over two arms on identical history:
-`full` puts the whole history in one prompt, `naru` leaves it in the log for the
-model to reach by writing code.
+`bench.py` runs LongMemEval (ICLR 2025) over three arms on identical history.
+`full` puts the whole history in one prompt. `rag` pastes the top 8 BM25 hits
+and answers in one call. `naru` leaves the history in the log for the model to
+reach by writing code.
 
 ```bash
 mkdir -p data && cd data
@@ -133,19 +134,40 @@ The `claude` CLI adds 13-23k input tokens per call before any prompt of ours, so
 compare arms on `net-of-harness`. That floor is measured at startup rather than
 hardcoded, for the reason recorded in ADR 0002.
 
-Run `noise.py` over two replicate runs before reading anything into a gap. At
-n=12 a difference under about 20 points is noise.
+### What the arms measure, and what they showed
 
-Latest run — LongMemEval-`s`, n=24, Haiku 4.5, judge Haiku 4.5:
+LongMemEval-`s`, n=24, Haiku 4.5 on agent and judge. Rows in
+[`results/published/`](results/published/), stripped of gold answers.
 
-| arm    | accuracy | net input / q | view size | cost  |
-| ------ | -------- | ------------- | --------- | ----- |
-| `full` | 66.7%    | 116,727       | 124,484t  | $6.49 |
-| `naru` | 79.2%    | 73,199        | 2,552t    | $3.79 |
+| arm    | correct | 95% CI | net input / q | view     | calls | cost  |
+| ------ | ------- | ------ | ------------- | -------- | ----- | ----- |
+| `full` | 16/24   | 47-82% | 116,727       | 124,484t | 1.0   | $6.49 |
+| `naru` | 19/24   | 60-91% | 73,199        | 2,552t   | 4.4   | $3.79 |
+| `rag`  | 21/24   | 69-96% | 1,816         | 1,805t   | 1.0   | $1.22 |
 
-Read the accuracy column as a tie: at n=24 the run-to-run band is wider than
-that 12.5-point gap. The claim that survives replication is the cost one — the
-same answer quality from a 49x smaller view for 42% less spend.
+**No pair separates on accuracy.** The arms answer the same questions, so
+`bench.py` compares them with an exact McNemar test on the questions where they
+disagree, and prints the verdict with the run:
+
+```
+full  vs rag    +20.8 pts   full only 1, rag only 6   p=0.125   not separable
+full  vs naru   +12.5 pts   full only 3, naru only 6  p=0.508   not separable
+rag   vs naru    -8.3 pts   rag only 3, naru only 1   p=0.625   not separable
+```
+
+At n=24 this harness cannot tell the three apart, and that includes gaps of 20
+points. Treat every accuracy number here as underpowered.
+
+Cost is not a statistical question. `rag` answered in one call on 1,816 input
+tokens net of harness overhead, against `naru`'s 4.4 calls and 73,199 — forty
+times the input for no measurable accuracy gain, at a numerically lower score.
+On this benchmark the kernel does not earn its keep, and BM25 with a top-8 cut
+is enough. ADR 0006 records why that is the expected result for LongMemEval's
+question shape, and what would actually test the kernel instead.
+
+Run `noise.py` over two replicate runs before reading anything into a gap: it
+reports how far a single arm moves when you only rerun it, which is a different
+question from whether two arms differ.
 
 ## Limitations
 
@@ -162,6 +184,10 @@ Search is BM25 only, as in the paper. No embeddings.
 
 The benchmark judge is not LongMemEval's official prompt. Numbers are for
 tracking this repo and are not comparable to published scores.
+
+At n=24 no arm separates from any other on accuracy. The `rag` arm currently
+beats `naru` on cost by 40x and on score by 2 questions, so nothing here
+demonstrates that a code-writing agent beats plain retrieval. See ADR 0006.
 
 ## See also
 

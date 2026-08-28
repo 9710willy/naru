@@ -1,5 +1,6 @@
 data/
-results/
+results/*
+!results/published/
 __pycache__/
 .ruff_cache/
 blobs/

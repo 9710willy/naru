@@ -705,33 +705,44 @@ ms.search(<span class="str">"Bd5"</span>) → <span class="hl">3 hits</span>    
         <table>
           <tr>
             <th>Arm</th>
-            <th class="num">Accuracy</th>
+            <th class="num">Correct</th>
             <th class="num">Net input / q</th>
             <th class="num">View size</th>
             <th class="num">Cost</th>
           </tr>
           <tr>
             <td>full context</td>
-            <td class="num">66.7%</td>
+            <td class="num">16/24</td>
             <td class="num lose">116,727</td>
             <td class="num lose">124,484t</td>
             <td class="num lose">$6.49</td>
           </tr>
           <tr>
             <td>naru</td>
-            <td class="num win">79.2%</td>
-            <td class="num win">73,199</td>
-            <td class="num win">2,552t</td>
-            <td class="num win">$3.79</td>
+            <td class="num">19/24</td>
+            <td class="num">73,199</td>
+            <td class="num">2,552t</td>
+            <td class="num">$3.79</td>
+          </tr>
+          <tr>
+            <td>rag (BM25 top-8)</td>
+            <td class="num win">21/24</td>
+            <td class="num win">1,816</td>
+            <td class="num win">1,805t</td>
+            <td class="num win">$1.22</td>
           </tr>
         </table>
         <p class="note">
-          LongMemEval-s, n=24, Haiku 4.5, judge Haiku 4.5. <b>Read the accuracy
-          column as a tie.</b> At n=24 the 2-sigma run-to-run band measured by
-          <code>noise.py</code> is wider than this 12.5-point gap, so the claim
-          that survives is the cost one: same answer quality for a 49&times;
-          smaller view and 42% less spend. The judge is not LongMemEval's
-          official prompt; these numbers track this repo and nothing else.
+          LongMemEval-s, n=24, Haiku 4.5, judge Haiku 4.5. <b>No pair separates
+          on accuracy</b> &mdash; paired McNemar puts every comparison between
+          p=0.125 and p=0.625, so at this n the harness cannot tell the three
+          apart. What is not close is cost: <code>rag</code> answers in one call
+          on 1,816 input tokens against naru's 4.4 calls and 73,199, forty times
+          the input for no measurable gain. <b>On this benchmark the kernel does
+          not earn its keep.</b> ADR 0006 records why that is the expected
+          result for LongMemEval's question shape and what would actually test
+          it. The judge is not LongMemEval's official prompt; these numbers
+          track this repo and nothing else.
         </p>
       </div>
 

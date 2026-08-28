@@ -15,7 +15,7 @@ Every module has a runnable self-check. The first four need no network:
 ```bash
 python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
 python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
-python3 noise.py --selfcheck
+python3 noise.py --selfcheck && python3 bench.py --selfcheck
 python3 backend.py    # live: 2 cheap calls, prints the harness token floor
 python3 test_judge.py # live: judge regression cases
 ```
@@ -24,15 +24,28 @@ Stdlib only. No dependencies — do not add one for something a few lines cover.
 
 ## Benchmark rules
 
-`bench.py` is the only source of numbers. Two arms (`full`, `naru`) over the
-same questions.
+`bench.py` is the only source of numbers. Three arms (`full`, `rag`, `naru`)
+over the same questions.
+
+**`rag` is the control and must never be quietly dropped.** It holds the kernel
+fixed and varies only what fills the prompt, which is the one thing that
+separates "programmatic access wins" from "any retrieval beats stuffing".
+Without it, `naru` beating `full` proves nothing. As of ADR 0006 `rag` beats
+`naru` on this benchmark on every column, so a run that omits it is flattering
+itself.
 
 - **Never hardcode a measured constant.** `--harness-floor` is measured at
   startup for exactly this reason (ADR 0002).
-- **Report a noise floor.** A single run's difference under ~20 points at n=12
-  is noise. Say so rather than implying a result.
-- **Both arms must see identical history.** `sessions(q)` is the one source of
-  ordering; do not re-derive it.
+- **Report a noise floor.** `separability()` prints an exact McNemar verdict
+  with every run because the arms answer identical questions, so the comparison
+  is paired. Do not replace it with overlapping confidence intervals: that
+  discards the pairing and is far too conservative. At n=24 nothing separates,
+  including a 20-point gap.
+- **All arms must see identical history.** `sessions(q)` is the one source of
+  ordering; do not re-derive it. `--arms` rejects an unknown name rather than
+  falling through to `full`, because a typo would corrupt a paid run in silence.
+- **Published rows live in `results/published/`**, stripped of `gold` and
+  `answer`. `results/` is otherwise gitignored.
 - The judge is not LongMemEval's official prompt, so numbers are internal
   progress only — never present them as leaderboard-comparable.
 - Multi-turn arms take more exposure to per-call flakiness than single-turn
