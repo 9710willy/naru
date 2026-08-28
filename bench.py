@@ -1,18 +1,22 @@
 """LongMemEval harness: ingest → answer → judge → score.
 
-Runs two arms over the same data so the comparison is controlled:
+Runs three arms over the same data so the comparison is controlled:
   full     — the whole history stuffed into one prompt (the usual approach)
-  naru   — history in the Session Environment, model writes code to reach it
+  rag      — top-k BM25 hits pasted in, one call, no kernel (the control)
+  naru     — history in the Session Environment, model writes code to reach it
 
 Reports accuracy, tokens billed, and cost for each.
 """
 
 import argparse
+import contextlib
+import io
 import json
 import math
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,8 +27,21 @@ from backend import HAIKU, get_backend, measure_floor
 from eviction import est, rollup
 from ms import MemorySurface
 
+# One owner for the p-value ADR 0006 publishes. noise.py had it first and
+# imports nothing local, so the dependency runs this way round.
+from noise import mcnemar
+
 DATA = pathlib.Path(__file__).parent / "data"
 DATE_RE = re.compile(r"(\d{4})/(\d{2})/(\d{2})")
+# One owner for the arm names: main() validates against it, demo() asserts on it.
+ARMS = ("full", "rag", "naru")
+
+
+def unknown_arms(arms):
+    """Arm names main() will refuse. A function so the self-check can exercise
+    the real predicate — asserting on a re-typed copy of it passes even when
+    main()'s validation has been deleted."""
+    return [x for x in arms if x not in ARMS]
 
 
 def iso(d):
@@ -312,7 +329,8 @@ def report(rows, label, floor, measured=True):
     if not rows:
         return
     n = len(rows)
-    acc = sum(r["correct"] for r in rows) / n
+    n_correct = sum(r["correct"] for r in rows)
+    acc = n_correct / n
     bi = sum(r["billed_input"] for r in rows)
     # floor is None when the backend reports no usage at all. Subtracting 0 and
     # printing the result would present "not measured" as a measurement.
@@ -323,12 +341,11 @@ def report(rows, label, floor, measured=True):
     )
     cost = sum(r["cost"] + r["judge_cost"] for r in rows)
     bar = "#" * round(acc * 28) + "." * (28 - round(acc * 28))
-    k = sum(r["correct"] for r in rows)
-    lo, hi = wilson(k, n)
+    lo, hi = wilson(n_correct, n)
     # The interval is printed on the same line as the accuracy on purpose. A
     # bare percentage invites a reader to compare two arms that overlap.
     print(
-        f"\n  {label:8} {bar} {acc * 100:5.1f}%  ({k}/{n})"
+        f"\n  {label:8} {bar} {acc * 100:5.1f}%  ({n_correct}/{n})"
         f"  95% CI {lo * 100:.0f}-{hi * 100:.0f}%"
     )
     if measured:
@@ -360,26 +377,6 @@ def report(rows, label, floor, measured=True):
     )
 
 
-def mcnemar(a_correct, b_correct):
-    """Exact two-sided McNemar test. Returns (a-only, b-only, p).
-
-    The arms answer the SAME questions, so the comparison is paired and only
-    the questions they disagree about carry information. Comparing two
-    independent Wilson intervals here is the wrong test and far too
-    conservative: it throws away the pairing and asks whether two separately
-    estimated rates could coexist, when the real question is whether the arms
-    trade wins evenly on the questions where they differ.
-    """
-    qs = sorted(set(a_correct) & set(b_correct))
-    b = sum(1 for q in qs if a_correct[q] and not b_correct[q])
-    c = sum(1 for q in qs if b_correct[q] and not a_correct[q])
-    n = b + c
-    if n == 0:
-        return b, c, 1.0
-    tail = sum(math.comb(n, i) for i in range(min(b, c) + 1))
-    return b, c, min(1.0, 2 * tail / 2**n)
-
-
 def separability(rows, arms):
     """State which arm differences are real and which are this run's luck.
 
@@ -398,13 +395,22 @@ def separability(rows, arms):
     if len(verdicts) < 2:
         return
     print("\n  separability — paired McNemar on the questions the arms disagree on")
-    for a, b in combinations([x for x in arms if x in verdicts], 2):
+    # verdicts is built by iterating arms, so its key order is already the
+    # filtered arm list — and unlike a list it cannot yield `full vs full`.
+    for a, b in combinations(verdicts, 2):
         va, vb = verdicts[a], verdicts[b]
-        shared = set(va) & set(vb)
+        shared = len(va.keys() & vb.keys())
+        if not shared:
+            # results/published/README.md documents comparing across two
+            # loaded result files. Two different splits share no question
+            # ids, and a traceback is a worse answer than saying so.
+            print(f"    {a:5} vs {b:5}   no shared questions — not comparable")
+            continue
         only_a, only_b, p = mcnemar(va, vb)
-        gap = 100 * (
-            sum(vb[q] for q in shared) - sum(va[q] for q in shared)
-        ) / len(shared)
+        # Questions both arms got right cancel in the subtraction, so the
+        # gap over the shared set is exactly the difference of the two
+        # disagreement counts mcnemar already computed.
+        gap = 100 * (only_b - only_a) / shared
         mark = "REAL at p<0.05" if p < 0.05 else "not separable — this run's luck"
         print(
             f"    {a:5} vs {b:5} {gap:+6.1f} pts   "
@@ -416,7 +422,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="oracle", choices=["oracle", "s", "m"])
     ap.add_argument("-n", type=int, default=12)
-    ap.add_argument("--arms", default="full,naru")
+    # CLAUDE.md: rag is the control and must never be quietly dropped, so it is
+    # in the default. A two-arm run has to be asked for.
+    ap.add_argument("--arms", default="full,rag,naru")
     ap.add_argument(
         "--rag-k",
         type=int,
@@ -447,6 +455,14 @@ def main():
     )
     a = ap.parse_args()
 
+    # A typo'd arm would otherwise run as `full` and quietly corrupt the run.
+    # Checked before the backend is touched and before a 277MB split is read,
+    # so a typo costs nothing.
+    arms = a.arms.split(",")
+    unknown = unknown_arms(arms)
+    if unknown:
+        sys.exit(f"unknown arm(s): {unknown} — pick from {', '.join(ARMS)}")
+
     measured = get_backend(a.model).reports_tokens
     if a.harness_floor is None:
         a.harness_floor = measure_floor(a.model)
@@ -459,11 +475,6 @@ def main():
             print(f"measured harness floor: {a.harness_floor:,} input tok/call")
 
     qs = load(a.split, a.n, qtype=a.qtype)
-    arms = a.arms.split(",")
-    # A typo'd arm would otherwise run as `full` and quietly corrupt the run.
-    unknown = [x for x in arms if x not in ("full", "rag", "naru")]
-    if unknown:
-        sys.exit(f"unknown arm(s): {unknown} — pick from full, rag, naru")
     print(
         f"LongMemEval-{a.split}  n={len(qs)}  arms={arms}  model={a.model}  "
         f"judge={a.judge_model}  budget={a.budget}t  max_turns={a.max_turns}"
@@ -484,9 +495,11 @@ def main():
                 a.max_turns,
                 a.budget,
                 a.verbose,
-                not a.no_rubric,
-                a.no_index,
-                a.rag_k,
+                # named: three of the last four are bools and a silent
+                # transposition here would corrupt a paid run.
+                rubric=not a.no_rubric,
+                no_index=a.no_index,
+                rag_k=a.rag_k,
             ): (q, arm)
             for q, arm in jobs
         }
@@ -585,36 +598,57 @@ def demo():
             for i in range(n)
         ]
 
-    import contextlib
-    import io
+    def sep_out(rows, arms):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            separability(rows, arms)
+        return buf.getvalue()
 
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        separability(rows_for("full", 16, 24) + rows_for("naru", 19, 24),
-                     ["full", "naru"])
-        separability(rows_for("full", 2, 24) + rows_for("naru", 23, 24),
-                     ["full", "naru"])
-    out = buf.getvalue()
-    assert "not separable" in out, out
-    assert "REAL at p<0.05" in out, out
+    # One buffer per scenario, and each assert pinned to the scenario that has
+    # to produce it. Sharing one buffer let the PAIR of calls satisfy both
+    # asserts, so swapping the two branches of `mark` — which reports the
+    # published tie as a significant result — passed this check.
+    both = ["full", "naru"]
+    tie = sep_out(rows_for("full", 16, 24) + rows_for("naru", 19, 24), both)
+    blowout = sep_out(rows_for("full", 2, 24) + rows_for("naru", 23, 24), both)
+    assert "not separable" in tie and "REAL" not in tie, tie
+    # pin the gap too: it is derived from the McNemar counts rather than
+    # recomputed, so a swapped subtraction there prints a sign-flipped result
+    # that every other assertion here would wave through.
+    assert "+12.5 pts" in tie, tie
+    assert "REAL at p<0.05" in blowout and "not separable" not in blowout, blowout
     # paired beats independent intervals: 16/24 vs 21/24 overlap as Wilson
     # intervals, but disagree 1-vs-6 when paired. Losing that is why the test
     # changed.
     assert wilson(16, 24)[1] > wilson(21, 24)[0], "intervals do overlap"
     agree = {f"q{i}": i < 16 for i in range(24)}
     better = {f"q{i}": i < 16 or i >= 22 for i in range(24)}
-    assert mcnemar(agree, better) == (0, 2, mcnemar(agree, better)[2])
+    # The p must be a literal. Comparing the slot to itself is a tautology
+    # that a one-sided p-value passes. 2 discordant pairs, both one way.
+    assert mcnemar(agree, better) == (0, 2, 0.5)
     assert mcnemar(agree, agree)[2] == 1.0, "identical arms cannot differ"
     # one arm alone has nothing to compare against and must print nothing
-    buf2 = io.StringIO()
-    with contextlib.redirect_stdout(buf2):
-        separability(rows_for("rag", 5, 24), ["rag"])
-    assert buf2.getvalue() == ""
+    assert sep_out(rows_for("rag", 5, 24), ["rag"]) == ""
+    # arms sharing no question ids must say so rather than divide by zero
+    disjoint = rows_for("full", 2, 3) + [
+        {"arm": "rag", "qid": "elsewhere", "correct": True, "type": "t"}
+    ]
+    assert "not comparable" in sep_out(disjoint, ["full", "rag"])
 
     # A typo'd arm must never fall through to `full` and corrupt a paid run.
-    assert [
-        x for x in ["full", "rag", "nauru"] if x not in ("full", "rag", "naru")
-    ] == ["nauru"]
+    assert unknown_arms(["full", "rag", "nauru"]) == ["nauru"]
+    assert unknown_arms(list(ARMS)) == []
+    # Assert on main()'s wiring, not only the predicate: deleting the call in
+    # main() leaves every in-process assertion above green. Reachable offline
+    # only because the check now runs before the backend and the data file.
+    r = subprocess.run(
+        [sys.executable, __file__, "--arms", "nauru"],
+        capture_output=True,
+        text=True,
+        check=False,  # a nonzero exit is the thing being asserted
+        env={**os.environ, "NARU_BACKEND": "cat"},
+    )
+    assert r.returncode != 0 and "nauru" in r.stderr, (r.returncode, r.stderr)
 
     print(
         "ok — bench checks passed "
