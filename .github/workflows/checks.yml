@@ -4,10 +4,15 @@ on: [push, pull_request]
 
 jobs:
   selfchecks:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         # The README claims 3.9+. The oldest and the newest prove it.
+        # macOS is not decoration: it refuses RLIMIT_AS, so the "a refused
+        # limit reports itself refused" branch and the mutation that guards it
+        # only ever execute there. Ubuntu-only, that check ran nowhere.
+        os: [ubuntu-latest, macos-latest]
         python: ["3.9", "3.13"]
     steps:
       - uses: actions/checkout@v7

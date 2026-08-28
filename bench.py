@@ -17,8 +17,10 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
@@ -99,6 +101,13 @@ def sessions(q):
     )
 
 
+def _log_path():
+    """Where one question's Event Log lives, and why it is usually nowhere."""
+    if os.environ.get("NARU_KERNEL") != "sandbox":
+        return ":memory:"
+    return str(pathlib.Path(tempfile.mkdtemp(prefix="naru-bench-")) / "log.db")
+
+
 def ingest(q, build_index=True):
     """Build the Event Log for one question, session by session.
 
@@ -112,7 +121,11 @@ def ingest(q, build_index=True):
     rather than starting blind. Passing build_index=False reproduces the
     earlier behaviour, for ablation.
     """
-    ms = MemorySurface(":memory:")
+    # NARU_KERNEL=sandbox runs cells in a child process, and a child cannot
+    # open an in-memory database. Without a file the sandbox was unreachable
+    # from the only entry point that runs the agent, so it was a feature with
+    # no caller. The default stays in-memory and fast.
+    ms = MemorySurface(_log_path())
     index = []
     for i, (date, sid, turns) in enumerate(sessions(q), 1):
         stamp = iso(date)
@@ -301,17 +314,23 @@ def one(
 
     if arm == "naru":
         ms, index = ingest(q, build_index=not no_index)
-        ans, turns, peak = run_naru(
-            ms,
-            q["question"],
-            be,
-            question_date=q.get("question_date"),
-            max_turns=max_turns,
-            budget=budget,
-            verbose=verbose,
-            rubric=LONGMEMEVAL_RUBRIC if rubric else None,
-            index=index,
-        )
+        try:
+            ans, turns, peak = run_naru(
+                ms,
+                q["question"],
+                be,
+                question_date=q.get("question_date"),
+                max_turns=max_turns,
+                budget=budget,
+                verbose=verbose,
+                rubric=LONGMEMEVAL_RUBRIC if rubric else None,
+                index=index,
+            )
+        finally:
+            # A sandboxed run leaves a real file behind; 96 questions leave 96.
+            if ms.path != ":memory:":
+                ms.db.close()
+                shutil.rmtree(pathlib.Path(ms.path).parent, ignore_errors=True)
     else:
         prompt = build_prompt(q, arm, rag_k)
         ans, turns, peak = be(prompt, system=FULL_SYSTEM), 1, est(prompt)

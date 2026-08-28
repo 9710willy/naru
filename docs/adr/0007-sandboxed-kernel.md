@@ -62,7 +62,21 @@ the operator supplies:
 ```
 NARU_KERNEL_JAIL='sandbox-exec -f jail.sb'              # macOS
 NARU_KERNEL_JAIL='bwrap --ro-bind / / --unshare-net'    # Linux
-NARU_KERNEL_JAIL='docker run --rm -i --network none …'
+```
+
+Those two share the host filesystem, so the child finds the repo, the log and
+the interpreter where the parent left them. A container finds none of them, and
+the first version of this ADR offered a `docker run …` line that could not have
+worked: the argv ends in the host's `sys.executable`, a path that does not
+exist inside the image. `NARU_KERNEL_PYTHON` overrides it, and the jail has to
+carry the rest in:
+
+```
+NARU_KERNEL_JAIL="docker run --rm -i --network none \
+    -v $PWD:/naru:ro -v $(dirname $LOG):/log:ro \
+    -e NARU_KERNEL_PATH=/naru -e NARU_KERNEL_DB=/log/log.db \
+    -e NARU_KERNEL_CALLBACKS python:3.13"
+NARU_KERNEL_PYTHON=python
 ```
 
 Same seam as `NARU_BACKEND`, and for the same reason: this repo does not ship a

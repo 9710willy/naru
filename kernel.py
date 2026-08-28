@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -109,16 +110,7 @@ class Kernel:
 # The child program. Reads one JSON request per line on stdin, writes one JSON
 # reply per line on the duplicated stdout, and keeps its namespace between
 # requests so state survives across cells exactly as the in-process Kernel does.
-_CHILD = r'''
-import contextlib, io, json, os, resource, sys, traceback
 
-sys.path.insert(0, os.environ["NARU_KERNEL_PATH"])
-from kernel import MAX_OUT, _cap, _shape
-
-# Frame replies down a private copy of stdout, then point stdout at devnull so
-# a stray print at import time cannot corrupt the stream the parent parses.
-_REPLY = os.fdopen(os.dup(1), "w")
-os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
 
 
 class _Done(Exception):
@@ -132,6 +124,8 @@ def _limits():
     memory is capped when it is not, which is the failure this whole repo is
     built to avoid, so the result is returned rather than discarded.
     """
+    import resource  # not at module level: absent on Windows
+
     applied = {}
     for name, what, want in (
         ("cpu_s", resource.RLIMIT_CPU, int(os.environ.get("NARU_KERNEL_CPU", "30"))),
@@ -149,7 +143,18 @@ def _limits():
     return applied
 
 
-def main():
+def _child_main():
+    """The child program. One JSON request per line in, one reply per line out.
+
+    A real function, not a string: embedded in one it was invisible to the
+    tokenizer, so a typo was not a SyntaxError at import but a dead child at
+    run time. It is lintable and greppable here, and `_shape`, `_cap` and
+    MAX_OUT have one owner instead of a copy on each side of the pipe.
+    """
+    # Frame replies down a private copy of stdout, then point stdout at
+    # devnull so a stray print at import time cannot corrupt the stream.
+    _reply = os.fdopen(os.dup(1), "w")
+    os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
     limits = _limits()
     calls = []
     ns = {"__name__": "__naru__"}
@@ -211,12 +216,38 @@ def main():
             line = json.dumps(
                 {"out": "", "err": f"reply not serialisable: {e}", "calls": []}
             )
-        _REPLY.write(line + "\n")
-        _REPLY.flush()
+        _reply.write(line + "\n")
+        _reply.flush()
 
 
-main()
-'''
+# The child is `kernel._child_main()`, reached by a three-line bootstrap so a
+# jail command in NARU_KERNEL_JAIL still wraps a plain `python -I -c`.
+_CHILD = (
+    "import os, sys\n"
+    "sys.path.insert(0, os.environ['NARU_KERNEL_PATH'])\n"
+    "import kernel; kernel._child_main()\n"
+)
+
+
+def _exit_reason(rc):
+    """Name a child's exit. A negative code is a signal, and the signal is the
+    diagnosis: RLIMIT_CPU does not raise, it delivers SIGXCPU, and "exit -24"
+    told nobody that the CPU ceiling had done its job."""
+    if rc is None:
+        return "no exit status"
+    if rc >= 0:
+        return f"exit {rc}"
+    try:
+        name = signal.Signals(-rc).name
+    except ValueError:
+        return f"signal {-rc}"
+    hint = {
+        "SIGXCPU": " — the CPU limit",
+        "SIGXFSZ": " — the file size limit",
+        "SIGKILL": " — killed, out of memory or by the OS",
+        "SIGSEGV": " — segmentation fault",
+    }.get(name, "")
+    return f"{name}{hint}"
 
 
 class SandboxedKernel:
@@ -236,7 +267,15 @@ class SandboxedKernel:
 
         NARU_KERNEL_JAIL='sandbox-exec -f jail.sb'             # macOS
         NARU_KERNEL_JAIL='bwrap --ro-bind / / --unshare-net'   # Linux
-        NARU_KERNEL_JAIL='docker run --rm -i --network none …'
+
+    A container also needs the repo, the log, the environment and its own
+    interpreter, because none of the host's paths exist inside it:
+
+        NARU_KERNEL_JAIL="docker run --rm -i --network none \\
+            -v $PWD:/naru:ro -v $(dirname $LOG):/log:ro \\
+            -e NARU_KERNEL_PATH=/naru -e NARU_KERNEL_DB=/log/log.db \\
+            -e NARU_KERNEL_CALLBACKS python:3.13"
+        NARU_KERNEL_PYTHON=python
 
     Without one of those this is process isolation, not a sandbox, and calling
     it a sandbox in a README is how people get hurt.
@@ -265,8 +304,12 @@ class SandboxedKernel:
         env["NARU_KERNEL_CALLBACKS"] = json.dumps(sorted(self.callbacks))
         if self.db:
             env["NARU_KERNEL_DB"] = str(self.db)
+        # NARU_KERNEL_PYTHON: a jail that supplies its own filesystem has no
+        # copy of the host interpreter at sys.executable, so a container jail
+        # could not work without this. sandbox-exec and bwrap share the host
+        # root and need nothing.
         argv = shlex.split(os.environ.get("NARU_KERNEL_JAIL", "")) + [
-            sys.executable,
+            os.environ.get("NARU_KERNEL_PYTHON", sys.executable),
             # -I, isolated: without it `python -c` puts the CWD at sys.path[0],
             # which model code shares. A cell writing ./resource.py and forcing
             # a respawn gave every later child no ceilings at all while
@@ -278,6 +321,10 @@ class SandboxedKernel:
         ]
         self._proc = subprocess.Popen(
             argv,
+            # Its own process group. Under NARU_KERNEL_JAIL self._proc is the
+            # jail command, and killing it leaves the python child it wrapped
+            # running. The group kills both.
+            start_new_session=True,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             # Kept, not discarded: it is the only diagnostic for a child that
@@ -290,8 +337,14 @@ class SandboxedKernel:
 
     def close(self):
         if self._proc and self._proc.poll() is None:
-            self._proc.kill()
-            self._proc.wait(timeout=5)
+            try:
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                self._proc.kill()  # no group, or already gone
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         self._proc = None
 
     def _ask(self, msg):
@@ -359,7 +412,7 @@ class SandboxedKernel:
         self._why = (
             f"exceeded {self.timeout}s wall clock"
             if hung
-            else f"died (exit {rc}){': ' + cause if cause else ''}"
+            else f"died ({_exit_reason(rc)}){': ' + cause if cause else ''}"
         )
         return None
 

@@ -399,6 +399,69 @@ def demo():
     assert "status=working" in over, over[:400]
     assert est(over) < 1500, f"eviction failed to bound view: {est(over)}t"
 
+    # NARU_KERNEL=sandbox, end to end. Nothing exercised this branch: the
+    # demo above builds MemorySurface(":memory:"), so the selection at the top
+    # of _run() always fell through to the in-process kernel and the sandbox
+    # path shipped with no offline check at all.
+    import pathlib
+    import subprocess
+    import tempfile
+
+    sandbox_dir = pathlib.Path(tempfile.mkdtemp())
+    fms = MemorySurface(str(sandbox_dir / "log.db"))
+    fms.append(
+        "user", "I drive a blue Subaru Outback", kind="context_msg",
+        session_id="s1", created_at="2023-01-01T00:00",
+    )
+    sandbox_script = [
+        # The pid is the only assertion that can tell WHERE the cell ran.
+        # Asserting on the answer alone passes when the branch falls through
+        # to the in-process kernel, which returns exactly the same string.
+        "```python\nimport os\nprint('PID', os.getpid())\n```",
+        "```python\nprint(ms.search('Subaru')[0]['content'])\n```",
+        (
+            "```python\nheadline(task='probe', status='working')\n"
+            "submit_answer('A blue Subaru Outback')\n```"
+        ),
+    ]
+    sn = {"n": 0, "prompts": []}
+
+    def sandbox_backend(prompt, system=None, nudge=None):
+        sn["prompts"].append(prompt)
+        r = sandbox_script[min(sn["n"], len(sandbox_script) - 1)]
+        sn["n"] += 1
+        return r
+
+    prev = os.environ.get("NARU_KERNEL")
+    os.environ["NARU_KERNEL"] = "sandbox"
+    kids_before = subprocess.run(
+        ["pgrep", "-P", str(os.getpid())], capture_output=True, text=True, check=False
+    ).stdout.split()
+    try:
+        sans, _sturns, _ = run_naru(
+            fms, "What car do I drive?", sandbox_backend, max_turns=5, budget=800
+        )
+    finally:
+        if prev is None:
+            os.environ.pop("NARU_KERNEL", None)
+        else:
+            os.environ["NARU_KERNEL"] = prev
+    assert sans == "A blue Subaru Outback", sans
+    seen = [p for p in sn["prompts"] if "PID " in p]
+    assert seen, "the pid cell never came back"
+    assert f"PID {os.getpid()}" not in seen[-1], (
+        "the cell ran in THIS process — the sandbox branch was not taken"
+    )
+    # record_answer, not submit_answer: the child raises its own stop signal,
+    # so replaying Done in the parent would throw out of run().
+    kids_after = subprocess.run(
+        ["pgrep", "-P", str(os.getpid())], capture_output=True, text=True, check=False
+    ).stdout.split()
+    assert len(kids_after) <= len(kids_before), (
+        "run_naru leaked "
+        f"{len(kids_after) - len(kids_before)} child process(es)"
+    )
+
     print(
         f"ok — agent checks passed: 4 turns, final view {est(last)}t, "
         f"40-row result stayed in kernel; eviction bounds a noisy run to "

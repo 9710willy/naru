@@ -121,6 +121,18 @@ MUTATIONS = [
         'f"exceeded {self.timeout}s wall clock"\n            if not hung',
     ),
     (
+        "agent.py never takes the sandbox branch",
+        "agent.py",
+        'if os.environ.get("NARU_KERNEL") == "sandbox" and path and path != ":memory:":',
+        "if False:",
+    ),
+    (
+        "run_naru leaves its kernel open",
+        "agent.py",
+        "        kernel.close()",
+        "        pass",
+    ),
+    (
         "callback dispatch is unguarded in the parent",
         "kernel.py",
         "            try:\n                fn(*args, **kwargs)\n            except Exception as e:",
@@ -192,6 +204,7 @@ def run_mutated(target, find, replace):
     cmd = {
         "ms.py": ["ms.py"],
         "kernel.py": ["kernel.py"],
+        "agent.py": ["agent.py"],
     }.get(target, ["bench.py", "--selfcheck"])
     return subprocess.run(
         [sys.executable, *cmd], cwd=work, capture_output=True, text=True, check=False
