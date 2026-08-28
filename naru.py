@@ -291,24 +291,14 @@ def main(argv):
         days = int(args[0]) if args and args[0].isdigit() else 30
         dry = "--dry-run" in args or "-n" in args
         cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
-        doomed = ms.sql_query(
-            "SELECT COUNT(*) n, COALESCE(SUM(LENGTH(content)),0) b FROM"
-            " conversation_history WHERE created_at IS NOT NULL AND"
-            " created_at < ?",
-            (cutoff,),
-        )[0]
-        kept = ms.sql_query(
-            "SELECT COUNT(*) n FROM conversation_history WHERE created_at IS"
-            " NULL OR created_at >= ?",
-            (cutoff,),
-        )[0]
+        n_doomed, b_doomed, n_kept = ms.prune_preview(cutoff)
         print(f"cutoff {cutoff[:10]} (older than {days} days)")
-        print(f"  would remove : {doomed.n} rows, {doomed.b:,} chars")
-        print(f"  would keep   : {kept.n} rows")
+        print(f"  would remove : {n_doomed} rows, {b_doomed:,} chars")
+        print(f"  would keep   : {n_kept} rows (promoted claims are never aged out)")
         if dry:
             print("  --dry-run: nothing deleted")
             return 0
-        if not doomed.n:
+        if not n_doomed:
             return 0
         removed = ms.prune(cutoff)
         print(f"  removed {removed} rows, index cleaned, database vacuumed")

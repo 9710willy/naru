@@ -387,6 +387,30 @@ class MemorySurface:
             out.append(row)
         return out
 
+    def prune_preview(self, before_iso):
+        """What `prune(before_iso)` would remove, and what it would keep.
+
+        Beside `prune` and sharing PRUNE_KEEP with it deliberately. The CLI
+        used to re-derive this with an age-only predicate, so `--dry-run`
+        reported that it would delete promoted claims that `prune` then
+        correctly refused to touch — the guard ADR 0005 exists for was
+        invisible in the one command you run before a destructive one.
+        """
+        row = self.db.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(LENGTH(content)),0) b"
+            " FROM conversation_history"
+            " WHERE created_at IS NOT NULL AND created_at < ?" + PRUNE_KEEP,
+            (before_iso,),
+        ).fetchone()
+        kept = self.db.execute(
+            "SELECT COUNT(*) n FROM conversation_history"
+            " WHERE NOT (created_at IS NOT NULL AND created_at < ?"
+            + PRUNE_KEEP
+            + ")",
+            (before_iso,),
+        ).fetchone()
+        return row["n"], row["b"], kept["n"]
+
     def prune(self, before_iso):
         """Delete rows created before `before_iso`. Returns rows removed.
 
@@ -395,9 +419,7 @@ class MemorySurface:
         human promotion a 30-day shelf life and silently empties the doc. Age
         is the right rule for spilled tool output, not for a curated decision.
 
-        The FTS table is contentless, so its rows must be deleted explicitly —
-        a plain DELETE on conversation_history leaves the index holding orphan
-        entries that occupy space forever. Blob files are removed too.
+        Blob files for the deleted rows are removed too.
         """
         doomed = self.db.execute(
             "SELECT seq, payload_path FROM conversation_history"
@@ -407,18 +429,17 @@ class MemorySurface:
         if not doomed:
             return 0
         seqs = [r["seq"] for r in doomed]
-        if True:
-            for r in doomed:
-                if r["payload_path"]:
-                    try:
-                        f = pathlib.Path(r["payload_path"])
-                        f.unlink(missing_ok=True)
-                        if f.parent.name.startswith("naru-blobs-") and not any(
-                            f.parent.iterdir()
-                        ):
-                            f.parent.rmdir()
-                    except OSError:
-                        pass
+        for r in doomed:
+            if r["payload_path"]:
+                try:
+                    f = pathlib.Path(r["payload_path"])
+                    f.unlink(missing_ok=True)
+                    if f.parent.name.startswith("naru-blobs-") and not any(
+                        f.parent.iterdir()
+                    ):
+                        f.parent.rmdir()
+                except OSError:
+                    pass
         marks = ",".join("?" * len(seqs))
         self.db.execute(
             f"DELETE FROM conversation_history WHERE seq IN ({marks})", seqs
@@ -810,8 +831,15 @@ def demo():
     stale_note = ms.append(
         "note", "ancient note", kind="note", created_at="2000-01-01T00:00:00"
     )
+    # the preview must agree with the delete. It used to be re-derived in the
+    # CLI without PRUNE_KEEP, so `naru prune --dry-run` announced it would
+    # take this promoted claim and then didn't.
+    n_doomed, _, n_kept = ms.prune_preview("2001-01-01T00:00:00")
+    before = ms.sql_query("SELECT COUNT(*) n FROM conversation_history")[0].n
+    assert n_doomed + n_kept == before, (n_doomed, n_kept, before)
     removed = ms.prune("2001-01-01T00:00:00")
     assert removed == 1, f"expected only the note to go, removed {removed}"
+    assert n_doomed == removed, f"preview said {n_doomed}, prune took {removed}"
     assert ms.expand(old), "prune deleted a promoted claim"
     assert ms.expand(stale_note) == [], "prune left the ordinary old row"
     assert "ancient decided claim" in ms.doc()
