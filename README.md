@@ -154,13 +154,22 @@ grader.
 disagree, and prints the verdict with the run:
 
 ```
-full  vs rag    +20.8 pts   full only 1, rag only 6   p=0.125   not separable
-full  vs naru   +12.5 pts   full only 3, naru only 6  p=0.508   not separable
-rag   vs naru    -8.3 pts   rag only 3, naru only 1   p=0.625   not separable
+separability — paired McNemar on the questions the arms disagree on, Bonferroni for 3 pairs
+    full  vs rag    +20.8 pts   full only 1, rag only 6   p=0.125   not separable — this run's luck
+    full  vs naru   +12.5 pts   full only 3, naru only 6   p=0.508   not separable — this run's luck
+    rag   vs naru    -8.3 pts   rag only 3, naru only 1   p=0.625   not separable — this run's luck
 ```
 
 At n=24 this harness cannot tell the three apart, and that includes gaps of 20
 points. Treat every accuracy number here as underpowered.
+
+Three arms means three tests, so the threshold is Bonferroni-corrected. At an
+uncorrected 0.05 each, at least one pair reads "REAL" in about 6% of runs where
+nothing separates, against 2% for a single pair. A question whose run errored
+leaves the pairing rather than scoring as a wrong answer: McNemar reads only
+the discordant pairs, so one CLI timeout scored as a loss can turn p=0.125 into
+p=0.031 and manufacture a significance claim. The published run had zero
+backend errors, so nothing was dropped from it.
 
 Cost is not a statistical question. `rag` answered in one call on 1,816 input
 tokens net of harness overhead, against `naru`'s 4.4 calls and 73,199. That is

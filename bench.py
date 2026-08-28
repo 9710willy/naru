@@ -339,7 +339,9 @@ def report(rows, label, floor, measured=True):
         if floor is None
         else sum(max(0, r["billed_input"] - floor * r["turns"]) for r in rows)
     )
-    cost = sum(r["cost"] + r["judge_cost"] for r in rows)
+    model_cost = sum(r["cost"] for r in rows)
+    judge_cost = sum(r["judge_cost"] for r in rows)
+    cost = model_cost + judge_cost
     bar = "#" * round(acc * 28) + "." * (28 - round(acc * 28))
     lo, hi = wilson(n_correct, n)
     # The interval is printed on the same line as the accuracy on purpose. A
@@ -361,6 +363,16 @@ def report(rows, label, floor, measured=True):
         f"view {sum(r['peak_view_tokens'] for r in rows) / n:>6,.0f}t   "
         + (f"${cost:.2f} total" if measured else "cost not measurable")
     )
+    if measured:
+        # The arm's own dollars, and the cache share that makes a token ratio
+        # and a money ratio disagree. Both are published columns; printing
+        # only a combined total left them hand-computed and unreproducible.
+        cr = sum(r.get("cache_read", 0) for r in rows)
+        print(
+            f"           model ${model_cost / n:.4f}/q   "
+            f"judge ${judge_cost / n:.4f}/q   "
+            f"cache-read {100 * cr / max(1, bi):.0f}% of billed input"
+        )
     errs = sum(r["errors"] for r in rows)
     retries = sum(r.get("empty_retries", 0) for r in rows)
     if errs or retries:
@@ -387,14 +399,37 @@ def separability(rows, arms):
     This answers "is this gap real on these questions". noise.py owns the
     different question of how far a rerun moves, and needs replicates for it.
     """
-    verdicts = {}
+    # A row whose run errored has correct=False, which is indistinguishable
+    # from a wrong answer. McNemar reads only the discordant pairs, so one
+    # contaminated question moves p hard: on the published run full-vs-rag is
+    # 1-vs-6 (p=0.125, "not separable"); had that single full win been a CLI
+    # timeout it is 0-vs-6 (p=0.031) and the harness prints a significance
+    # claim manufactured by a hung subprocess. Drop them from the pairing —
+    # the shared-key intersection then removes each dropped question from
+    # both arms, which is what a paired test requires.
+    verdicts, dropped = {}, {}
     for arm in arms:
-        v = {r["qid"]: bool(r["correct"]) for r in rows if r["arm"] == arm}
+        rs = [r for r in rows if r["arm"] == arm]
+        v = {r["qid"]: bool(r["correct"]) for r in rs if not r.get("errors")}
         if v:
             verdicts[arm] = v
+            dropped[arm] = len(rs) - len(v)
     if len(verdicts) < 2:
         return
-    print("\n  separability — paired McNemar on the questions the arms disagree on")
+    pairs = len(list(combinations(verdicts, 2)))
+    # Three arms means three tests. At an uncorrected 0.05 each, at least one
+    # pair reads REAL in ~6% of runs where nothing separates, against ~2% for
+    # a single pair. The verdict is the harness's published claim, so it is
+    # the number that has to be honest.
+    alpha = 0.05 / pairs
+    note = f", Bonferroni for {pairs} pairs" if pairs > 1 else ""
+    print(
+        f"\n  separability — paired McNemar on the questions the arms"
+        f" disagree on{note}"
+    )
+    if any(dropped.values()):
+        drops = ", ".join(f"{a} {d}" for a, d in dropped.items() if d)
+        print(f"    dropped from the pairing (run errored): {drops}")
     # verdicts is built by iterating arms, so its key order is already the
     # filtered arm list — and unlike a list it cannot yield `full vs full`.
     for a, b in combinations(verdicts, 2):
@@ -411,7 +446,11 @@ def separability(rows, arms):
         # gap over the shared set is exactly the difference of the two
         # disagreement counts mcnemar already computed.
         gap = 100 * (only_b - only_a) / shared
-        mark = "REAL at p<0.05" if p < 0.05 else "not separable — this run's luck"
+        mark = (
+            f"REAL at p<{alpha:.3g}"
+            if p < alpha
+            else "not separable — this run's luck"
+        )
         print(
             f"    {a:5} vs {b:5} {gap:+6.1f} pts   "
             f"{a} only {only_a}, {b} only {only_b}   p={p:.3f}   {mark}"
@@ -627,6 +666,33 @@ def demo():
     # that a one-sided p-value passes. 2 discordant pairs, both one way.
     assert mcnemar(agree, better) == (0, 2, 0.5)
     assert mcnemar(agree, agree)[2] == 1.0, "identical arms cannot differ"
+    # A question whose run errored must leave the pairing, not score as wrong.
+    # Scored wrong it is a discordant pair and moves p; dropped it is removed
+    # from both arms, which is what the paired test requires.
+    # q16 is a discordant pair: full got it wrong, naru right. Erroring it
+    # must remove it from the counts, not leave it scored as a full loss.
+    contaminated = rows_for("full", 16, 24) + rows_for("naru", 19, 24)
+    for r in contaminated:
+        if r["arm"] == "full" and r["qid"] == "q16":
+            r["errors"] = 1
+    out = sep_out(contaminated, both)
+    assert "dropped from the pairing (run errored): full 1" in out, out
+    # and the dropped question must really leave the counts, not just be named
+    clean = sep_out(rows_for("full", 16, 24) + rows_for("naru", 19, 24), both)
+    assert "full only 0, naru only 3" in clean, clean
+    assert "full only 0, naru only 2" in out, out
+    # Three arms means three tests, so the threshold must tighten — pinned on
+    # the split that turns on it. 6 discordant pairs all one way is p=0.031:
+    # REAL against an uncorrected 0.05, not separable against 0.05/3.
+    two_arm = sep_out(rows_for("full", 18, 24) + rows_for("naru", 24, 24), both)
+    assert "REAL at p<0.05" in two_arm, two_arm
+    three = (
+        rows_for("full", 18, 24) + rows_for("rag", 18, 24) + rows_for("naru", 24, 24)
+    )
+    out3 = sep_out(three, ["full", "rag", "naru"])
+    assert "Bonferroni for 3 pairs" in out3, out3
+    assert "REAL" not in out3, out3
+    assert "p=0.031" in out3, out3
     # one arm alone has nothing to compare against and must print nothing
     assert sep_out(rows_for("rag", 5, 24), ["rag"]) == ""
     # arms sharing no question ids must say so rather than divide by zero

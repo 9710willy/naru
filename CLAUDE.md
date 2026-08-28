@@ -41,6 +41,12 @@ itself.
   is paired. Do not replace it with overlapping confidence intervals: that
   discards the pairing and is far too conservative. At n=24 nothing separates,
   including a 20-point gap.
+- **Three arms means three tests.** The threshold is Bonferroni-corrected;
+  uncorrected, one pair reads "REAL" in ~6% of runs where nothing separates.
+- **A question whose run errored leaves the pairing.** `correct=False` cannot
+  tell a wrong answer from a call that never completed, and McNemar reads only
+  the discordant pairs — one timeout scored as a loss turns p=0.125 into
+  p=0.031 and publishes a significance claim a hung subprocess invented.
 - **All arms must see identical history.** `sessions(q)` is the one source of
   ordering; do not re-derive it. `--arms` rejects an unknown name rather than
   falling through to `full`, because a typo would corrupt a paid run in silence.
