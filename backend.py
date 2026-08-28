@@ -48,6 +48,7 @@ class Usage:
     cost_usd: float = 0.0
     errors: int = 0
     empty_retries: int = 0
+    call_retries: int = 0
 
     def add(self, u, cost):
         self.calls += 1
@@ -94,9 +95,17 @@ class _Retrying:
         """Send one prompt, return the model's text.
 
         Retries a genuinely empty reply, which the CLI produces sporadically
-        for a valid request. A HARD failure — timeout, non-zero exit,
-        unparseable output — is not retried: `_once` returns None for those,
-        and hammering a broken command six times only multiplies the wait.
+        for a valid request, AND a hard failure — timeout, non-zero exit,
+        unparseable output — which `_once` reports as None.
+
+        Hard failures used to return immediately, on the reasoning that
+        hammering a broken command only multiplies the wait. A broken command
+        is already rejected by `__post_init__`, so what that actually skipped
+        was the transient case, and a transient failure costs an arm one whole
+        question in proportion to its turn count: at a 6% per-call rate a
+        single-call arm loses 6% of its questions and a 3.3-call arm loses 20%.
+        An n=96 Sonnet run lost five questions that way before this changed.
+
         `nudge` is appended on retry, because an identical retry tends to come
         back empty again; the caller supplies it, since the right nudge for a
         code-writing turn is the wrong one for a one-word judge verdict.
@@ -105,12 +114,16 @@ class _Retrying:
             p = prompt if attempt == 0 or not nudge else f"{prompt}\n\n{nudge}"
             out = self._once(p, system)
             if out is None:
-                return ""  # already counted as an error by _once
+                self.usage.call_retries += 1
+                continue
             if out.strip():
                 return out
             self.usage.empty_retries += 1
         # Exhausting the budget loses a whole turn. Count it as the error it is
-        # rather than returning "" as if the model had nothing to say.
+        # rather than returning "" as if the model had nothing to say. `errors`
+        # therefore means "this question permanently lost a call", which is the
+        # signal bench.separability() drops a row on — a failure the retry
+        # recovered from must not disqualify a good answer.
         self.usage.errors += 1
         return ""
 
@@ -134,11 +147,13 @@ class _Retrying:
                 timeout=self.timeout,
             )
         except catch as e:
-            self.usage.errors += 1
+            # Not counted as an error here: __call__ owns that, and only once
+            # the retry budget is gone. Counting per attempt would make
+            # `errors` mean "a call failed somewhere", and a recovered blip
+            # would then disqualify a perfectly good answer.
             self._complain(f"{type(e).__name__}: {e}")
             return None
         if p.returncode != 0:
-            self.usage.errors += 1
             self._complain(f"exit {p.returncode}: {(p.stderr or '').strip()[:300]}")
             return None
         return p.stdout
@@ -171,12 +186,17 @@ class Backend(_Retrying):
         try:
             d = json.loads(out)
         except json.JSONDecodeError:
-            self.usage.errors += 1
             self._complain("unparseable JSON on stdout")
             return None
+        # Usage is added before the error check on purpose: an errored call
+        # still burned tokens and still costs money.
         self.usage.add(d.get("usage") or {}, d.get("total_cost_usd"))
         if d.get("is_error"):
-            self.usage.errors += 1
+            # None, not the payload: on is_error the result field carries the
+            # error text, not an answer. Returning it fed an error message to
+            # the judge as though the model had answered. __call__ retries.
+            self._complain(f"is_error: {str(d.get('result'))[:200]}")
+            return None
         return d.get("result") or ""
 
 
@@ -269,9 +289,17 @@ def measure_floor(model=HAIKU):
     return b.usage.billed_input // b.usage.calls if b.usage.calls else None
 
 
-def demo():
-    """Live check — costs a couple of cheap calls. Also measures the harness
-    token floor, so benchmark numbers can be read net of CLI overhead."""
+def demo(live=True):
+    """Check the backend. `live=False` runs only the parts that need no network.
+
+    The offline half covers the plumbing, the bad-command rejection and the
+    retry semantics, and it is the half CI can run. Splitting it out is not
+    cosmetic: the retry fix below is exactly the kind of thing that rots
+    unnoticed when its only check costs money to run.
+
+    The live half costs a couple of cheap calls and measures the harness token
+    floor, so benchmark numbers can be read net of CLI overhead.
+    """
     # Offline first: any stdin->stdout command is a valid backend. `cat` echoes
     # the prompt, which is enough to prove the plumbing without a network call.
     echo = CommandBackend(cmd="cat")
@@ -285,6 +313,38 @@ def demo():
             raise AssertionError(f"accepted a bad backend command: {bad!r}")
         except (ValueError, FileNotFoundError):
             pass
+
+    # A transient hard failure must be retried, not surrendered. Before this,
+    # `_once` returning None ended the call, so a blip cost the question — and
+    # cost it in proportion to an arm's turn count, biasing the benchmark
+    # against the multi-turn arm exactly as CLAUDE.md warns.
+    import pathlib as _pathlib
+    import stat as _stat
+    import tempfile as _tempfile
+
+    _d = _pathlib.Path(_tempfile.mkdtemp())
+    _n = _d / "n"
+    _flaky = _d / "flaky.sh"
+    _flaky.write_text(
+        "#!/bin/bash\ncat > /dev/null\n"
+        f"n=$(cat {_n} 2>/dev/null || echo 0)\necho $((n+1)) > {_n}\n"
+        'if [ "$n" -lt 2 ]; then exit 1; fi\necho "recovered"\n'
+    )
+    _flaky.chmod(_flaky.stat().st_mode | _stat.S_IEXEC)
+    _fb = CommandBackend(cmd=str(_flaky))
+    assert _fb("q").strip() == "recovered", "a transient failure must be retried"
+    assert _fb.usage.call_retries == 2, _fb.usage.call_retries
+    assert _fb.usage.errors == 0, "a recovered blip is not a lost question"
+
+    _dead = _d / "dead.sh"
+    _dead.write_text("#!/bin/bash\ncat > /dev/null\nexit 1\n")
+    _dead.chmod(_dead.stat().st_mode | _stat.S_IEXEC)
+    _db = CommandBackend(cmd=str(_dead))
+    assert _db("q") == ""
+    # one lost question, not one per attempt: bench.separability() drops a row
+    # on errors, so counting per attempt would be the same verdict either way,
+    # but report()'s error line would read six times too high.
+    assert _db.usage.errors == 1, _db.usage.errors
 
     # The "no usage" warning is per command, not per construction. bench.py
     # builds one backend per question per arm, so this is the difference
@@ -303,6 +363,8 @@ def demo():
     )
     os.environ.pop("NARU_BACKEND", None)
     print("ok — generic command backend (offline)")
+    if not live:
+        return
 
     b = Backend(model=HAIKU)
 
@@ -323,4 +385,4 @@ def demo():
 
 
 if __name__ == "__main__":
-    demo()
+    demo(live="--selfcheck" not in sys.argv)

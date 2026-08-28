@@ -345,6 +345,9 @@ def one(
         # WRONG. Counted separately, it is the only call whose failure is
         # indistinguishable from a real negative result.
         "judge_errors": jb.usage.errors,
+        # hard failures a retry recovered from: invisible in `errors` by
+        # design, but the flakiness tax an arm paid is worth seeing.
+        "call_retries": be.usage.call_retries,
         "empty_retries": be.usage.empty_retries,
     }
 
@@ -374,6 +377,12 @@ def report(rows, label, floor, measured=True):
     n = len(rows)
     n_correct = sum(r["correct"] for r in rows)
     acc = n_correct / n
+    # A question whose run lost a call is scored wrong above, because that is
+    # what the row says. It is not evidence about the arm, and a multi-turn arm
+    # meets a per-call failure rate proportionally more often. Both numbers are
+    # printed: the gap between them is the flakiness tax.
+    ok_rows = [r for r in rows if not r.get("errors") and not r.get("judge_errors")]
+    lost = n - len(ok_rows)
     bi = sum(r["billed_input"] for r in rows)
     # floor is None when the backend reports no usage at all. Subtracting 0 and
     # printing the result would present "not measured" as a measurement.
@@ -393,6 +402,14 @@ def report(rows, label, floor, measured=True):
         f"\n  {label:8} {bar} {acc * 100:5.1f}%  ({n_correct}/{n})"
         f"  95% CI {lo * 100:.0f}-{hi * 100:.0f}%"
     )
+    if lost and ok_rows:  # every row lost leaves nothing to rescore
+        k2 = sum(r["correct"] for r in ok_rows)
+        n2 = len(ok_rows)
+        l2, h2 = wilson(k2, n2)
+        print(
+            f"           excluding {lost} harness-lost question(s): "
+            f"{100 * k2 / n2:.1f}%  ({k2}/{n2})  95% CI {l2 * 100:.0f}-{h2 * 100:.0f}%"
+        )
     if measured:
         print(
             f"           billed-in {bi / n:>9,.0f}/q   net-of-harness "
@@ -417,6 +434,7 @@ def report(rows, label, floor, measured=True):
             f"cache-read {100 * cr / max(1, bi):.0f}% of billed input"
         )
     errs = sum(r["errors"] for r in rows)
+    cretries = sum(r.get("call_retries", 0) for r in rows)
     # Rows written before judge_errors existed have no such key. Summing them
     # to 0 would print "0 judge errors" for a run where nobody counted, which
     # is ADR 0002's mistake in miniature: not measured rendered as measured.
@@ -426,11 +444,11 @@ def report(rows, label, floor, measured=True):
         else None
     )
     retries = sum(r.get("empty_retries", 0) for r in rows)
-    if errs or retries or jerrs:
+    if errs or retries or jerrs or cretries:
         judge_part = "judge errors not recorded" if jerrs is None else f"{jerrs} judge errors"
         print(
             f"           {errs} backend errors, {judge_part}, "
-            f"{retries} empty-reply retries"
+            f"{retries} empty-reply retries, {cretries} call retries"
         )
     by = {}
     for r in rows:
@@ -818,6 +836,16 @@ def demo():
         r.update(billed_input=1, output=1, turns=1, peak_view_tokens=1,
                  cost=0.0, judge_cost=0.0, errors=1)
     assert "judge errors not recorded" in rep_out(old_rows), rep_out(old_rows)
+    # every row lost: nothing to rescore, and it must not divide by zero
+    assert "excluding" not in rep_out(old_rows), rep_out(old_rows)
+    # one of three lost: the excluding line appears and rescores the rest
+    mixed = rows_for("x", 2, 3)
+    for r in mixed:
+        r.update(billed_input=1, output=1, turns=1, peak_view_tokens=1,
+                 cost=0.0, judge_cost=0.0, errors=0, judge_errors=0)
+    mixed[2]["errors"] = 1          # the wrong one was a harness loss
+    out_mixed = rep_out(mixed)
+    assert "excluding 1 harness-lost question(s): 100.0%  (2/2)" in out_mixed, out_mixed
     for r in old_rows:
         r["judge_errors"] = 0
     assert "0 judge errors" in rep_out(old_rows), rep_out(old_rows)
