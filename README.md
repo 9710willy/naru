@@ -1,5 +1,7 @@
 # naru
 
+[![checks](https://github.com/9710willy/naru/actions/workflows/checks.yml/badge.svg)](https://github.com/9710willy/naru/actions/workflows/checks.yml)
+
 Shared, human-approved context for coding agents.
 
 ```
@@ -236,6 +238,7 @@ six categories. See ADR 0006.
 
 ## See also
 
+[`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a PR.
 [`docs/adr/`](docs/adr/) for design decisions. [`bench.py`](bench.py) for the
 benchmark. [`how-it-works.html`](how-it-works.html) walks the mechanism.
 
