@@ -103,6 +103,24 @@ MUTATIONS = [
         "return a_only, b_only, min(1.0, tail)",
     ),
     (
+        "a refused rlimit is reported as applied",
+        "kernel.py",
+        'applied[name] = f"NOT APPLIED: {type(e).__name__}"',
+        "applied[name] = want",
+    ),
+    (
+        "a crashed child is reported as a timeout",
+        "kernel.py",
+        'f"exceeded {self.timeout}s wall clock"\n            if rc is None',
+        'f"exceeded {self.timeout}s wall clock"\n            if rc is not None',
+    ),
+    (
+        "an in-memory log is accepted for a child process",
+        "kernel.py",
+        'if db == ":memory:":',
+        "if False:",
+    ),
+    (
         "prune preview forgets PRUNE_KEEP",
         "ms.py",
         (
@@ -134,8 +152,11 @@ def run_mutated(target, find, replace):
         for f in published.glob("*.json"):
             shutil.copy(f, work / "results" / "published" / f.name)
     (work / target).write_text(body.replace(find, replace))
-    # ms.py's own demo owns the prune invariant; everything else is bench's
-    cmd = ["ms.py"] if target == "ms.py" else ["bench.py", "--selfcheck"]
+    # each invariant belongs to the module whose demo asserts it
+    cmd = {
+        "ms.py": ["ms.py"],
+        "kernel.py": ["kernel.py"],
+    }.get(target, ["bench.py", "--selfcheck"])
     return subprocess.run(
         [sys.executable, *cmd], cwd=work, capture_output=True, text=True, check=False
     ).returncode

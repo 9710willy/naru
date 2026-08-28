@@ -218,7 +218,14 @@ descriptive.
 
 Curation has self-checks and no production use.
 
-`kernel.py` executes model-authored code in-process without a sandbox.
+`kernel.py` executes model-authored code in-process by default.
+`NARU_KERNEL=sandbox` moves it to a child process with CPU, memory and file
+size limits and a wall-clock timeout, so a runaway loop or a crash takes the
+child rather than the run. That is process isolation, not a sandbox: the child
+is the same user with the same filesystem and network. `NARU_KERNEL_JAIL`
+wraps it in `sandbox-exec`, `bwrap` or a container if you need containment.
+macOS refuses `RLIMIT_AS`, so memory is uncapped there and `limits()` says so
+rather than reporting a cap that does not exist. See ADR 0007.
 
 Conflict detection is exact string matching on `topic_key`. Contradictory claims
 filed under different keys both appear as approved.

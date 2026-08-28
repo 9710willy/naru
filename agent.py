@@ -7,10 +7,11 @@ the view exceeds budget, Algorithm 1 evicts spans to a tiered index that keeps
 them addressable.
 """
 
+import os
 import re
 
 from eviction import Block, est, evict, format_headline, render_index
-from kernel import Kernel
+from kernel import Kernel, SandboxedKernel
 
 CODE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
 # Models sometimes emit the cell with no fences at all. Detect that so a bare
@@ -139,8 +140,14 @@ def _run(
     answer = {"text": None}
     system = SYSTEM + ("\n\n" + rubric if rubric else "")
 
-    def submit_answer(text):
+    def record_answer(text):
+        """The side effect alone. A sandboxed kernel's child raises its own
+        stop signal locally, so replaying Done in the parent would throw out of
+        run() instead of ending a cell that already ended."""
         answer["text"] = str(text)
+
+    def submit_answer(text):
+        record_answer(text)
         raise Done()
 
     landmark = {"text": None}
@@ -150,11 +157,22 @@ def _run(
         landmark["text"] = format_headline(task, state, next_action, status)
 
     # Section 2.2: the Event Log is read-only from the kernel.
-    kernel = Kernel(
-        ms=ms.readonly() if hasattr(ms, "readonly") else ms,
-        submit_answer=submit_answer,
-        headline=headline,
-    )
+    # NARU_KERNEL=sandbox runs cells in a child process, which survives a
+    # runaway loop or a crash. It needs the log by path, so it is opt-in rather
+    # than default: bench.py ingests into an in-memory database that no child
+    # can open. See ADR 0007.
+    path = getattr(ms, "path", None)
+    if os.environ.get("NARU_KERNEL") == "sandbox" and path and path != ":memory:":
+        kernel = SandboxedKernel(
+            db=path,
+            callbacks={"submit_answer": record_answer, "headline": headline},
+        )
+    else:
+        kernel = Kernel(
+            ms=ms.readonly() if hasattr(ms, "readonly") else ms,
+            submit_answer=submit_answer,
+            headline=headline,
+        )
     # Section 3.3: the eviction index built during ingestion is carried
     # forward; the raw context starts empty.
     view = []

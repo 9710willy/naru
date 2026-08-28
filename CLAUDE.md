@@ -81,6 +81,20 @@ itself.
   it inline on the hook command makes `naru stats` judge the distribution
   against a threshold the hook never ran at.
 
+## The kernel
+
+`NARU_KERNEL=sandbox` runs cells in a child process (ADR 0007). Opt-in, because
+`bench.py` ingests into `MemorySurface(":memory:")` and no child can open an
+in-memory database — the constructor refuses `":memory:"` loudly.
+
+- **It is process isolation, not a sandbox.** Same user, same filesystem, same
+  network. `NARU_KERNEL_JAIL` is the seam for a real jail, like `NARU_BACKEND`.
+- **A limit the platform refuses must report itself refused.** macOS rejects
+  `RLIMIT_AS`; swallowing that leaves a caller believing memory is capped.
+- `submit_answer` is split into `record_answer` (the side effect) and the
+  `Done` raise. The child stops its own cell, so replaying the raise in the
+  parent would throw out of `run()`.
+
 ## Observability
 
 `naru stats [days]` reads `~/.naru/metrics.jsonl`, one appended line per hook

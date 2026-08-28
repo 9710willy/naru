@@ -93,6 +93,9 @@ class MemorySurface:
         # Several agents append while a human reads. WAL lets readers run
         # during a write; busy_timeout absorbs the overlap instead of raising
         # "database is locked" in whichever caller lost the race.
+        # The path, not just the connection: a sandboxed kernel runs in a
+        # child process and has to reopen the log by name.
+        self.path = db
         self.db = sqlite3.connect(db, timeout=30)
         self.db.row_factory = sqlite3.Row
         try:
