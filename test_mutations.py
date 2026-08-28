@@ -121,6 +121,18 @@ MUTATIONS = [
         'f"exceeded {self.timeout}s wall clock"\n            if not hung',
     ),
     (
+        "the child opens the log writable",
+        "kernel.py",
+        'ns["ms"] = MemorySurface.open_readonly(db).readonly()',
+        'ns["ms"] = MemorySurface(db).readonly()',
+    ),
+    (
+        "the child runs without -I, so CWD is importable",
+        "kernel.py",
+        '            "-I",\n            "-c",',
+        '            "-c",',
+    ),
+    (
         "an in-memory log is accepted for a child process",
         "kernel.py",
         'if db == ":memory:":',

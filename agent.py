@@ -186,83 +186,90 @@ def _run(
         else f"Question: {question}"
     )
 
-    for turn in range(max_turns):
-        turns_used = turn + 1
-        parts = [header]
-        idx = render_index(index)
-        if idx:
-            parts.append(idx)
-        parts.append(kernel.digest())
-        if view:
-            parts.append("--- working view ---")
-            parts += [b.text for b in view]
-        if turn == max_turns - 1:
-            parts.append("LAST TURN. You must call submit_answer(...) now.")
-        prompt = "\n\n".join(parts)
+    try:
+        for turn in range(max_turns):
+            turns_used = turn + 1
+            parts = [header]
+            idx = render_index(index)
+            if idx:
+                parts.append(idx)
+            parts.append(kernel.digest())
+            if view:
+                parts.append("--- working view ---")
+                parts += [b.text for b in view]
+            if turn == max_turns - 1:
+                parts.append("LAST TURN. You must call submit_answer(...) now.")
+            prompt = "\n\n".join(parts)
 
-        # The retry nudge lives here, not in backend: a code-block reminder
-        # is right for a turn that must emit Python and wrong for a judge
-        # that must emit one word.
-        reply = backend(
-            prompt, system=system, nudge="(Reply with one ```python code block.)"
-        )
-        code = extract_code(reply)
-        if trace is not None:
-            trace.append(
-                {
-                    "turn": turns_used,
-                    "prompt_tokens": est(prompt),
-                    "code": code,
-                    "reply_if_no_code": None if code else reply,
-                }
+            # The retry nudge lives here, not in backend: a code-block reminder
+            # is right for a turn that must emit Python and wrong for a judge
+            # that must emit one word.
+            reply = backend(
+                prompt, system=system, nudge="(Reply with one ```python code block.)"
             )
-        if code is None:
-            # Genuine prose, no code. Take it as the final answer.
-            if reply.strip():
-                answer["text"] = reply.strip()
-            break
-
-        seq += 1
-        exec_block = Block(seq, "exec", f"[exec {seq}]\n{code.strip()}",
-                           headline=f"exec {seq}")
-        view.append(exec_block)
-
-        landmark["text"] = None
-        out, err = kernel.run(code)
-        # Bind the landmark at append time, to the address this turn was given.
-        if landmark["text"]:
-            exec_block.headline = f"[{seq}] {landmark['text']}"
-        if answer["text"] is not None:
+            code = extract_code(reply)
             if trace is not None:
-                trace[-1]["obs"] = "(submitted)"
-            break
+                trace.append(
+                    {
+                        "turn": turns_used,
+                        "prompt_tokens": est(prompt),
+                        "code": code,
+                        "reply_if_no_code": None if code else reply,
+                    }
+                )
+            if code is None:
+                # Genuine prose, no code. Take it as the final answer.
+                if reply.strip():
+                    answer["text"] = reply.strip()
+                break
 
-        seq += 1
-        obs = out.strip() or "(nothing printed)"
-        if err:
-            obs = f"{obs}\nERROR: {err}" if out.strip() else f"ERROR: {err}"
-        if trace is not None:
-            trace[-1]["obs"] = obs
-        view.append(
-            Block(
-                seq,
-                "obs",
-                f"[obs {seq}]\n{obs}",
-                headline=f"obs {seq}: {obs[:50]}",
-                is_payload=True,
+            seq += 1
+            exec_block = Block(seq, "exec", f"[exec {seq}]\n{code.strip()}",
+                               headline=f"exec {seq}")
+            view.append(exec_block)
+
+            landmark["text"] = None
+            out, err = kernel.run(code)
+            # Bind the landmark at append time, to the address this turn was given.
+            if landmark["text"]:
+                exec_block.headline = f"[{seq}] {landmark['text']}"
+            if answer["text"] is not None:
+                if trace is not None:
+                    trace[-1]["obs"] = "(submitted)"
+                break
+
+            seq += 1
+            obs = out.strip() or "(nothing printed)"
+            if err:
+                obs = f"{obs}\nERROR: {err}" if out.strip() else f"ERROR: {err}"
+            if trace is not None:
+                trace[-1]["obs"] = obs
+            view.append(
+                Block(
+                    seq,
+                    "obs",
+                    f"[obs {seq}]\n{obs}",
+                    headline=f"obs {seq}: {obs[:50]}",
+                    is_payload=True,
+                )
             )
-        )
 
-        if verbose:
-            print(
-                f"  turn {turn + 1}: {est(code)}t code -> {est(obs)}t obs"
-                f"{' ERR' if err else ''}"
-            )
+            if verbose:
+                print(
+                    f"  turn {turn + 1}: {est(code)}t code -> {est(obs)}t obs"
+                    f"{' ERR' if err else ''}"
+                )
 
-        view, index = evict(view, index, budget=budget, protect_tail=protect_tail)
+            view, index = evict(view, index, budget=budget, protect_tail=protect_tail)
 
-    peak = sum(b.tokens() for b in view)
-    return answer["text"], turns_used, peak
+        peak = sum(b.tokens() for b in view)
+        return answer["text"], turns_used, peak
+    finally:
+        # A sandboxed kernel owns a child process and its SQLite
+        # connection. Without this a 96-question run finishes holding
+        # 96 idle children; the in-process Kernel's close() is a no-op
+        # so the call site needs no branch.
+        kernel.close()
 
 
 def run_naru(

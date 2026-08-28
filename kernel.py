@@ -16,6 +16,21 @@ import sys
 import threading
 import traceback
 
+MAX_OUT = 8000  # chars of printed output allowed into the working view
+
+
+def _cap(out):
+    """Truncate a cell's output to what may enter the model's view.
+
+    One owner, and applied in the CHILD. Capping only in the parent still
+    required readline() to pull the whole line in first: a cell printing 200MB
+    took the parent from 19MB to 687MB of RSS before the truncation ran, which
+    is precisely the memory bomb ADR 0007 claims the child absorbs.
+    """
+    if len(out) <= MAX_OUT:
+        return out
+    return out[:MAX_OUT] + f"\n[output truncated at {MAX_OUT} chars]"
+
 
 def _provenance(v):
     """Which Event Log addresses a resident value derives from.
@@ -53,8 +68,6 @@ class Kernel:
     data; move to a subprocess or container before running untrusted code.
     """
 
-    MAX_OUT = 8000  # chars of printed output allowed into the working view
-
     def __init__(self, **preload):
         self.ns = {"__name__": "__naru__"}
         self.ns.update(preload)
@@ -67,13 +80,16 @@ class Kernel:
         try:
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                 exec(compile(code, "<cell>", "exec"), self.ns)
-        except Exception:
+        except (Exception, SystemExit):
+            # SystemExit subclasses BaseException, so `except Exception` let
+            # sys.exit() in a cell unwind out of run_naru and end a paid bench
+            # run mid-flight. Not BaseException: Ctrl-C must still reach you.
             tb = traceback.format_exc(limit=2).strip().splitlines()
             err = tb[-1] if tb else "error"
-        out = buf.getvalue()
-        if len(out) > self.MAX_OUT:
-            out = out[: self.MAX_OUT] + f"\n[output truncated at {self.MAX_OUT} chars]"
-        return out, err
+        return _cap(buf.getvalue()), err
+
+    def close(self):
+        """Nothing to release; present so callers need no isinstance check."""
 
     def digest(self):
         """Short listing of resident variables: name, type, shape.
@@ -97,7 +113,7 @@ _CHILD = r'''
 import contextlib, io, json, os, resource, sys, traceback
 
 sys.path.insert(0, os.environ["NARU_KERNEL_PATH"])
-from kernel import _shape
+from kernel import MAX_OUT, _cap, _shape
 
 # Frame replies down a private copy of stdout, then point stdout at devnull so
 # a stray print at import time cannot corrupt the stream the parent parses.
@@ -141,7 +157,10 @@ def main():
     if db:
         from ms import MemorySurface
 
-        ns["ms"] = MemorySurface(db).readonly()
+        # open_readonly, not MemorySurface(db): the plain constructor opens a
+        # writable connection and runs migrations against the operator's live
+        # log, and ReadOnly only withholds an attribute name.
+        ns["ms"] = MemorySurface.open_readonly(db).readonly()
     for name in json.loads(os.environ.get("NARU_KERNEL_CALLBACKS", "[]")):
 
         def stub(*a, _n=name, **k):
@@ -182,7 +201,8 @@ def main():
                 # the loop silently.
                 tb = traceback.format_exc(limit=2).strip().splitlines()
                 err = tb[-1] if tb else "error"
-            reply = {"out": buf.getvalue(), "err": err, "calls": list(calls)}
+            # capped here, before it crosses the pipe
+            reply = {"out": _cap(buf.getvalue()), "err": err, "calls": list(calls)}
         _REPLY.write(json.dumps(reply) + "\n")
         _REPLY.flush()
 
@@ -218,8 +238,6 @@ class SandboxedKernel:
     in-process Kernel remains the default for benchmark runs.
     """
 
-    MAX_OUT = 8000
-
     def __init__(self, db=None, callbacks=None, timeout=60):
         if db == ":memory:":
             raise ValueError(
@@ -241,6 +259,12 @@ class SandboxedKernel:
             env["NARU_KERNEL_DB"] = str(self.db)
         argv = shlex.split(os.environ.get("NARU_KERNEL_JAIL", "")) + [
             sys.executable,
+            # -I, isolated: without it `python -c` puts the CWD at sys.path[0],
+            # which model code shares. A cell writing ./resource.py and forcing
+            # a respawn gave every later child no ceilings at all while
+            # limits() reported the fabricated numbers as applied — the
+            # enforcement mechanism supplied by the thing it constrains.
+            "-I",
             "-c",
             _CHILD,
         ]
@@ -266,7 +290,10 @@ class SandboxedKernel:
         try:
             self._proc.stdin.write(json.dumps(msg) + "\n")
             self._proc.stdin.flush()
-        except (BrokenPipeError, ValueError):
+        except (BrokenPipeError, ValueError) as e:
+            # _why has to be set on EVERY path out of here, or run() prints
+            # whatever the last failure left behind — "not started", typically.
+            self._why = f"pipe closed ({type(e).__name__})"
             self.close()
             return None
         result = {}
@@ -311,10 +338,8 @@ class SandboxedKernel:
             fn = self.callbacks.get(name)
             if fn:
                 fn(*args, **kwargs)
-        out = reply.get("out", "")
-        if len(out) > self.MAX_OUT:
-            out = out[: self.MAX_OUT] + f"\n[output truncated at {self.MAX_OUT} chars]"
-        return out, reply.get("err")
+        # already capped in the child; belt and braces for a hand-built reply
+        return _cap(reply.get("out", "")), reply.get("err")
 
     def digest(self):
         reply = self._ask({"op": "digest"})
@@ -349,6 +374,13 @@ def demo():
     assert "xs: list[4]" in d and "big: str[100000]" in d, d
     assert "helper" not in d, d
 
+    # SystemExit subclasses BaseException, so `except Exception` let a cell
+    # calling sys.exit() unwind out of the harness mid-run.
+    out, err = k.run("import sys; sys.exit(3)")
+    assert err and "SystemExit" in err, (out, err)
+    out, _ = k.run("print('alive')")
+    assert out.strip() == "alive", "kernel did not survive sys.exit()"
+
     # errors are captured, not raised, and the kernel survives
     out, err = k.run("1/0")
     assert err and "ZeroDivisionError" in err, err
@@ -357,7 +389,7 @@ def demo():
 
     # runaway output is capped
     out, _ = k.run("print('z' * 50000)")
-    assert len(out) < Kernel.MAX_OUT + 200 and "truncated" in out
+    assert len(out) < MAX_OUT + 200 and "truncated" in out
 
     # ---- SandboxedKernel: same interface, child process ------------------
     import tempfile
@@ -392,6 +424,35 @@ def demo():
         assert "kayak" in out, out               # the log reopened by path
         _, err = sk.run("ms.db = 1")
         assert err and "read-only" in err, err
+        # The facade withholds a name; SQLite withholds the write. A cell
+        # walked ms._ms.db and emptied a live log, so the child's connection
+        # is opened mode=ro and the refusal comes from the database.
+        _, err = sk.run("ms._ms.db.execute('DELETE FROM conversation_history')")
+        assert err and "readonly database" in err, err
+        out, _ = sk.run("print(len(ms.search('kayak')))")
+        assert out.strip() == "1", out           # and reads still work
+
+        # -I keeps the CWD off the child's sys.path. Without it a cell writes
+        # ./resource.py, forces a respawn, and every later child reports
+        # fabricated ceilings as applied — the limits supplied by the thing
+        # they constrain. Run from a scratch directory, because the child adds
+        # the repo to sys.path itself and the repo is often the CWD.
+        here = os.getcwd()
+        os.chdir(d)
+        try:
+            poison = SandboxedKernel(timeout=2)
+            honest = poison.limits()
+            poison.run(
+                "open('resource.py','w').write("
+                "'def setrlimit(*a):\\n    pass\\n"
+                "def getrlimit(w):\\n    return (1, 1)\\n"
+                "RLIMIT_CPU=0\\nRLIMIT_AS=1\\nRLIMIT_FSIZE=2\\n')"
+            )
+            poison.run("while True: pass")      # force a respawn
+            assert poison.limits() == honest, (honest, poison.limits())
+            poison.close()
+        finally:
+            os.chdir(here)
 
         sk.run("submit_answer('42')\nprint('NOT REACHED')")
         assert got == ["42"], got                # callback crossed back
@@ -401,6 +462,11 @@ def demo():
         assert err and "wall clock" in err, err
         out, _ = sk.run("print('alive')")
         assert out.strip() == "alive", "parent did not survive a runaway loop"
+        # Capped in the CHILD: the parent must never pull the whole payload
+        # through the pipe just to truncate it afterwards.
+        out, _ = sk.run("print('z' * 5_000_000)")
+        assert len(out) < MAX_OUT + 200 and "truncated" in out, len(out)
+
         _, err = sk.run("import ctypes; ctypes.string_at(0)")
         assert err and "died" in err, err        # a crash is not a timeout
         out, _ = sk.run("print('alive')")

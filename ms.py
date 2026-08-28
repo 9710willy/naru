@@ -89,6 +89,27 @@ def _to_match(query):
 
 
 class MemorySurface:
+    @classmethod
+    def open_readonly(cls, path):
+        """A surface backed by a connection SQLite itself refuses to write.
+
+        `ReadOnly` withholds a `db` attribute, which is a naming convention and
+        not a boundary: model-authored code reached the live log through
+        `ms._ms.db.execute("DELETE FROM conversation_history")` and emptied it.
+        A `mode=ro` URI moves the refusal into SQLite, where no attribute walk
+        gets around it.
+
+        The schema is not created or migrated here — a reader must not write,
+        and whoever opened the log for writing has already done it.
+        """
+        m = cls.__new__(cls)
+        m.path = path
+        m.db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+        m.db.row_factory = sqlite3.Row
+        m.db.execute("PRAGMA busy_timeout=30000")
+        m.blobs = pathlib.Path(tempfile.gettempdir()) / "naru-blobs-readonly"
+        return m
+
     def __init__(self, db=":memory:", blobs=None):
         # Several agents append while a human reads. WAL lets readers run
         # during a write; busy_timeout absorbs the overlap instead of raising
@@ -585,8 +606,14 @@ class ReadOnly:
 
     Section 2.2: "Model-authored code runs in a fail-closed sandbox: the Event
     Log is read-only from the kernel." Exposes exactly the Table-1 operations
-    plus the documented helpers, and deliberately carries no `db` attribute, so
-    model code has no path to a writable connection.
+    plus the documented helpers, and carries no `db` attribute.
+
+    Withholding the attribute is a convention, not a boundary — `ms._ms.db`
+    reaches the connection, and a cell used it to empty a live log. Under the
+    in-process Kernel nothing can fix that: model code shares the interpreter
+    and owns every object in it. The boundary lives one layer down, in
+    `open_readonly()`, which hands the sandboxed child a connection SQLite
+    itself refuses to write.
     """
 
     __slots__ = ("_ms",)

@@ -20,7 +20,21 @@ one JSON request and one JSON reply per line.
 - `RLIMIT_CPU` (30s), `RLIMIT_AS` (1GB), `RLIMIT_FSIZE` (64MB), each
   configurable, plus a parent-side wall-clock timeout for hangs no CPU limit
   catches: `sleep`, a blocking read, a socket.
-- The Event Log is reopened **by path** in the child, read-only.
+- The Event Log is reopened **by path** in the child through
+  `MemorySurface.open_readonly()`, a `mode=ro` URI connection. The first
+  version used the plain constructor and a `ReadOnly` facade; that facade
+  withholds an attribute name and nothing else, and a cell reached the live log
+  through `ms._ms.db.execute("DELETE FROM conversation_history")` and emptied
+  it. The refusal now comes from SQLite, which no attribute walk gets around.
+- The child runs with `-I`. Without it `python -c` puts the working directory
+  at `sys.path[0]`, and model code shares that directory: one cell writing
+  `./resource.py` and one forcing a respawn left every later child with no
+  ceilings at all while `limits()` reported the fabricated numbers as applied.
+  The enforcement mechanism was supplied by the thing it constrains.
+- Output is capped **in the child**, before it crosses the pipe. Capping only
+  in the parent still required `readline()` to pull the whole line in first: a
+  cell printing 200MB took the parent from 19MB to 687MB of RSS, which is the
+  memory bomb this design claims the child absorbs.
 - `submit_answer` and `headline` become stubs that batch their calls into the
   reply; the parent applies them. That keeps the protocol request/response
   rather than duplex RPC.
@@ -70,6 +84,17 @@ assert isinstance(lim["mem_b"], int) or "NOT APPLIED" in str(lim["mem_b"])
 That accepts both branches. It passed while the child reported a refused limit
 as applied, and `test_mutations.py` caught it. The check now asks the child to
 exceed the cap it claims to have.
+
+## What the in-process kernel still cannot do
+
+`ReadOnly` is a convention there, not a boundary, and it cannot become one.
+Model code under `Kernel` shares the interpreter and owns every object in it,
+so `ms._ms.db` is reachable and writable by construction. `ms.py` says so now
+instead of claiming the attribute is withheld for safety.
+
+That is an argument for the sandboxed kernel, not against the facade: the same
+expression against a child's connection raises `attempt to write a readonly
+database`.
 
 ## Consequences
 
