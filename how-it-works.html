@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Scroll — how the build works</title>
+    <title>naru — how the build works</title>
     <style>
       :root {
         --bg: #0f1115;
@@ -340,8 +340,8 @@
   </head>
   <body>
     <div class="wrap">
-      <div class="kicker">What we built · /Users/willee1/work/scroll</div>
-      <h1>Scroll, explained by what the code actually does</h1>
+      <div class="kicker">What we built · naru</div>
+      <h1>naru, explained by what the code actually does</h1>
       <p class="lede">
         One idea: the conversation history never enters the prompt. It lives in
         a database. The model writes Python to reach it, and only what it prints
@@ -440,7 +440,7 @@ bulk    = [ …40 hits… ]</code></pre>
         </div>
         <div style="height: 14px"></div>
         <div class="row">
-          <div class="lbl" style="color: var(--good)">with Scroll</div>
+          <div class="lbl" style="color: var(--good)">with naru</div>
           <div class="barwrap">
             <div class="bar" style="width: 3%; background: var(--good)">
               <span>~300 · flat</span>
@@ -531,7 +531,7 @@ original text: <span style="color:var(--bad)">GONE</span></code></pre>
             </div>
           </div>
           <div>
-            <h3 class="win">Scroll's eviction</h3>
+            <h3 class="win">naru's eviction</h3>
             <div class="mini">
               <pre><code>turns 3-18  ──►  [3-18] travel plans
                  ms.expand(3,18)
@@ -654,7 +654,7 @@ ms.search(<span class="str">"Bd5"</span>) → <span class="hl">3 hits</span>    
       </div>
 
       <!-- ============ 6. HONEST SCOREBOARD ============ -->
-      <h2>6 · Where Scroll wins, and where it doesn't</h2>
+      <h2>6 · Where naru wins, and where it doesn't</h2>
 
       <div class="card">
         <h3>Oracle split — history is only 5.6k tokens</h3>
@@ -672,7 +672,7 @@ ms.search(<span class="str">"Bd5"</span>) → <span class="hl">3 hits</span>    
             <td class="num">5,669t</td>
           </tr>
           <tr>
-            <td>scroll (v3)</td>
+            <td>naru (v3)</td>
             <td class="num">83.3%</td>
             <td class="num lose">100,206</td>
             <td class="num win">1,310t</td>
@@ -681,7 +681,7 @@ ms.search(<span class="str">"Bd5"</span>) → <span class="hl">3 hits</span>    
         <p class="note">
           <b>Full context wins here, and it should.</b> A 5.6k history fits in
           one prompt with room to spare, so there is no pressure to relieve —
-          and Scroll pays for multiple turns to reach the same facts. Reporting
+          and naru pays for multiple turns to reach the same facts. Reporting
           this is the point: a technique that only ever looks good is being
           measured wrong.
         </p>
@@ -698,11 +698,41 @@ ms.search(<span class="str">"Bd5"</span>) → <span class="hl">3 hits</span>    
           </div>
           <p>
             Every question carries ~125k tokens of history. Full context must
-            ship all of it, every turn. Scroll ships an outline and a few
-            printed lines. <b>This run is executing now</b> — numbers land when
-            it finishes.
+            ship all of it, every turn. naru ships an outline and a few
+            printed lines.
           </p>
         </div>
+        <table>
+          <tr>
+            <th>Arm</th>
+            <th class="num">Accuracy</th>
+            <th class="num">Net input / q</th>
+            <th class="num">View size</th>
+            <th class="num">Cost</th>
+          </tr>
+          <tr>
+            <td>full context</td>
+            <td class="num">66.7%</td>
+            <td class="num lose">116,727</td>
+            <td class="num lose">124,484t</td>
+            <td class="num lose">$6.49</td>
+          </tr>
+          <tr>
+            <td>naru</td>
+            <td class="num win">79.2%</td>
+            <td class="num win">73,199</td>
+            <td class="num win">2,552t</td>
+            <td class="num win">$3.79</td>
+          </tr>
+        </table>
+        <p class="note">
+          LongMemEval-s, n=24, Haiku 4.5, judge Haiku 4.5. <b>Read the accuracy
+          column as a tie.</b> At n=24 the 2-sigma run-to-run band measured by
+          <code>noise.py</code> is wider than this 12.5-point gap, so the claim
+          that survives is the cost one: same answer quality for a 49&times;
+          smaller view and 42% less spend. The judge is not LongMemEval's
+          official prompt; these numbers track this repo and nothing else.
+        </p>
       </div>
 
       <!-- ============ 7. FILES ============ -->

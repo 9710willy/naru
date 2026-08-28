@@ -111,7 +111,9 @@ rather than printing a zero that looks measured.
 ```bash
 python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
 python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
-python3 backend.py    # makes two live API calls
+python3 noise.py --selfcheck
+python3 backend.py      # live: two cheap calls, prints the harness token floor
+python3 test_judge.py   # live: judge regression cases
 ```
 
 ## Benchmark
@@ -134,6 +136,17 @@ hardcoded, for the reason recorded in ADR 0002.
 Run `noise.py` over two replicate runs before reading anything into a gap. At
 n=12 a difference under about 20 points is noise.
 
+Latest run — LongMemEval-`s`, n=24, Haiku 4.5, judge Haiku 4.5:
+
+| arm    | accuracy | net input / q | view size | cost  |
+| ------ | -------- | ------------- | --------- | ----- |
+| `full` | 66.7%    | 116,727       | 124,484t  | $6.49 |
+| `naru` | 79.2%    | 73,199        | 2,552t    | $3.79 |
+
+Read the accuracy column as a tie: at n=24 the run-to-run band is wider than
+that 12.5-point gap. The claim that survives replication is the cost one — the
+same answer quality from a 49x smaller view for 42% less spend.
+
 ## Limitations
 
 Curation has self-checks and no production use.
@@ -153,6 +166,6 @@ tracking this repo and are not comparable to published scores.
 ## See also
 
 [`docs/adr/`](docs/adr/) for design decisions. [`bench.py`](bench.py) for the
-benchmark.
+benchmark. [`how-it-works.html`](how-it-works.html) walks the mechanism.
 
 License: MIT

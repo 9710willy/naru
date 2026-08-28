@@ -15,7 +15,9 @@ Every module has a runnable self-check. The first four need no network:
 ```bash
 python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
 python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
+python3 noise.py --selfcheck
 python3 backend.py    # live: 2 cheap calls, prints the harness token floor
+python3 test_judge.py # live: judge regression cases
 ```
 
 Stdlib only. No dependencies — do not add one for something a few lines cover.
