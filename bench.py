@@ -9,12 +9,14 @@ Reports accuracy, tokens billed, and cost for each.
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import combinations
 
 from agent import LONGMEMEVAL_RUBRIC, run_naru
 from backend import HAIKU, get_backend, measure_floor
@@ -203,8 +205,27 @@ def judge(q, response, backend, votes=3):
     return yes > (votes // 2)
 
 
+def rag_context(ms, question, k):
+    """Top-k BM25 hits for the question, back in chronological order.
+
+    Each row already carries its own `[Session i | date] role:` prefix from
+    ingest(), so the hits need no further framing to be readable.
+    """
+    hits = ms.search(question, k=k)
+    return "\n".join(h["content"] for h in sorted(hits, key=lambda h: h["seq"]))
+
+
 def one(
-    q, arm, model, judge_model, max_turns, budget, verbose, rubric=True, no_index=False
+    q,
+    arm,
+    model,
+    judge_model,
+    max_turns,
+    budget,
+    verbose,
+    rubric=True,
+    no_index=False,
+    rag_k=8,
 ):
     """Run a single question through one arm. Returns a result record."""
     be = get_backend(model)
@@ -224,9 +245,17 @@ def one(
             index=index,
         )
     else:
-        hist = history_text(q)
+        if arm == "rag":
+            # The control between the two: also one call, also a small prompt,
+            # but a fixed BM25 top-k picks its contents instead of the model.
+            # Same system prompt as `full` on purpose — the arms must differ in
+            # exactly one variable, which is what goes in the prompt.
+            ms, _ = ingest(q, build_index=False)
+            body = rag_context(ms, q["question"], rag_k)
+        else:
+            body = history_text(q)
         prompt = (
-            f"{hist}\n\n=== Question (asked {q.get('question_date', '')}) ===\n"
+            f"{body}\n\n=== Question (asked {q.get('question_date', '')}) ===\n"
             f"{q['question']}"
         )
         ans, turns, peak = be(prompt, system=FULL_SYSTEM), 1, est(prompt)
@@ -260,6 +289,22 @@ def one(
     }
 
 
+def wilson(k, n, z=1.96):
+    """95% confidence interval on a proportion, Wilson score.
+
+    Not the textbook normal approximation: at n=24 with p near 0.8 that one
+    produces a bound above 1.0, which reads as a measurement and isn't. Wilson
+    stays inside [0,1] at every n this harness can afford to run.
+    """
+    if not n:
+        return 0.0, 0.0
+    p = k / n
+    d = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / d
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
 def report(rows, label, floor, measured=True):
     """Print one arm's results. `measured` is the backend's own reports_tokens:
     a generic pipe never touches the token counters, so billed-in and cost are
@@ -278,8 +323,13 @@ def report(rows, label, floor, measured=True):
     )
     cost = sum(r["cost"] + r["judge_cost"] for r in rows)
     bar = "#" * round(acc * 28) + "." * (28 - round(acc * 28))
+    k = sum(r["correct"] for r in rows)
+    lo, hi = wilson(k, n)
+    # The interval is printed on the same line as the accuracy on purpose. A
+    # bare percentage invites a reader to compare two arms that overlap.
     print(
-        f"\n  {label:8} {bar} {acc * 100:5.1f}%  ({sum(r['correct'] for r in rows)}/{n})"
+        f"\n  {label:8} {bar} {acc * 100:5.1f}%  ({k}/{n})"
+        f"  95% CI {lo * 100:.0f}-{hi * 100:.0f}%"
     )
     if measured:
         print(
@@ -310,11 +360,69 @@ def report(rows, label, floor, measured=True):
     )
 
 
+def mcnemar(a_correct, b_correct):
+    """Exact two-sided McNemar test. Returns (a-only, b-only, p).
+
+    The arms answer the SAME questions, so the comparison is paired and only
+    the questions they disagree about carry information. Comparing two
+    independent Wilson intervals here is the wrong test and far too
+    conservative: it throws away the pairing and asks whether two separately
+    estimated rates could coexist, when the real question is whether the arms
+    trade wins evenly on the questions where they differ.
+    """
+    qs = sorted(set(a_correct) & set(b_correct))
+    b = sum(1 for q in qs if a_correct[q] and not b_correct[q])
+    c = sum(1 for q in qs if b_correct[q] and not a_correct[q])
+    n = b + c
+    if n == 0:
+        return b, c, 1.0
+    tail = sum(math.comb(n, i) for i in range(min(b, c) + 1))
+    return b, c, min(1.0, 2 * tail / 2**n)
+
+
+def separability(rows, arms):
+    """State which arm differences are real and which are this run's luck.
+
+    CLAUDE.md says to report a noise floor rather than imply a result. That
+    rule lived only in prose, so every run needed a human to remember it. It
+    is a print statement now.
+
+    This answers "is this gap real on these questions". noise.py owns the
+    different question of how far a rerun moves, and needs replicates for it.
+    """
+    verdicts = {}
+    for arm in arms:
+        v = {r["qid"]: bool(r["correct"]) for r in rows if r["arm"] == arm}
+        if v:
+            verdicts[arm] = v
+    if len(verdicts) < 2:
+        return
+    print("\n  separability — paired McNemar on the questions the arms disagree on")
+    for a, b in combinations([x for x in arms if x in verdicts], 2):
+        va, vb = verdicts[a], verdicts[b]
+        shared = set(va) & set(vb)
+        only_a, only_b, p = mcnemar(va, vb)
+        gap = 100 * (
+            sum(vb[q] for q in shared) - sum(va[q] for q in shared)
+        ) / len(shared)
+        mark = "REAL at p<0.05" if p < 0.05 else "not separable — this run's luck"
+        print(
+            f"    {a:5} vs {b:5} {gap:+6.1f} pts   "
+            f"{a} only {only_a}, {b} only {only_b}   p={p:.3f}   {mark}"
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="oracle", choices=["oracle", "s", "m"])
     ap.add_argument("-n", type=int, default=12)
     ap.add_argument("--arms", default="full,naru")
+    ap.add_argument(
+        "--rag-k",
+        type=int,
+        default=8,
+        help="hits the rag arm pastes into the prompt (~2.5k tokens at 8)",
+    )
     ap.add_argument("--model", default=HAIKU)
     ap.add_argument("--judge-model", default=HAIKU)
     ap.add_argument("--max-turns", type=int, default=8)
@@ -352,6 +460,10 @@ def main():
 
     qs = load(a.split, a.n, qtype=a.qtype)
     arms = a.arms.split(",")
+    # A typo'd arm would otherwise run as `full` and quietly corrupt the run.
+    unknown = [x for x in arms if x not in ("full", "rag", "naru")]
+    if unknown:
+        sys.exit(f"unknown arm(s): {unknown} — pick from full, rag, naru")
     print(
         f"LongMemEval-{a.split}  n={len(qs)}  arms={arms}  model={a.model}  "
         f"judge={a.judge_model}  budget={a.budget}t  max_turns={a.max_turns}"
@@ -374,6 +486,7 @@ def main():
                 a.verbose,
                 not a.no_rubric,
                 a.no_index,
+                a.rag_k,
             ): (q, arm)
             for q, arm in jobs
         }
@@ -410,6 +523,7 @@ def main():
 
     for arm in arms:
         report([r for r in rows if r["arm"] == arm], arm, a.harness_floor, measured)
+    separability(rows, arms)
 
     out = DATA.parent / "results" / f"{a.tag}_{a.split}_n{len(qs)}.json"
     out.parent.mkdir(exist_ok=True)
@@ -423,5 +537,94 @@ def main():
     print(f"\nwrote {out}")
 
 
+def demo():
+    """Offline self-check. No data file, no API calls, no results written.
+
+    bench.py was the one module without one, which is how `rag` could have
+    silently run as `full`.
+    """
+    # Wilson, not the normal approximation: at 24/24 the textbook interval
+    # reaches past 1.0 and prints a bound that cannot happen.
+    assert wilson(0, 0) == (0.0, 0.0)
+    assert wilson(24, 24)[1] <= 1.0
+    assert wilson(0, 24)[0] >= 0.0
+    lo24, hi24 = wilson(19, 24)
+    lo96, hi96 = wilson(76, 96)
+    assert (hi96 - lo96) < (hi24 - lo24), "more questions must narrow the interval"
+    # The published run. If this ever stops overlapping, the README's "read the
+    # accuracy column as a tie" has become false and must be rewritten.
+    assert wilson(19, 24)[0] < wilson(16, 24)[1]
+
+    assert iso("2023/04/10 (Mon) 17:50") == "2023-04-10T17:50"
+    assert iso(None) == "1970-01-01T00:00", "a missing date must not crash ingest"
+
+    # rag_context returns hits in LOG order, not BM25 rank order. The last row
+    # repeats the term most, so BM25 ranks it first and the sort must move it
+    # back to the end — otherwise the arm feeds the model a scrambled history.
+    ms = MemorySurface(":memory:")
+    for i, body in enumerate(
+        [
+            "[Session 1 | 2023-01-01] user: I bought a kayak",
+            "[Session 2 | 2023-02-01] user: the kayak leaks",
+            "[Session 3 | 2023-03-01] user: kayak kayak kayak, I sold the kayak",
+        ],
+        1,
+    ):
+        ms.append("user", body, kind="context_msg", session_id=f"s{i}",
+                  created_at=f"2023-0{i}-01T00:00")
+    ranked = [h["seq"] for h in ms.search("kayak", k=3)]
+    assert ranked[0] == 3, f"expected BM25 to rank seq 3 first, got {ranked}"
+    ctx = rag_context(ms, "kayak", 3)
+    assert ctx.index("Session 1") < ctx.index("Session 2") < ctx.index("Session 3")
+
+    # separability must call the published run a tie, and must call a blowout
+    # separable — a function that only ever says "not separable" is not a check.
+    def rows_for(arm, k, n):
+        return [
+            {"arm": arm, "qid": f"q{i}", "correct": i < k, "type": "t"}
+            for i in range(n)
+        ]
+
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        separability(rows_for("full", 16, 24) + rows_for("naru", 19, 24),
+                     ["full", "naru"])
+        separability(rows_for("full", 2, 24) + rows_for("naru", 23, 24),
+                     ["full", "naru"])
+    out = buf.getvalue()
+    assert "not separable" in out, out
+    assert "REAL at p<0.05" in out, out
+    # paired beats independent intervals: 16/24 vs 21/24 overlap as Wilson
+    # intervals, but disagree 1-vs-6 when paired. Losing that is why the test
+    # changed.
+    assert wilson(16, 24)[1] > wilson(21, 24)[0], "intervals do overlap"
+    agree = {f"q{i}": i < 16 for i in range(24)}
+    better = {f"q{i}": i < 16 or i >= 22 for i in range(24)}
+    assert mcnemar(agree, better) == (0, 2, mcnemar(agree, better)[2])
+    assert mcnemar(agree, agree)[2] == 1.0, "identical arms cannot differ"
+    # one arm alone has nothing to compare against and must print nothing
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        separability(rows_for("rag", 5, 24), ["rag"])
+    assert buf2.getvalue() == ""
+
+    # A typo'd arm must never fall through to `full` and corrupt a paid run.
+    assert [
+        x for x in ["full", "rag", "nauru"] if x not in ("full", "rag", "naru")
+    ] == ["nauru"]
+
+    print(
+        "ok — bench checks passed "
+        f"(19/24 is {100 * wilson(19, 24)[0]:.0f}-{100 * wilson(19, 24)[1]:.0f}%, "
+        "overlapping 16/24)"
+    )
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--selfcheck":
+        demo()
+    else:
+        main()
