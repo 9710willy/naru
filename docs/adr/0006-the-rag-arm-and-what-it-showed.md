@@ -40,11 +40,11 @@ Two consequences for the harness:
 LongMemEval-`s`, n=24, Haiku 4.5 on agent and judge. Rows in
 `results/published/`.
 
-| arm    | correct | 95% CI | net input/q | view    | calls | cost  |
-| ------ | ------- | ------ | ----------- | ------- | ----- | ----- |
-| `full` | 16/24   | 47-82% | 116,727     | 124,484 | 1.0   | $6.49 |
-| `naru` | 19/24   | 60-91% | 73,199      | 2,552   | 4.4   | $3.79 |
-| `rag`  | 21/24   | 69-96% | 1,816       | 1,805   | 1.0   | $1.22 |
+| arm    | correct | 95% CI | net input/q | view    | calls | model $/q |
+| ------ | ------- | ------ | ----------- | ------- | ----- | --------- |
+| `full` | 16/24   | 47-82% | 116,727     | 124,484 | 1.0   | $0.2524   |
+| `naru` | 19/24   | 60-91% | 73,199      | 2,552   | 4.4   | $0.1409   |
+| `rag`  | 21/24   | 69-96% | 1,816       | 1,805   | 1.0   | $0.0251   |
 
 No pair separates on accuracy. Paired McNemar gives p = 0.125 for `full` vs
 `rag`, 0.508 for `full` vs `naru`, and 0.625 for `rag` vs `naru`. At n=24 this
@@ -55,6 +55,20 @@ Cost is not a statistical question, and there the answer is unambiguous. `rag`
 answered in one call on 1,816 input tokens net of harness overhead. `naru` took
 4.4 calls and 73,199 — **forty times more input for no measurable accuracy
 gain**, and it scored numerically lower.
+
+The money ratio is 5.6x, not 40x, and the difference is a real effect rather
+than rounding. `billed_input` is an unweighted sum of fresh, cache-creation and
+cache-read tokens, and those bill at roughly 1x, 1.25x and 0.1x. `naru` is 70%
+cache reads by volume against `rag`'s 55%, so its token count is inflated
+relative to its bill. Report the token ratio as tokens and the money ratio as
+money; the harness prints both and they will not agree whenever the arms differ
+in call count.
+
+Two limits on this run. `rag` has no replicate, so `noise.py` has nothing to
+compare and the accuracy caveat rests entirely on the paired test. And the two
+runs measured harness floors of 22,846 and 18,718 tokens per call, so they are
+not the same session; each row's `net-of-harness` is taken against its own
+run's floor, which is why `results/published/README.md` records both.
 
 ## Consequences
 

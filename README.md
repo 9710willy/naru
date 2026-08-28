@@ -139,11 +139,15 @@ hardcoded, for the reason recorded in ADR 0002.
 LongMemEval-`s`, n=24, Haiku 4.5 on agent and judge. Rows in
 [`results/published/`](results/published/), stripped of gold answers.
 
-| arm    | correct | 95% CI | net input / q | view     | calls | cost  |
-| ------ | ------- | ------ | ------------- | -------- | ----- | ----- |
-| `full` | 16/24   | 47-82% | 116,727       | 124,484t | 1.0   | $6.49 |
-| `naru` | 19/24   | 60-91% | 73,199        | 2,552t   | 4.4   | $3.79 |
-| `rag`  | 21/24   | 69-96% | 1,816         | 1,805t   | 1.0   | $1.22 |
+| arm    | correct | 95% CI | net input / q | view     | calls | model $/q |
+| ------ | ------- | ------ | ------------- | -------- | ----- | --------- |
+| `full` | 16/24   | 47-82% | 116,727       | 124,484t | 1.0   | $0.2524   |
+| `naru` | 19/24   | 60-91% | 73,199        | 2,552t   | 4.4   | $0.1409   |
+| `rag`  | 21/24   | 69-96% | 1,816         | 1,805t   | 1.0   | $0.0251   |
+
+Cost is the model's own, per question. Judge cost is roughly equal across arms
+(~$0.02/q) and is excluded so the column measures the arm rather than the
+grader.
 
 **No pair separates on accuracy.** The arms answer the same questions, so
 `bench.py` compares them with an exact McNemar test on the questions where they
@@ -159,11 +163,25 @@ At n=24 this harness cannot tell the three apart, and that includes gaps of 20
 points. Treat every accuracy number here as underpowered.
 
 Cost is not a statistical question. `rag` answered in one call on 1,816 input
-tokens net of harness overhead, against `naru`'s 4.4 calls and 73,199 — forty
-times the input for no measurable accuracy gain, at a numerically lower score.
-On this benchmark the kernel does not earn its keep, and BM25 with a top-8 cut
-is enough. ADR 0006 records why that is the expected result for LongMemEval's
+tokens net of harness overhead, against `naru`'s 4.4 calls and 73,199. That is
+40x the input for no measurable accuracy gain, at a numerically lower score. On
+this benchmark the kernel does not earn its keep, and BM25 with a top-8 cut is
+enough. ADR 0006 records why that is the expected result for LongMemEval's
 question shape, and what would actually test the kernel instead.
+
+**The token ratio and the money ratio are not the same number, and the gap is
+not noise.** `billed_input` sums fresh, cache-creation and cache-read tokens
+without weighting them, but they do not cost the same: cache reads bill at
+roughly a tenth of base. 70% of `naru`'s billed input is cache reads against
+55% of `rag`'s, so 40x the tokens comes out as 5.6x the money. Both are real;
+quote whichever one you actually mean.
+
+Two limits on the run above. `rag` has no replicate, so `noise.py` cannot say
+how far it moves on a rerun — the accuracy caveat above rests on the paired
+test, not on repeated measurement. And the two runs measured different harness
+floors (22,846 and 18,718 input tokens per call), because that floor is measured
+per run rather than hardcoded; `net-of-harness` subtracts each row against its
+own run's floor.
 
 Run `noise.py` over two replicate runs before reading anything into a gap: it
 reports how far a single arm moves when you only rerun it, which is a different

@@ -708,28 +708,28 @@ ms.search(<span class="str">"Bd5"</span>) → <span class="hl">3 hits</span>    
             <th class="num">Correct</th>
             <th class="num">Net input / q</th>
             <th class="num">View size</th>
-            <th class="num">Cost</th>
+            <th class="num">Model $/q</th>
           </tr>
           <tr>
             <td>full context</td>
             <td class="num">16/24</td>
             <td class="num lose">116,727</td>
             <td class="num lose">124,484t</td>
-            <td class="num lose">$6.49</td>
+            <td class="num lose">$0.2524</td>
           </tr>
           <tr>
             <td>naru</td>
             <td class="num">19/24</td>
             <td class="num">73,199</td>
             <td class="num">2,552t</td>
-            <td class="num">$3.79</td>
+            <td class="num">$0.1409</td>
           </tr>
           <tr>
             <td>rag (BM25 top-8)</td>
             <td class="num win">21/24</td>
             <td class="num win">1,816</td>
             <td class="num win">1,805t</td>
-            <td class="num win">$1.22</td>
+            <td class="num win">$0.0251</td>
           </tr>
         </table>
         <p class="note">
@@ -738,7 +738,8 @@ ms.search(<span class="str">"Bd5"</span>) → <span class="hl">3 hits</span>    
           p=0.125 and p=0.625, so at this n the harness cannot tell the three
           apart. What is not close is cost: <code>rag</code> answers in one call
           on 1,816 input tokens against naru's 4.4 calls and 73,199, forty times
-          the input for no measurable gain. <b>On this benchmark the kernel does
+          the input for no measurable gain (5.6&times; the money &mdash; most of
+          naru's tokens are cache reads, which bill at a tenth). <b>On this benchmark the kernel does
           not earn its keep.</b> ADR 0006 records why that is the expected
           result for LongMemEval's question shape and what would actually test
           it. The judge is not LongMemEval's official prompt; these numbers
