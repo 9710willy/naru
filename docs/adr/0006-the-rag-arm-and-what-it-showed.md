@@ -118,6 +118,31 @@ harness runs Haiku 4.5; MemDelta reports baseline rankings reversing across
 model families, so the two sets of numbers cannot be read against each other in
 either direction.
 
+## The ranking reverses with the model
+
+Run on Sonnet 5 over the same 12 questions, `naru` scores 11/12 and `rag` 9/12
+— the opposite order to Haiku's 21/24 against 19/24. Neither ordering is
+separable (p=0.375 to 1.000), and at n=12 `noise.py` puts run-to-run movement
+at ~33 points, so no accuracy claim on either model survives contact with its
+own noise floor. What the reversal does establish is that the earlier
+"BM25 beats the kernel" reading was a statement about Haiku 4.5, which is the
+failure MemDelta (arXiv 2606.29914) documents: baseline rankings reverse across
+model families.
+
+Cost does not reverse. `rag` used 2,727 input tokens per question against
+`naru`'s 314,587 on Sonnet — 115x, against 40x on Haiku. The dollar ratio is
+smaller than the token ratio in both because 87% of `naru`'s Sonnet input is
+cache reads, and for the same reason `naru` is cheaper than `full` in money
+while spending more tokens.
+
+One thing worth a closer look than n=2 allows: preference-following is the only
+category where `naru` beat `rag` cleanly on Sonnet, 2/2 against 0/2. ADR 0003
+records that the paper's ablation says the eviction index affects that category
+most (89.1 vs 74.9), and that it has been this harness's weakest category in
+every run. That is where to look next, not at the aggregate.
+
+## What survives
+
 The conclusion that survives: **LongMemEval is the wrong benchmark for the
 question this repo asks.** Testing the kernel needs one where a single
 retrieval cannot win — BEAM (arXiv 2510.27246), where the `full` arm cannot run

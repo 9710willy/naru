@@ -194,11 +194,36 @@ for the rest. Retrieval is 20 points behind once the questions stop being
 single-turn lookups. ADR 0006 has both tables and the caveats — including that
 a generic code-writing agent is within 1.4 points of Scroll on LOCA.
 
-Two limits on reading our arms against those numbers. This harness runs Haiku
-4.5 and the paper ran Qwen3.8-Max; on Sonnet 5 our `naru` arm scored 11/12
-(91.7%, CI 65-99%) in two separate runs, an interval that contains the paper's
-94.8. And `rag` has only ever run on Haiku, so the comparison above is a
-statement about one cheap model, not about the architectures.
+### The ranking reverses with the model
+
+The table above is Haiku 4.5. On Sonnet 5, over the same 12 questions:
+
+| arm    | correct | 95% CI | net input / q | calls | model $/q |
+| ------ | ------- | ------ | ------------- | ----- | --------- |
+| `full` | 8/12    | 39-86% | 167,351       | 1.0   | $0.7231   |
+| `naru` | 11/12   | 65-99% | 314,587       | 3.3   | $0.3462   |
+| `rag`  | 9/12    | 47-91% | 2,727         | 1.0   | $0.0722   |
+
+`rag` led on Haiku and `naru` leads on Sonnet. Neither lead is separable —
+every pair lands between p=0.375 and p=1.000 — but the **order** flips, which
+is exactly what MemDelta (arXiv 2606.29914) reports for baseline rankings
+across model families. Any single-model claim from this harness, including the
+one above it, is a claim about that model.
+
+Do not read the accuracy columns at n=12 at all: `noise.py` over two Sonnet
+replicates puts run-to-run movement at ~33 points, and those two runs disagreed
+on a third of the questions while landing on the same total.
+
+What does not flip is cost. `rag` answered in one call on 2,727 input tokens
+against `naru`'s 3.3 calls and 314,587 — 115x on Sonnet against 40x on Haiku.
+The money gap is smaller than the token gap in both, because 87% of `naru`'s
+Sonnet input is cache reads billing at a tenth. And `naru` is cheaper than
+`full` in dollars while using more tokens, for the same reason.
+
+This harness runs Haiku and Sonnet; the paper ran Qwen3.8-Max. Our `naru` arm's
+11/12 on Sonnet has a 65-99% interval, which contains the paper's 94.8, so
+nothing here suggests the implementation is wrong — only that the benchmark
+cannot resolve what it is being asked.
 
 **The token ratio and the money ratio are not the same number, and the gap is
 not noise.** `billed_input` sums fresh, cache-creation and cache-read tokens

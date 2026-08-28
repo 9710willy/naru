@@ -827,23 +827,46 @@ def demo():
     # README's claims and the data that produced them cannot drift apart.
     pub = sorted((DATA.parent / "results" / "published").glob("*.json"))
     assert pub, "results/published/ is committed; a missing one is a broken checkout"
-    published = []
+    # Grouped by (model, n), because the two published runs use different
+    # models and summing them together compares nothing.
+    expected = {
+        ("claude-haiku-4-5-20251001", 24): {
+            "full": (16, 24),
+            "naru": (19, 24),
+            "rag": (21, 24),
+        },
+        ("claude-sonnet-5", 12): {
+            "full": (8, 12),
+            "naru": (11, 12),
+            "rag": (9, 12),
+        },
+    }
+    runs = {}
     for f in pub:
-        published += json.loads(f.read_text())["rows"]
-    for r in published:
-        if r["arm"] == "scroll":  # v12 predates the rename
-            r["arm"] = "naru"
-    tally = {}
-    for r in published:
-        k_, n_ = tally.get(r["arm"], (0, 0))
-        tally[r["arm"]] = (k_ + bool(r["correct"]), n_ + 1)
-    assert tally == {"full": (16, 24), "naru": (19, 24), "rag": (21, 24)}, tally
-    # "read the accuracy column as a tie": every interval must overlap every
-    # other, and no pair may separate once the threshold is corrected.
-    for x, y in combinations(tally, 2):
-        assert wilson(*tally[x])[1] > wilson(*tally[y])[0], (x, y)
-        assert wilson(*tally[y])[1] > wilson(*tally[x])[0], (x, y)
-    assert "REAL" not in sep_out(published, ["full", "rag", "naru"])
+        d = json.loads(f.read_text())
+        key = (d["config"]["model"], d["config"]["n"])
+        for r in d["rows"]:
+            if r["arm"] == "scroll":  # v12 predates the rename
+                r["arm"] = "naru"
+        runs[key] = runs.get(key, []) + d["rows"]
+    assert set(runs) == set(expected), (sorted(runs), sorted(expected))
+    for key, rows_ in runs.items():
+        tally = {}
+        for r in rows_:
+            k_, n_ = tally.get(r["arm"], (0, 0))
+            tally[r["arm"]] = (k_ + bool(r["correct"]), n_ + 1)
+        assert tally == expected[key], (key, tally)
+        # "read the accuracy column as a tie": every interval overlaps every
+        # other, and no pair separates once the threshold is corrected.
+        for x, y in combinations(tally, 2):
+            assert wilson(*tally[x])[1] > wilson(*tally[y])[0], (key, x, y)
+            assert wilson(*tally[y])[1] > wilson(*tally[x])[0], (key, x, y)
+        assert "REAL" not in sep_out(rows_, ["full", "rag", "naru"]), key
+    # the ranking reverses between the two models, which is the finding
+    haiku = expected[("claude-haiku-4-5-20251001", 24)]
+    sonnet = expected[("claude-sonnet-5", 12)]
+    assert haiku["rag"][0] / 24 > haiku["naru"][0] / 24, "rag led on Haiku"
+    assert sonnet["naru"][0] / 12 > sonnet["rag"][0] / 12, "naru led on Sonnet"
 
     # NARU_BACKEND can hold a credential and results/published/ is committed,
     # so the recorded provenance must be argv[0] and nothing after it.
