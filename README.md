@@ -112,6 +112,7 @@ rather than printing a zero that looks measured.
 python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
 python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
 python3 noise.py --selfcheck && python3 bench.py --selfcheck
+python3 test_mutations.py   # do those self-checks catch anything?
 python3 backend.py      # live: two cheap calls, prints the harness token floor
 python3 test_judge.py   # live: judge regression cases
 ```

@@ -656,7 +656,11 @@ def main():
 
 
 def demo():
-    """Offline self-check. No data file, no API calls, no results written.
+    """Offline self-check. No API calls, no results written.
+
+    Reads results/published/, which is committed, to check the README's
+    published claims against the rows they came from. It does not touch
+    data/, which is gitignored and 277MB.
 
     bench.py was the one module without one, which is how `rag` could have
     silently run as `full`.
@@ -669,9 +673,6 @@ def demo():
     lo24, hi24 = wilson(19, 24)
     lo96, hi96 = wilson(76, 96)
     assert (hi96 - lo96) < (hi24 - lo24), "more questions must narrow the interval"
-    # The published run. If this ever stops overlapping, the README's "read the
-    # accuracy column as a tie" has become false and must be rewritten.
-    assert wilson(19, 24)[0] < wilson(16, 24)[1]
 
     assert iso("2023/04/10 (Mon) 17:50") == "2023-04-10T17:50"
     assert iso(None) == "1970-01-01T00:00", "a missing date must not crash ingest"
@@ -820,6 +821,29 @@ def demo():
     for r in old_rows:
         r["judge_errors"] = 0
     assert "0 judge errors" in rep_out(old_rows), rep_out(old_rows)
+
+    # The published run, read from the rows rather than from literals retyped
+    # here. Republish a different run and this fails, which is the point: the
+    # README's claims and the data that produced them cannot drift apart.
+    pub = sorted((DATA.parent / "results" / "published").glob("*.json"))
+    assert pub, "results/published/ is committed; a missing one is a broken checkout"
+    published = []
+    for f in pub:
+        published += json.loads(f.read_text())["rows"]
+    for r in published:
+        if r["arm"] == "scroll":  # v12 predates the rename
+            r["arm"] = "naru"
+    tally = {}
+    for r in published:
+        k_, n_ = tally.get(r["arm"], (0, 0))
+        tally[r["arm"]] = (k_ + bool(r["correct"]), n_ + 1)
+    assert tally == {"full": (16, 24), "naru": (19, 24), "rag": (21, 24)}, tally
+    # "read the accuracy column as a tie": every interval must overlap every
+    # other, and no pair may separate once the threshold is corrected.
+    for x, y in combinations(tally, 2):
+        assert wilson(*tally[x])[1] > wilson(*tally[y])[0], (x, y)
+        assert wilson(*tally[y])[1] > wilson(*tally[x])[0], (x, y)
+    assert "REAL" not in sep_out(published, ["full", "rag", "naru"])
 
     # NARU_BACKEND can hold a credential and results/published/ is committed,
     # so the recorded provenance must be argv[0] and nothing after it.

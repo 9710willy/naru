@@ -24,3 +24,4 @@ jobs:
       - run: python hook_spill.py --selfcheck
       - run: python noise.py --selfcheck
       - run: python bench.py --selfcheck
+      - run: python test_mutations.py

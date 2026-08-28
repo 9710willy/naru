@@ -16,6 +16,7 @@ Every module has a runnable self-check. The first four need no network:
 python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
 python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
 python3 noise.py --selfcheck && python3 bench.py --selfcheck
+python3 test_mutations.py   # breaks the code on purpose; checks must fail
 python3 backend.py    # live: 2 cheap calls, prints the harness token floor
 python3 test_judge.py # live: judge regression cases
 ```
@@ -43,6 +44,9 @@ itself.
   including a 20-point gap.
 - **Three arms means three tests.** The threshold is Bonferroni-corrected;
   uncorrected, one pair reads "REAL" in ~6% of runs where nothing separates.
+- **A self-check that passes proves the code runs, not that it checks.** Four
+  of these were decorative until `test_mutations.py` broke the code on purpose
+  and found they stayed green. Add a mutation with any new invariant.
 - **A question whose run errored leaves the pairing.** `correct=False` cannot
   tell a wrong answer from a call that never completed, and McNemar reads only
   the discordant pairs — one timeout scored as a loss turns p=0.125 into
