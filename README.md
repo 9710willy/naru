@@ -155,9 +155,9 @@ disagree, and prints the verdict with the run:
 
 ```
 separability — paired McNemar on the questions the arms disagree on, Bonferroni for 3 pairs
-    full  vs rag    +20.8 pts   full only 1, rag only 6   p=0.125   not separable — this run's luck
-    full  vs naru   +12.5 pts   full only 3, naru only 6   p=0.508   not separable — this run's luck
-    rag   vs naru    -8.3 pts   rag only 3, naru only 1   p=0.625   not separable — this run's luck
+    full  vs rag    20.8 pts to rag    full only 1, rag only 6   p=0.125   not separable — this run's luck
+    full  vs naru   12.5 pts to naru   full only 3, naru only 6   p=0.508   not separable — this run's luck
+    rag   vs naru    8.3 pts to rag    rag only 3, naru only 1   p=0.625   not separable — this run's luck
 ```
 
 At n=24 this harness cannot tell the three apart, and that includes gaps of 20

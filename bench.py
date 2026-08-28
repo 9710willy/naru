@@ -235,13 +235,28 @@ def judge(q, response, backend, votes=3):
     return yes > (votes // 2)
 
 
+# ms._to_match passes these through as FTS5 boolean operators, which the
+# interactive CLI wants and a benchmark question does not.
+_FTS_OPS = ("AND", "OR", "NOT")
+
+
 def rag_context(ms, question, k):
     """Top-k BM25 hits for the question, back in chronological order.
 
     Each row already carries its own `[Session i | date] role:` prefix from
     ingest(), so the hits need no further framing to be readable.
+
+    The question is dataset text, not a query. One containing a bare uppercase
+    AND/OR/NOT raised `fts5: syntax error`, which one()'s handler turned into a
+    forfeited question for THIS arm while full and naru answered it normally —
+    a one-sided accuracy penalty on the control arm, from punctuation.
     """
-    hits = ms.search(question, k=k)
+    query = " ".join(
+        t.lower() if t in _FTS_OPS else t for t in question.split()
+    ).strip()
+    if not query:
+        return ""
+    hits = ms.search(query, k=k)
     return "\n".join(h["content"] for h in sorted(hits, key=lambda h: h["seq"]))
 
 
@@ -495,8 +510,9 @@ def separability(rows, arms):
             if p < alpha
             else "not separable — this run's luck"
         )
+        ahead = b if gap > 0 else a
         print(
-            f"    {a:5} vs {b:5} {gap:+6.1f} pts   "
+            f"    {a:5} vs {b:5} {abs(gap):5.1f} pts to {ahead:5}  "
             f"{a} only {only_a}, {b} only {only_b}   p={p:.3f}   {mark}"
         )
 
@@ -674,6 +690,13 @@ def demo():
     ):
         ms.append("user", body, kind="context_msg", session_id=f"s{i}",
                   created_at=f"2023-0{i}-01T00:00")
+    # a question is dataset text, not a query: bare AND/OR/NOT are FTS5
+    # operators and used to raise, forfeiting the question for this arm alone
+    for hostile in ("kayak AND NOT leaks", "kayak OR sold", "", "   "):
+        rag_context(ms, hostile, 3)
+    assert "kayak" in rag_context(ms, "kayak AND NOT leaks", 3)
+    assert rag_context(ms, "   ", 3) == ""
+
     ranked = [h["seq"] for h in ms.search("kayak", k=3)]
     assert ranked[0] == 3, f"expected BM25 to rank seq 3 first, got {ranked}"
     ctx = rag_context(ms, "kayak", 3)
@@ -701,15 +724,21 @@ def demo():
     tie = sep_out(rows_for("full", 16, 24) + rows_for("naru", 19, 24), both)
     blowout = sep_out(rows_for("full", 2, 24) + rows_for("naru", 23, 24), both)
     assert "not separable" in tie and "REAL" not in tie, tie
-    # pin the gap too: it is derived from the McNemar counts rather than
-    # recomputed, so a swapped subtraction there prints a sign-flipped result
-    # that every other assertion here would wave through.
-    assert "+12.5 pts" in tie, tie
+    # pin the gap AND its direction: it is derived from the McNemar counts
+    # rather than recomputed, so a swapped subtraction prints the wrong arm as
+    # the winner and every other assertion here would wave it through.
+    assert "12.5 pts to naru" in tie, tie
     assert "REAL at p<0.05" in blowout and "not separable" not in blowout, blowout
     # paired beats independent intervals: 16/24 vs 21/24 overlap as Wilson
     # intervals, but disagree 1-vs-6 when paired. Losing that is why the test
     # changed.
+    # The claim this whole test change rests on, exercised rather than
+    # asserted in a comment: 16/24 and 21/24 overlap as independent intervals
+    # while the paired test sees a 1-vs-6 split.
     assert wilson(16, 24)[1] > wilson(21, 24)[0], "intervals do overlap"
+    paired = {f"q{i}": i < 16 for i in range(24)}
+    other = {f"q{i}": 0 < i <= 21 for i in range(24)}
+    assert mcnemar(paired, other) == (1, 6, 0.125), mcnemar(paired, other)
     agree = {f"q{i}": i < 16 for i in range(24)}
     better = {f"q{i}": i < 16 or i >= 22 for i in range(24)}
     # The p must be a literal. Comparing the slot to itself is a tautology
