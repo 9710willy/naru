@@ -33,7 +33,7 @@ from ms import DEFAULT_DB
 # One owner for the number. It used to be set inline on the hook command in
 # settings.json, so `naru stats` (which imports THRESHOLD) judged the spill
 # distribution against 2000 while the hook actually ran at 10000.
-THRESHOLD = int(os.environ.get("NARU_SPILL_THRESHOLD", "10000"))  # chars
+THRESHOLD = int(os.environ.get("NARU_SPILL_THRESHOLD", "4000"))  # chars
 KEEP = int(os.environ.get("NARU_SPILL_PREVIEW", "600"))
 SIGNPOST_EVERY = 40  # one signpost line per N lines of spilled text
 DB = pathlib.Path(os.environ.get("NARU_SPILL_DB", DEFAULT_DB))
