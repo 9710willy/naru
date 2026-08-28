@@ -28,7 +28,9 @@ import tempfile
 REPO = pathlib.Path(__file__).resolve().parent
 COPY = ("ms.py", "kernel.py", "eviction.py", "agent.py", "backend.py", "noise.py")
 
-# (name, file, find, replace)
+# (name, file, find, replace) or (name, file, find, replace, only_if)
+# only_if is a Python expression: when it is false the mutation cannot
+# change behaviour here and is reported n/a rather than counted a survivor.
 MUTATIONS = [
     (
         "rag falls through to full",
@@ -107,6 +109,10 @@ MUTATIONS = [
         "kernel.py",
         'applied[name] = f"NOT APPLIED: {type(e).__name__}"',
         "applied[name] = want",
+        # Linux grants RLIMIT_AS, so the except branch never runs there and the
+        # mutation is a no-op. macOS refuses it, which is the whole reason the
+        # branch exists.
+        'sys.platform == "darwin"',
     ),
     (
         "a crashed child is reported as a timeout",
@@ -163,13 +169,19 @@ def run_mutated(target, find, replace):
 
 
 def main():
-    survivors = []
-    for name, target, find, replace in MUTATIONS:
+    survivors, skipped = [], []
+    for mutation in MUTATIONS:
+        name, target, find, replace = mutation[:4]
+        only_if = mutation[4] if len(mutation) > 4 else None
+        if only_if and not eval(only_if):  # noqa: S307 - our own literals
+            print(f"  {'n/a':9} {name}  ({only_if})")
+            skipped.append(name)
+            continue
         caught = run_mutated(target, find, replace) != 0
         print(f"  {'caught' if caught else 'SURVIVED':9} {name}")
         if not caught:
             survivors.append(name)
-    n = len(MUTATIONS)
+    n = len(MUTATIONS) - len(skipped)
     if survivors:
         print(
             f"\n{len(survivors)} of {n} mutations survived — those checks are decorative:"
@@ -177,7 +189,8 @@ def main():
         for s in survivors:
             print(f"  - {s}")
         return 1
-    print(f"\nok — {n}/{n} mutations caught")
+    tail = f" ({len(skipped)} n/a on {sys.platform})" if skipped else ""
+    print(f"\nok — {n}/{n} mutations caught{tail}")
     return 0
 
 
