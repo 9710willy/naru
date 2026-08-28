@@ -46,8 +46,13 @@ Python 3.9+ and a SQLite built with FTS5. No dependencies.
 
 ```bash
 git clone https://github.com/9710willy/naru
-cd naru && python3 ms.py
+cd naru && python3 ms.py          # self-check: no network, no writes outside a temp dir
+ln -s "$PWD/naru.py" ~/.local/bin/naru   # or anywhere on PATH
 ```
+
+Every command below is spelled `naru`, so without that symlink none of them
+exist. `python3 naru.py <cmd>` works too, but only from the repo directory,
+and the agent filing a claim is rarely in it.
 
 ## Storage
 
