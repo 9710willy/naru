@@ -1,0 +1,26 @@
+name: checks
+
+on: [push, pull_request]
+
+jobs:
+  selfchecks:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The README claims 3.9+. The oldest and the newest prove it.
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: FTS5 is a hard requirement, not a nice-to-have
+        run: python -c "import sqlite3; sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)')"
+      - run: python ms.py
+      - run: python kernel.py
+      - run: python eviction.py
+      - run: python agent.py
+      - run: python naru.py --selfcheck
+      - run: python hook_spill.py --selfcheck
+      - run: python noise.py --selfcheck
+      - run: python bench.py --selfcheck
