@@ -153,7 +153,7 @@ def main():
     limits = _limits()
     calls = []
     ns = {"__name__": "__naru__"}
-    db = os.environ.get("NARU_KERNEL_DB")
+    db = os.environ.pop("NARU_KERNEL_DB", None)
     if db:
         from ms import MemorySurface
 
@@ -203,7 +203,15 @@ def main():
                 err = tb[-1] if tb else "error"
             # capped here, before it crosses the pipe
             reply = {"out": _cap(buf.getvalue()), "err": err, "calls": list(calls)}
-        _REPLY.write(json.dumps(reply) + "\n")
+        try:
+            line = json.dumps(reply)
+        except (TypeError, ValueError) as e:
+            # Callback arguments come from model code and need not be JSON.
+            # Outside this guard, one un-encodable argument killed the child.
+            line = json.dumps(
+                {"out": "", "err": f"reply not serialisable: {e}", "calls": []}
+            )
+        _REPLY.write(line + "\n")
         _REPLY.flush()
 
 
@@ -272,7 +280,10 @@ class SandboxedKernel:
             argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            # Kept, not discarded: it is the only diagnostic for a child that
+            # dies before it can frame a reply, and a typo in the bootstrap
+            # otherwise reads as "your cell crashed the kernel".
+            stderr=subprocess.PIPE,
             env=env,
             text=True,
         )
@@ -286,7 +297,13 @@ class SandboxedKernel:
     def _ask(self, msg):
         """One request, one reply. Returns None if the child died or hung."""
         if self._proc is None or self._proc.poll() is not None:
-            self._spawn()
+            try:
+                self._spawn()
+            except OSError as e:
+                # A misspelled NARU_KERNEL_JAIL is an operator error, not a
+                # reason to take the harness down mid-run.
+                self._why = f"cannot start the kernel: {e}"
+                return None
         try:
             self._proc.stdin.write(json.dumps(msg) + "\n")
             self._proc.stdin.flush()
@@ -300,8 +317,14 @@ class SandboxedKernel:
 
         def read():
             line = self._proc.stdout.readline()
-            if line:
+            if not line:
+                return                      # EOF: the child died
+            try:
                 result["reply"] = json.loads(line)
+            except ValueError as e:
+                # Unhandled, this killed the thread and the caller read it as a
+                # wall-clock hang, waiting out the full timeout for nothing.
+                result["reply"] = {"out": "", "err": f"unparseable reply: {e}"}
 
         t = threading.Thread(target=read, daemon=True)
         t.start()
@@ -321,11 +344,20 @@ class SandboxedKernel:
                 rc = self._proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 hung = True
+        # Read stderr BEFORE close(), which drops the handle along with the
+        # process. Only on a death: on a hang the child still holds the pipe
+        # and this would block for as long as it stays alive.
+        cause = ""
+        if not hung and self._proc and self._proc.stderr:
+            try:
+                cause = (self._proc.stderr.read() or "").strip()[-300:]
+            except (OSError, ValueError):
+                cause = ""
         self.close()
         self._why = (
             f"exceeded {self.timeout}s wall clock"
             if hung
-            else f"died (exit {rc})"
+            else f"died (exit {rc}){': ' + cause if cause else ''}"
         )
         return None
 
@@ -334,12 +366,21 @@ class SandboxedKernel:
         reply = self._ask({"op": "run", "code": code})
         if reply is None:
             return "", f"kernel {self._why}; resident state was lost"
+        err = reply.get("err")
         for name, args, kwargs in reply.get("calls", []):
             fn = self.callbacks.get(name)
-            if fn:
+            if not fn:
+                continue
+            try:
                 fn(*args, **kwargs)
+            except Exception as e:
+                # The arguments come from model-authored code. Dispatching them
+                # unguarded let `headline(1,2,3,4,5)` raise a live TypeError out
+                # of run() and into the harness — the one thing a child process
+                # is here to prevent.
+                err = err or f"{name}(): {type(e).__name__}: {e}"
         # already capped in the child; belt and braces for a hand-built reply
-        return _cap(reply.get("out", "")), reply.get("err")
+        return _cap(reply.get("out", "")), err
 
     def digest(self):
         reply = self._ask({"op": "digest"})
@@ -454,8 +495,25 @@ def demo():
         finally:
             os.chdir(here)
 
-        sk.run("submit_answer('42')\nprint('NOT REACHED')")
+        out, _ = sk.run("submit_answer('42')\nprint('NOT REACHED')")
         assert got == ["42"], got                # callback crossed back
+        assert "NOT REACHED" not in out, out     # and stopped the rest of it
+
+        # Callback arguments come from model code. Dispatched unguarded in the
+        # parent, one bad call raised a live TypeError out of run().
+        bad = SandboxedKernel(callbacks={"headline": lambda task=None: task}, timeout=2)
+        try:
+            _, err = bad.run("headline(1,2,3,4,5)")
+            assert err and "TypeError" in err, err
+            out, _ = bad.run("print('alive')")
+            assert out.strip() == "alive", "a bad callback arg took the parent"
+        finally:
+            bad.close()
+
+        # The log path must not stay in the child's environment: model code
+        # reading it can reopen the same file writable and undo mode=ro.
+        out, _ = sk.run("import os; print(os.environ.get('NARU_KERNEL_DB'))")
+        assert out.strip() == "None", out
 
         # Containment. Each of these used to take the harness down with it.
         _, err = sk.run("while True: pass")

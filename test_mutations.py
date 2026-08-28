@@ -121,6 +121,24 @@ MUTATIONS = [
         'f"exceeded {self.timeout}s wall clock"\n            if not hung',
     ),
     (
+        "callback dispatch is unguarded in the parent",
+        "kernel.py",
+        "            try:\n                fn(*args, **kwargs)\n            except Exception as e:",
+        "            if True:\n                fn(*args, **kwargs)\n            except Exception as e:",
+    ),
+    (
+        "the log path stays in the child's environment",
+        "kernel.py",
+        'db = os.environ.pop("NARU_KERNEL_DB", None)',
+        'db = os.environ.get("NARU_KERNEL_DB")',
+    ),
+    (
+        "submit_answer no longer stops the cell",
+        "kernel.py",
+        '            if _n == "submit_answer":\n                raise _Done()',
+        '            if False:\n                raise _Done()',
+    ),
+    (
         "the child opens the log writable",
         "kernel.py",
         'ns["ms"] = MemorySurface.open_readonly(db).readonly()',
