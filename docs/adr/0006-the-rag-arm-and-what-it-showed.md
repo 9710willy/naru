@@ -37,38 +37,61 @@ Two consequences for the harness:
 
 ## The result
 
-LongMemEval-`s`, n=24, Haiku 4.5 on agent and judge. Rows in
-`results/published/`.
+Superseded by an n=96 run on Sonnet 5, which reverses the n=24 Haiku ordering
+this ADR originally reported. Both are published; the small one is kept because
+the reversal is the point.
 
-| arm    | correct | 95% CI | net input/q | view    | calls | model $/q |
-| ------ | ------- | ------ | ----------- | ------- | ----- | --------- |
-| `full` | 16/24   | 47-82% | 116,727     | 124,484 | 1.0   | $0.2524   |
-| `naru` | 19/24   | 60-91% | 73,199      | 2,552   | 4.4   | $0.1409   |
-| `rag`  | 21/24   | 69-96% | 1,816       | 1,805   | 1.0   | $0.0251   |
+LongMemEval-`s`, n=96, Sonnet 5, judge Haiku 4.5:
 
-No pair separates on accuracy. Paired McNemar gives p = 0.125 for `full` vs
-`rag`, 0.508 for `full` vs `naru`, and 0.625 for `rag` vs `naru`. At n=24 this
-harness cannot distinguish any of the three, and that includes the 12.5-point
-gap the README used to lead with.
+| arm    | correct | 95% CI | view     | calls | model $/q |
+| ------ | ------- | ------ | -------- | ----- | --------- |
+| `naru` | 72/96   | 65-83% | 2,174    | 3.7   | $0.3547   |
+| `full` | 64/96   | 57-75% | 124,073  | 1.0   | $0.8036   |
+| `rag`  | 59/96   | 51-71% | 2,142    | 1.0   | $0.0753   |
 
-Cost is not a statistical question, and there the answer is unambiguous. `rag`
-answered in one call on 1,816 input tokens net of harness overhead. `naru` took
-4.4 calls and 73,199 — **forty times more input for no measurable accuracy
-gain**, and it scored numerically lower.
+Paired McNemar, Bonferroni-corrected to 0.0167 for three pairs: `full` vs `rag`
+p=0.064, `full` vs `naru` p=0.690, `rag` vs `naru` p=0.029. The last clears a
+plain 0.05 and not the corrected threshold, so nothing separates.
 
-The money ratio is 5.6x, not 40x, and the difference is a real effect rather
-than rounding. `billed_input` is an unweighted sum of fresh, cache-creation and
-cache-read tokens, and those bill at roughly 1x, 1.25x and 0.1x. `naru` is 70%
-cache reads by volume against `rag`'s 55%, so its token count is inflated
-relative to its bill. Report the token ratio as tokens and the money ratio as
-money; the harness prints both and they will not agree whenever the arms differ
-in call count.
+At n=24 on Haiku the ordering was `rag` 21/24, `naru` 19/24, `full` 16/24 —
+`rag` ahead. Neither ordering is separable and both are single-model, so the
+lesson is about the harness rather than the architectures: MemDelta (arXiv
+2606.29914) reports exactly this reversal across model families, and `noise.py`
+over two Sonnet replicates at n=12 puts run-to-run movement at ~33 points with
+a third of question verdicts flipping.
 
-Two limits on this run. `rag` has no replicate, so `noise.py` has nothing to
-compare and the accuracy caveat rests entirely on the paired test. And the two
-runs measured harness floors of 22,846 and 18,718 tokens per call, so they are
-not the same session; each row's `net-of-harness` is taken against its own
-run's floor, which is why `results/published/README.md` records both.
+### Where the difference sits
+
+| category                  | `full` | `rag` | `naru` | naru vs rag |
+| ------------------------- | ------ | ----- | ------ | ----------- |
+| knowledge-update          | 13/16  | 13/16 | 13/16  | p=1.000     |
+| multi-session             | 10/16  | 7/16  | 8/16   | p=1.000     |
+| single-session-assistant  | 13/15  | 15/16 | 15/16  | p=1.000     |
+| single-session-user       | 14/14  | 15/16 | 15/16  | p=1.000     |
+| single-session-preference | 4/16   | 2/16  | 7/16   | p=0.125     |
+| temporal-reasoning        | 10/14  | 7/16  | 14/16  | p=0.039     |
+
+Four categories tie. The aggregate difference is entirely temporal-reasoning
+and preference-following: the two where the answer must be computed over the
+log rather than quoted from a turn. A top-8 keyword window retrieves turns and
+cannot do arithmetic across sessions.
+
+Preference-following was predicted before it was measured — ADR 0003 records
+the paper's ablation putting it at 89.1 with the index against 74.9 without,
+the largest category effect it reports. Temporal-reasoning was not predicted,
+and six post-hoc category tests carry their own multiple-comparison exposure.
+Read the table as descriptive.
+
+### The token columns are not trustworthy
+
+The `claude` CLI's usage dict does not reconcile across runs. The same `full`
+prompt reported 201,288 billed input tokens at n=12 and 47,151 at n=96, for the
+same 124k view and nearly the same cost per question. Every "40x the input"
+claim in earlier versions of this ADR rested on that field and has been removed.
+
+Cost derives from the CLI's `total_cost_usd` and is consistent across runs.
+`view` is `est()`, ours, a character count. Those two are safe to quote; the
+`net-of-harness` column is not.
 
 ## Consequences
 
@@ -129,25 +152,19 @@ own noise floor. What the reversal does establish is that the earlier
 failure MemDelta (arXiv 2606.29914) documents: baseline rankings reverse across
 model families.
 
-Cost does not reverse. `rag` used 2,727 input tokens per question against
-`naru`'s 314,587 on Sonnet — 115x, against 40x on Haiku. The dollar ratio is
-smaller than the token ratio in both because 87% of `naru`'s Sonnet input is
-cache reads, and for the same reason `naru` is cheaper than `full` in money
-while spending more tokens.
-
-One thing worth a closer look than n=2 allows: preference-following is the only
-category where `naru` beat `rag` cleanly on Sonnet, 2/2 against 0/2. ADR 0003
-records that the paper's ablation says the eviction index affects that category
-most (89.1 vs 74.9), and that it has been this harness's weakest category in
-every run. That is where to look next, not at the aggregate.
+Cost does not reverse: `rag` is the cheapest arm on both models, $0.0753/q
+against `naru`'s $0.3547/q at n=96. `naru` is nonetheless cheaper than `full`
+($0.8036/q) while holding a 2,174-token view against 124,073, which is the
+paper's actual claim and the one thing every run here agrees on.
 
 ## What survives
 
 The conclusion that survives: **LongMemEval is the wrong benchmark for the
 question this repo asks.** Testing the kernel needs one where a single
 retrieval cannot win — BEAM (arXiv 2510.27246), where the `full` arm cannot run
-at all. Until that run exists, `rag` is the arm to beat here, and the burden is
-on the kernel to show it earns 40x the input somewhere that matters.
+at all. The n=96 category table points the same way from inside LongMemEval:
+the difference lives in the two categories that need computation rather than
+retrieval, and the other four are ties.
 
 Baseline tables above are from the paper's own HTML (arxiv.org/abs/2608.21690),
 read after this run, not reproduced by us.

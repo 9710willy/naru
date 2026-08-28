@@ -125,6 +125,13 @@ python3 test_judge.py   # live: judge regression cases
 and answers in one call. `naru` leaves the history in the log for the model to
 reach by writing code.
 
+**What this is for.** It checks whether this implementation behaves like the
+one in the paper. It is not a contribution to the field and the numbers are not
+leaderboard-comparable — the judge is not LongMemEval's official prompt, and the
+paper already reports 94.8 on LongMemEval-S, 73.1 on BEAM-10M and 86.7 on
+LOCA-256K against ten named baselines. Nothing here improves on that. What it
+can tell you is whether a change to this repo broke something.
+
 ```bash
 mkdir -p data && cd data
 curl -LO https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json
@@ -132,117 +139,73 @@ cd ..
 python3 bench.py --split oracle -n 12
 ```
 
-The `claude` CLI adds 13-23k input tokens per call before any prompt of ours, so
-compare arms on `net-of-harness`. That floor is measured at startup rather than
-hardcoded, for the reason recorded in ADR 0002.
+### The reference run
 
-### What the arms measure, and what they showed
-
-LongMemEval-`s`, n=24, Haiku 4.5 on agent and judge. Rows in
+LongMemEval-`s`, n=96, Sonnet 5, judge Haiku 4.5. Rows in
 [`results/published/`](results/published/), stripped of gold answers.
 
-| arm    | correct | 95% CI | net input / q | view     | calls | model $/q |
-| ------ | ------- | ------ | ------------- | -------- | ----- | --------- |
-| `full` | 16/24   | 47-82% | 116,727       | 124,484t | 1.0   | $0.2524   |
-| `naru` | 19/24   | 60-91% | 73,199        | 2,552t   | 4.4   | $0.1409   |
-| `rag`  | 21/24   | 69-96% | 1,816         | 1,805t   | 1.0   | $0.0251   |
+| arm    | correct | 95% CI | view      | calls | model $/q |
+| ------ | ------- | ------ | --------- | ----- | --------- |
+| `naru` | 72/96   | 65-83% | 2,174t    | 3.7   | $0.3547   |
+| `full` | 64/96   | 57-75% | 124,073t  | 1.0   | $0.8036   |
+| `rag`  | 59/96   | 51-71% | 2,142t    | 1.0   | $0.0753   |
 
-Cost is the model's own, per question. Judge cost is roughly equal across arms
-(~$0.02/q) and is excluded so the column measures the arm rather than the
-grader.
-
-**No pair separates on accuracy.** The arms answer the same questions, so
-`bench.py` compares them with an exact McNemar test on the questions where they
-disagree, and prints the verdict with the run:
+`view` is the largest context the model ever held, measured by us. `model $/q`
+is the arm's own cost; judge cost is ~$0.027/q across all three and is excluded
+so the column measures the arm rather than the grader.
 
 ```
-separability — paired McNemar on the questions the arms disagree on, Bonferroni for 3 pairs
-    full  vs rag    20.8 pts to rag    full only 1, rag only 6   p=0.125   not separable — this run's luck
-    full  vs naru   12.5 pts to naru   full only 3, naru only 6   p=0.508   not separable — this run's luck
-    rag   vs naru    8.3 pts to rag    rag only 3, naru only 1   p=0.625   not separable — this run's luck
+separability — paired McNemar, Bonferroni for 3 pairs
+    dropped from the pairing (run errored): full 5
+    full  vs rag     9.9 pts to full   full only 14, rag only  5   p=0.064   not separable
+    full  vs naru    3.3 pts to naru   full only 11, naru only 14  p=0.690   not separable
+    rag   vs naru   13.5 pts to naru   rag  only  9, naru only 22  p=0.029   not separable
 ```
 
-At n=24 this harness cannot tell the three apart, and that includes gaps of 20
-points. Treat every accuracy number here as underpowered.
+Three arms means three tests, so the threshold is Bonferroni-corrected to
+0.0167. `rag` vs `naru` clears a plain 0.05 and does not clear that, so the
+harness calls it not separable and is right to.
 
-Three arms means three tests, so the threshold is Bonferroni-corrected. At an
-uncorrected 0.05 each, at least one pair reads "REAL" in about 6% of runs where
-nothing separates, against 2% for a single pair. A question whose run errored
-leaves the pairing rather than scoring as a wrong answer: McNemar reads only
-the discordant pairs, so one CLI timeout scored as a loss can turn p=0.125 into
-p=0.031 and manufacture a significance claim. A judge failure counts the same
-way and is worse, because an empty verdict is byte-identical to a legitimate
-WRONG. The published run logged zero backend errors, so nothing was dropped
-from it; it predates the judge-error counter, and `report()` says so rather
-than printing a zero nobody measured.
+### Where the difference sits
 
-Cost is not a statistical question. `rag` answered in one call on 1,816 input
-tokens net of harness overhead, against `naru`'s 4.4 calls and 73,199. That is
-40x the input for no measurable accuracy gain, at a numerically lower score. On
-this benchmark the kernel does not earn its keep, and BM25 with a top-8 cut is
-enough.
+| category                   | `full` | `rag` | `naru` | naru vs rag |
+| -------------------------- | ------ | ----- | ------ | ----------- |
+| knowledge-update           | 13/16  | 13/16 | 13/16  | p=1.000     |
+| multi-session              | 10/16  | 7/16  | 8/16   | p=1.000     |
+| single-session-assistant   | 13/15  | 15/16 | 15/16  | p=1.000     |
+| single-session-user        | 14/14  | 15/16 | 15/16  | p=1.000     |
+| single-session-preference  | 4/16   | 2/16  | 7/16   | p=0.125     |
+| **temporal-reasoning**     | 10/14  | 7/16  | 14/16  | **p=0.039** |
 
-**That is what LongMemEval does to everyone.** The paper's own table puts five
-unrelated architectures inside a two-point band, with its own system third:
-Exabase M-1 96.4, Mastra OM 94.9, Scroll 94.8, Hindsight 94.6, Mem0 94.4. It
-does not win its own LongMemEval table and does not claim to. Our `rag` result
-reproduces that with a cruder baseline; it does not contradict the paper.
+Four categories are a tie. The whole difference is temporal-reasoning and
+preference-following — the two where an answer has to be *computed* over the
+log rather than quoted from one turn. A top-8 keyword window can retrieve a
+turn; it cannot do arithmetic across sessions.
 
-The paper stakes its claim elsewhere, and one of those benchmarks carries a
-named retrieval baseline. On LOCA-256K: Scroll 86.7, CodeAct 85.3, **Retrieval
-Agent 66.7**, Summarization Agent 65.3. On BEAM-10M: Scroll 73.1 against 64-68
-for the rest. Retrieval is 20 points behind once the questions stop being
-single-turn lookups. ADR 0006 has both tables and the caveats — including that
-a generic code-writing agent is within 1.4 points of Scroll on LOCA.
+That is the shape the paper predicts, which is what makes this a reproduction
+check rather than a result. ADR 0003 records that the paper's own ablation says
+the eviction index affects preference-following most (89.1 vs 74.9), so that
+category was predicted before it was measured. Temporal-reasoning was not, and
+these are post-hoc category tests on six categories — treat the p-values as
+descriptive.
 
-### The ranking reverses with the model
+### Reading the numbers honestly
 
-The table above is Haiku 4.5. On Sonnet 5, over the same 12 questions:
-
-| arm    | correct | 95% CI | net input / q | calls | model $/q |
-| ------ | ------- | ------ | ------------- | ----- | --------- |
-| `full` | 8/12    | 39-86% | 167,351       | 1.0   | $0.7231   |
-| `naru` | 11/12   | 65-99% | 314,587       | 3.3   | $0.3462   |
-| `rag`  | 9/12    | 47-91% | 2,727         | 1.0   | $0.0722   |
-
-`rag` led on Haiku and `naru` leads on Sonnet. Neither lead is separable —
-every pair lands between p=0.375 and p=1.000 — but the **order** flips, which
-is exactly what MemDelta (arXiv 2606.29914) reports for baseline rankings
-across model families. Any single-model claim from this harness, including the
-one above it, is a claim about that model.
-
-Do not read the accuracy columns at n=12 at all: `noise.py` over two Sonnet
-replicates puts run-to-run movement at ~33 points, and those two runs disagreed
-on a third of the questions while landing on the same total.
-
-What does not flip is cost. `rag` answered in one call on 2,727 input tokens
-against `naru`'s 3.3 calls and 314,587 — 115x on Sonnet against 40x on Haiku.
-The money gap is smaller than the token gap in both, because 87% of `naru`'s
-Sonnet input is cache reads billing at a tenth. And `naru` is cheaper than
-`full` in dollars while using more tokens, for the same reason.
-
-This harness runs Haiku and Sonnet; the paper ran Qwen3.8-Max. Our `naru` arm's
-11/12 on Sonnet has a 65-99% interval, which contains the paper's 94.8, so
-nothing here suggests the implementation is wrong — only that the benchmark
-cannot resolve what it is being asked.
-
-**The token ratio and the money ratio are not the same number, and the gap is
-not noise.** `billed_input` sums fresh, cache-creation and cache-read tokens
-without weighting them, but they do not cost the same: cache reads bill at
-roughly a tenth of base. 70% of `naru`'s billed input is cache reads against
-55% of `rag`'s, so 40x the tokens comes out as 5.6x the money. Both are real;
-quote whichever one you actually mean.
-
-Two limits on the run above. `rag` has no replicate, so `noise.py` cannot say
-how far it moves on a rerun — the accuracy caveat above rests on the paired
-test, not on repeated measurement. And the two runs measured different harness
-floors (22,846 and 18,718 input tokens per call), because that floor is measured
-per run rather than hardcoded; `net-of-harness` subtracts each row against its
-own run's floor.
-
-Run `noise.py` over two replicate runs before reading anything into a gap: it
-reports how far a single arm moves when you only rerun it, which is a different
-question from whether two arms differ.
+- **Do not quote `billed_input` or `net-of-harness` ratios.** The `claude`
+  CLI's usage dict is not consistent across runs: the same `full` prompt
+  reported 201,288 billed input tokens at n=12 and 47,151 at n=96, for the same
+  view size and nearly the same cost. Cost comes from the CLI's own
+  `total_cost_usd` and does reconcile; `view` is ours. Those two are safe.
+- **A question whose run errored leaves the pairing** rather than scoring as a
+  wrong answer. McNemar reads only the discordant pairs, so one CLI timeout
+  scored as a loss can turn p=0.125 into p=0.031 and manufacture a significance
+  claim. `report()` prints accuracy twice when that happens.
+- **Run `noise.py` over two replicate runs** before reading anything into a
+  gap. At n=12 the run-to-run band is ~33 points, and two identical Sonnet runs
+  disagreed on a third of the questions while landing on the same total. The
+  n=24 Haiku run in `results/published/` shows `rag` ahead of `naru`; the n=96
+  Sonnet run reverses it. Single-model, small-n orderings from this harness do
+  not survive.
 
 ## Limitations
 
@@ -260,9 +223,11 @@ Search is BM25 only, as in the paper. No embeddings.
 The benchmark judge is not LongMemEval's official prompt. Numbers are for
 tracking this repo and are not comparable to published scores.
 
-At n=24 no arm separates from any other on accuracy. The `rag` arm currently
-beats `naru` on cost by 40x and on score by 2 questions, so nothing here
-demonstrates that a code-writing agent beats plain retrieval. See ADR 0006.
+No arm separates from any other on accuracy at any n this harness has run.
+`naru` leads at n=96 on Sonnet and `rag` leads at n=24 on Haiku; neither
+ordering clears the corrected threshold. `rag` is 4.7x cheaper than `naru` in
+money on the n=96 run, and the difference between them sits entirely in two of
+six categories. See ADR 0006.
 
 ## See also
 

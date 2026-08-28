@@ -868,6 +868,11 @@ def demo():
             "naru": (11, 12),
             "rag": (9, 12),
         },
+        ("claude-sonnet-5", 96): {
+            "full": (64, 96),
+            "naru": (72, 96),
+            "rag": (59, 96),
+        },
     }
     runs = {}
     for f in pub:
