@@ -76,18 +76,56 @@ The honest reading is that on LongMemEval, BM25 over a SQLite log with a
 top-8 cut is sufficient, and the kernel is overhead. We are not going to bury
 that.
 
-What it does **not** establish: that the kernel is useless in general.
-LongMemEval questions are largely single-fact lookups where one lexical query
-lands on the evidence turn, which is the case retrieval is built for. The
-paper's system targets long-horizon agent trajectories, where the answer is
-usually not sitting in one retrievable turn and the model has to compute over
-the log rather than quote it. That is a real hypothesis and it is untested here.
+What it does **not** establish: that the kernel is useless in general. The
+paper's own results say why, and we should have read them before treating this
+as a surprise.
 
-Testing it needs a benchmark where a single retrieval cannot win — BEAM at 1M
-and 10M tokens (arXiv 2510.27246) is the obvious candidate, since the `full`
-arm cannot run there at all and questions span more evidence than a top-k
-window holds. Until that run exists, `rag` is the arm to beat and the burden is
-on the kernel.
+Its LongMemEval-S table puts five unrelated architectures inside a two-point
+band, with its own system third:
+
+| system      | LongMemEval-S |
+| ----------- | ------------- |
+| Exabase M-1 | 96.4          |
+| Mastra OM   | 94.9          |
+| Scroll      | **94.8**      |
+| Hindsight   | 94.6          |
+| Mem0        | 94.4          |
+
+The paper does not win its own LongMemEval table and does not claim to. That
+benchmark does not separate memory architectures for anyone, which is the same
+thing our `rag` arm found with a cruder baseline and a smaller n. Our result
+reproduces the paper's, it does not contradict it.
+
+The paper stakes its claim on two other benchmarks, and one of them carries a
+named retrieval baseline:
+
+| LOCA-256K           |      | BEAM-10M    |          |
+| ------------------- | ---- | ----------- | -------- |
+| Scroll              | 86.7 | Scroll      | **73.1** |
+| CodeAct             | 85.3 | Exabase M-1 | 68.0     |
+| **Retrieval Agent** | 66.7 | Cognee      | 67.0     |
+| Summarization Agent | 65.3 | Hindsight   | 64.1     |
+
+A retrieval agent is 20 points behind on LOCA-256K. So the hypothesis is not
+untested — the paper tested it, against retrieval, and retrieval lost badly
+once the questions stopped being single-turn lookups.
+
+Two things in those tables deserve stating plainly. CodeAct, a generic
+code-writing agent, is 1.4 points behind Scroll on LOCA — so the margin over
+retrieval belongs to the write-code family broadly, and Scroll's specific
+design adds little on top of it. And the paper ran Qwen3.8-Max while this
+harness runs Haiku 4.5; MemDelta reports baseline rankings reversing across
+model families, so the two sets of numbers cannot be read against each other in
+either direction.
+
+The conclusion that survives: **LongMemEval is the wrong benchmark for the
+question this repo asks.** Testing the kernel needs one where a single
+retrieval cannot win — BEAM (arXiv 2510.27246), where the `full` arm cannot run
+at all. Until that run exists, `rag` is the arm to beat here, and the burden is
+on the kernel to show it earns 40x the input somewhere that matters.
+
+Baseline tables above are from the paper's own HTML (arxiv.org/abs/2608.21690),
+read after this run, not reproduced by us.
 
 Second consequence: n=24 is too small to separate anything, including a
 20.8-point gap. Every accuracy claim from this harness is currently

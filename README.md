@@ -179,8 +179,26 @@ Cost is not a statistical question. `rag` answered in one call on 1,816 input
 tokens net of harness overhead, against `naru`'s 4.4 calls and 73,199. That is
 40x the input for no measurable accuracy gain, at a numerically lower score. On
 this benchmark the kernel does not earn its keep, and BM25 with a top-8 cut is
-enough. ADR 0006 records why that is the expected result for LongMemEval's
-question shape, and what would actually test the kernel instead.
+enough.
+
+**That is what LongMemEval does to everyone.** The paper's own table puts five
+unrelated architectures inside a two-point band, with its own system third:
+Exabase M-1 96.4, Mastra OM 94.9, Scroll 94.8, Hindsight 94.6, Mem0 94.4. It
+does not win its own LongMemEval table and does not claim to. Our `rag` result
+reproduces that with a cruder baseline; it does not contradict the paper.
+
+The paper stakes its claim elsewhere, and one of those benchmarks carries a
+named retrieval baseline. On LOCA-256K: Scroll 86.7, CodeAct 85.3, **Retrieval
+Agent 66.7**, Summarization Agent 65.3. On BEAM-10M: Scroll 73.1 against 64-68
+for the rest. Retrieval is 20 points behind once the questions stop being
+single-turn lookups. ADR 0006 has both tables and the caveats — including that
+a generic code-writing agent is within 1.4 points of Scroll on LOCA.
+
+Two limits on reading our arms against those numbers. This harness runs Haiku
+4.5 and the paper ran Qwen3.8-Max; on Sonnet 5 our `naru` arm scored 11/12
+(91.7%, CI 65-99%) in two separate runs, an interval that contains the paper's
+94.8. And `rag` has only ever run on Haiku, so the comparison above is a
+statement about one cheap model, not about the architectures.
 
 **The token ratio and the money ratio are not the same number, and the gap is
 not noise.** `billed_input` sums fresh, cache-creation and cache-read tokens
