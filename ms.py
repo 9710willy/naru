@@ -578,8 +578,32 @@ class MemorySurface:
                     f"  · {r.agent_id or 'unknown'}: {_oneline(r.content)}"
                     for r in rows
                 ]
+        shelved = self._dropped_keys() - set(keyed)
+        if shelved:
+            if lines:
+                lines.append("")
+            lines.append("## Archive — not loaded; `naru search \"<terms>\"` to pull one back")
+            lines.append(", ".join(sorted(shelved)))
+
         body = "\n".join(lines) or "(nothing promoted yet)"
         return f"# naru · seq {head} · ~{est(body)} tokens\n\n{body}\n"
+
+    def _dropped_keys(self):
+        """Topic keys whose every claim was dropped.
+
+        A dropped fact stays in the log and stays searchable, but nothing tells
+        a fresh session it exists — so the trim reads as a delete. The key is
+        the breadcrumb: ~9% of the body's tokens, and enough to know what to
+        search for.
+        """
+        return {
+            r[0]
+            for r in self.db.execute(
+                "SELECT topic_key FROM conversation_history"
+                " WHERE kind='claim' AND topic_key IS NOT NULL"
+                " GROUP BY topic_key HAVING max(promoted) = -1"
+            ).fetchall()
+        }
 
     # ---- COMPUTE (read-only SQL) -----------------------------------------
     def sql_query(self, sql, params=()):
@@ -827,6 +851,14 @@ def demo():
     assert "Store is SQLite" in ms.doc(), "the surviving fact must come back"
     assert ms.decide(rival, False) == 0, "retiring twice must report 0"
     assert ms.decide(c1, True) == 0, "promoting an already-promoted claim reports 0"
+
+    # a wholly-dropped key leaves a breadcrumb; a key still promoted does not
+    gone = ms.append("agent", "Retry budget was 5.", kind="claim", topic_key="retry.budget")
+    ms.decide(gone, False)
+    d3 = ms.doc()
+    assert "## Archive" in d3 and "retry.budget" in d3, d3
+    assert "Retry budget" not in d3, "the archive must list keys, not bodies"
+    assert "store.engine" not in d3.split("## Archive")[1], "a live key must not be archived"
 
     # doc_version tracks the DOC, not the log: an unrelated append must not
     # read as "the doc moved under you"
