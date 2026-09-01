@@ -120,6 +120,34 @@ preview instead of the whole payload.
 }
 ```
 
+## Statusline
+
+Claims sit pending until you run `naru inbox`, and nothing reminds you. `prune`
+keeps every decided claim and deletes a pending one after 30 days, so a claim
+you never looked at is the only kind that expires. A count in your statusline is
+the cheapest reminder.
+
+Add this to your statusline script:
+
+```bash
+db="${NARU_DB:-$HOME/.naru/log.db}" cache="${TMPDIR:-/tmp}/naru-pending.$UID"
+if [[ $db -nt $cache ]]; then
+  sqlite3 -readonly "$db" \
+    "SELECT COUNT(*) FROM conversation_history WHERE kind='claim' AND promoted=0" \
+    >"$cache" 2>/dev/null
+fi
+read -r pending <"$cache" 2>/dev/null
+((pending > 0)) && printf ' ✉%d' "$pending"
+```
+
+The db stays the one source of truth and `-nt` invalidates the cache exactly,
+so the count is never stale: only `naru claim`, `naru inbox` and a spill write
+the db. On a render that skips the spawn this costs nothing measurable, against
+11.5 ms for the uncached query. Use `sqlite3` rather than `naru inbox` when the
+cache does miss: `python3 -c pass` alone costs 17 ms.
+
+It prints nothing when the inbox is clear or the store does not exist yet.
+
 ## Other models
 
 `backend.py` defaults to the local `claude` CLI. `NARU_BACKEND` replaces it with
