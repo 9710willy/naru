@@ -32,7 +32,8 @@ pointing it at a CLAUDE.md you maintain by hand is safe.
 
 Harness-agnostic by construction: anything that can run a shell command can
 both write proposals and read the doc. `inject` targets the context file the
-harness already reads.
+harness already reads. The Codex plugin calls `naru codex-hook` to load the
+same approved doc through Codex lifecycle hooks.
 
     naru inject CLAUDE.md        # Claude Code
     naru inject AGENTS.md        # Codex, DeepSeek Harness, most others
@@ -45,7 +46,9 @@ ever wrote.
 """
 
 import contextlib
+import hashlib
 import io
+import json
 import os
 import pathlib
 import sys
@@ -56,6 +59,9 @@ import metrics
 from ms import BEGIN, DEFAULT_DB, END, MemorySurface
 
 DB = pathlib.Path(os.environ.get("NARU_NOTES", DEFAULT_DB))
+CODEX_STATE_SCHEMA = "naru.codex.context.v1"
+CODEX_EVENTS = {"SessionStart", "UserPromptSubmit", "SubagentStart"}
+CODEX_SESSION_LIMIT = 512
 
 
 def store():
@@ -123,11 +129,108 @@ def _apply(ms, seq, answer):
     return "skipped"
 
 
+def _codex_session(event):
+    session_id = event.get("session_id")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or len(session_id) > CODEX_SESSION_LIMIT
+        or "\0" in session_id
+    ):
+        return None
+    return f"codex:{session_id}"
+
+
+def _codex_seen(ms, session_id):
+    rows = ms.sql_query(
+        "SELECT content FROM conversation_history"
+        " WHERE kind='agent_state' AND agent_id='codex' AND session_id=?"
+        " ORDER BY seq DESC LIMIT 1",
+        (session_id,),
+    )
+    if not rows:
+        return None
+    try:
+        state = json.loads(rows[0].content)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if state.get("schema") != CODEX_STATE_SCHEMA:
+        return None
+    return state.get("doc_hash") if isinstance(state.get("doc_hash"), str) else None
+
+
+def _codex_remember(ms, session_id, doc_seq, doc_hash):
+    if _codex_seen(ms, session_id) == doc_hash:
+        return
+    ms.append(
+        "agent",
+        json.dumps(
+            {
+                "schema": CODEX_STATE_SCHEMA,
+                "doc_seq": doc_seq,
+                "doc_hash": doc_hash,
+            },
+            separators=(",", ":"),
+        ),
+        kind="agent_state",
+        session_id=session_id,
+        agent_id="codex",
+        created_at=datetime.now().isoformat(timespec="seconds"),
+    )
+
+
+def _codex_context(doc):
+    return (
+        "Naru live context follows. It replaces any older Naru block from "
+        "AGENTS.md.\n"
+        "File a lasting fact with `naru claim \"<text>\" --key <topic> --by "
+        "codex`; a person decides it with `naru inbox`. Use `naru search "
+        "\"<terms>\"` to recall archived facts.\n\n"
+        + doc
+    )
+
+
+def _codex_hook(event, ms):
+    if not isinstance(event, dict) or event.get("hook_event_name") not in CODEX_EVENTS:
+        return None
+    session_id = _codex_session(event)
+    if session_id is None:
+        return None
+    event_name = event["hook_event_name"]
+    doc = ms.doc()
+    doc_seq = ms.doc_version()
+    doc_hash = hashlib.sha256(doc.encode()).hexdigest()
+    if event_name == "UserPromptSubmit" and _codex_seen(ms, session_id) == doc_hash:
+        return None
+    if event_name != "SubagentStart":
+        _codex_remember(ms, session_id, doc_seq, doc_hash)
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": _codex_context(doc),
+        }
+    }
+
+
+def codex_hook_main(raw=None):
+    """Codex hook boundary. A Naru failure must not stop the agent."""
+    try:
+        event = json.loads(sys.stdin.read() if raw is None else raw)
+        output = _codex_hook(event, store())
+    except Exception:
+        return 0
+    if output:
+        json.dump(output, sys.stdout)
+    return 0
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0
     cmd, args = argv[0], argv[1:]
+    if cmd == "codex-hook":
+        return codex_hook_main()
     ms = store()
 
     if cmd == "add":
@@ -254,9 +357,8 @@ def main(argv):
             print("  " + _apply(ms, c.seq, ans) + "\n")
 
     elif cmd == "inject":
-        # One render, every harness. `naru inject AGENTS.md` is the whole
-        # integration for anything that reads a context file — spliced between
-        # markers, so it never destroys a file it does not own.
+        # One render for every file-based harness, spliced between markers so
+        # it never destroys a file it does not own.
         text = ms.doc()
         if args:
             wrote, had = _splice(args[0], text)
@@ -560,7 +662,7 @@ def _demo(real_stdin):
     assert "Store is SQLite" in doc, doc
     assert "Retry budget" not in doc, "a dropped claim reached the doc"
 
-    # writing the doc to a file IS the harness integration — no per-host API
+    # File-based harnesses still use the shared marker-safe integration.
     target = DB.parent / "AGENTS.md"
     assert main(["inject", str(target)]) == 0
     assert "Store is SQLite" in target.read_text()
@@ -581,6 +683,84 @@ def _demo(real_stdin):
     body2 = hand.read_text()
     assert body2.count(BEGIN) == 1, "re-inject appended a second block"
     assert "Always run the tests" in body2, "re-inject lost the user's content"
+
+    # Codex gets the approved doc at startup, then only after the doc changes.
+    codex_id = "session-" + "x" * 80
+    codex_run = f"codex:{codex_id}"
+    start = _codex_hook(
+        {"hook_event_name": "SessionStart", "session_id": codex_id}, store()
+    )
+    assert start["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "Store is SQLite" in start["hookSpecificOutput"]["additionalContext"]
+    state = store().sql_query(
+        "SELECT session_id, content FROM conversation_history"
+        " WHERE kind='agent_state' AND agent_id='codex' ORDER BY seq DESC LIMIT 1"
+    )[0]
+    assert state.session_id == codex_run, "Codex session ID was truncated"
+    state_content = json.loads(state.content)
+    assert state_content["doc_seq"] == store().doc_version()
+    assert state_content["doc_hash"] == hashlib.sha256(store().doc().encode()).hexdigest()
+    assert not any(
+        r.content.startswith('{"schema":"naru.codex.context.v1"')
+        for r in store().search("naru", k=50)
+    ), "Codex hook state leaked into normal search"
+    assert _codex_hook(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": codex_id,
+            "prompt": "PRIVATE_CODEX_PROMPT",
+        },
+        store(),
+    ) is None, "unchanged Naru context was sent twice"
+    assert not store().sql_query(
+        "SELECT seq FROM conversation_history WHERE content LIKE ?",
+        ("%PRIVATE_CODEX_PROMPT%",),
+    ), "Codex prompt was persisted"
+
+    assert main(["claim", "Codex refresh marker.", "--key", "codex.refresh"]) == 0
+    codex_claim = store().pending()[-1].seq
+    assert main(["promote", str(codex_claim), "--yes"]) == 0
+    assert main(["claim", "Codex high marker.", "--key", "codex.high"]) == 0
+    codex_high = store().pending()[-1].seq
+    assert main(["promote", str(codex_high), "--yes"]) == 0
+    refresh = _codex_hook(
+        {"hook_event_name": "UserPromptSubmit", "session_id": codex_id}, store()
+    )
+    assert "Codex refresh marker" in refresh["hookSpecificOutput"]["additionalContext"]
+    assert "Codex high marker" in refresh["hookSpecificOutput"]["additionalContext"]
+    assert _codex_hook(
+        {"hook_event_name": "UserPromptSubmit", "session_id": codex_id}, store()
+    ) is None, "refreshed Naru context was sent twice"
+
+    assert main(["drop", str(codex_claim), "--yes"]) == 0
+    retired = _codex_hook(
+        {"hook_event_name": "UserPromptSubmit", "session_id": codex_id}, store()
+    )
+    assert "Codex refresh marker" not in retired["hookSpecificOutput"]["additionalContext"]
+    assert "Codex high marker" in retired["hookSpecificOutput"]["additionalContext"]
+    assert _codex_hook(
+        {"hook_event_name": "UserPromptSubmit", "session_id": codex_id}, store()
+    ) is None, "retired Naru context was sent twice"
+    assert main(["drop", str(codex_high), "--yes"]) == 0
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert codex_hook_main(
+            json.dumps(
+                {"hook_event_name": "SubagentStart", "session_id": codex_id}
+            )
+        ) == 0
+    subagent = json.loads(buf.getvalue())
+    assert subagent["hookSpecificOutput"]["hookEventName"] == "SubagentStart"
+    assert "Store is SQLite" in subagent["hookSpecificOutput"]["additionalContext"]
+    assert "Codex high marker" not in subagent["hookSpecificOutput"]["additionalContext"]
+    assert _codex_hook(
+        {"hook_event_name": "PostToolUse", "session_id": codex_id}, store()
+    ) is None, "unsupported Codex event produced output"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert codex_hook_main("not json") == 0
+    assert not buf.getvalue(), "malformed Codex input produced output"
 
     # a note is not a claim: `add` must never reach the doc
     assert main(["add", "notes topic", "This line is a note, not a claim."]) == 0

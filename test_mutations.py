@@ -26,7 +26,15 @@ import sys
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent
-COPY = ("ms.py", "kernel.py", "eviction.py", "agent.py", "backend.py", "noise.py")
+COPY = (
+    "ms.py",
+    "kernel.py",
+    "eviction.py",
+    "agent.py",
+    "backend.py",
+    "noise.py",
+    "metrics.py",
+)
 
 # (name, file, find, replace) or (name, file, find, replace, only_if)
 # only_if is a Python expression: when it is false the mutation cannot
@@ -252,6 +260,24 @@ MUTATIONS = [
         "CREATE INDEX IF NOT EXISTS ix_promoted_sources",
         "CREATE INDEX IF NOT EXISTS ix_promoted_sources_off",
     ),
+    (
+        "Codex repeats unchanged Naru context",
+        "naru.py",
+        'if event_name == "UserPromptSubmit" and _codex_seen(ms, session_id) == doc_hash:',
+        'if event_name == "UserPromptSubmit" and False:',
+    ),
+    (
+        "Codex hook state reaches normal search",
+        "naru.py",
+        'kind="agent_state",\n        session_id=session_id,\n        agent_id="codex",',
+        'kind="tool_result",\n        session_id=session_id,\n        agent_id="codex",',
+    ),
+    (
+        "Codex refresh watches only the highest promoted seq",
+        "naru.py",
+        "doc_hash = hashlib.sha256(doc.encode()).hexdigest()",
+        "doc_hash = str(doc_seq)",
+    ),
 ]
 
 
@@ -278,6 +304,7 @@ def run_mutated(target, find, replace):
         "kernel.py": ["kernel.py"],
         "agent.py": ["agent.py"],
         "eviction.py": ["eviction.py"],
+        "naru.py": ["naru.py", "--selfcheck"],
     }.get(target, ["bench.py", "--selfcheck"])
     return subprocess.run(
         [sys.executable, *cmd], cwd=work, capture_output=True, text=True, check=False

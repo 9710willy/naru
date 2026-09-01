@@ -28,7 +28,8 @@ naru inject .cursorrules     # Cursor
 ```
 
 Any tool that can run a shell command can both file claims and read the result.
-There is no plugin API.
+The CLI owns the data. The Codex plugin below only calls that CLI from native
+lifecycle hooks.
 
 `inject` splices the doc between `<!-- naru:begin -->` and `<!-- naru:end -->`
 markers and leaves the rest of the file alone, so pointing it at a CLAUDE.md you
@@ -55,6 +56,24 @@ ln -s "$PWD/naru.py" ~/.local/bin/naru   # or anywhere on PATH
 Every command below is spelled `naru`, so without that symlink none of them
 exist. `python3 naru.py <cmd>` works too, but only from the repo directory,
 and the agent filing a claim is rarely in it.
+
+### Codex
+
+Install the local marketplace and plugin after `naru` is on `PATH`:
+
+```bash
+codex plugin marketplace add "$PWD/codex"
+codex plugin add naru-codex@naru
+```
+
+Start a new Codex thread and trust the plugin hooks when Codex asks. The plugin
+loads the current approved Naru doc at session start, refreshes it after a new
+promotion or retirement, and gives the same context to subagents. It stores only
+the last doc sequence and fingerprint seen by each Codex session.
+
+The plugin does not replace Codex tool results. Codex 0.152 reports the only
+working replacement form as a blocked tool after that tool has already run,
+which can make an agent repeat a write or request.
 
 ## Storage
 
