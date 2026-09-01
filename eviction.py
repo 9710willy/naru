@@ -15,7 +15,7 @@ def est(text):
     return max(1, len(text) // TOK)
 
 
-def format_headline(task=None, state=None, next_action=None, status=None):
+def format_headline(task=None, verified=None, next_action=None, status=None):
     """The paper's landmark shape: task, verified state, next action, status.
 
     Auto-derived headlines (truncated block text) only support recall by
@@ -25,7 +25,7 @@ def format_headline(task=None, state=None, next_action=None, status=None):
     """
     parts = [
         ("task", task),
-        ("state", state),
+        ("verified", ", ".join(verified or [])),
         ("next", next_action),
         ("status", status),
     ]
@@ -53,13 +53,16 @@ class Block:
         return f"<blk {self.seq} {self.role} {self.tokens()}t>"
 
 
-def fold_payloads(blocks):
+def fold_payloads(blocks, recovery_session=None):
     """Tool payloads collapse to a seq pointer — cheapest recovery, so folded
     first. The row keeps a bounded preview; the full bytes stay in the log."""
     for b in blocks:
         if b.is_payload and not b.text.startswith("[folded"):
             preview = b.text.replace("\n", " ")[:80]
-            b.text = f"[folded payload seq {b.seq}: {preview}… -> ms.expand({b.seq})]"
+            call = f"ms.expand({b.seq}"
+            if recovery_session is not None:
+                call += f", session_id={recovery_session!r}"
+            b.text = f"[folded payload seq {b.seq}: {preview}… -> {call})]"
     return blocks
 
 
@@ -69,9 +72,12 @@ def rollup(index, k):
     the next tier. After n evictions the index is O(k log_k n) blocks."""
     for t in range(len(index)):
         while len(index[t]) > k:
-            old = (
-                [index[t].pop(0) for _ in range(k - 1)] if k > 1 else [index[t].pop(0)]
-            )
+            n = k - 1 if k > 1 else 1
+            old = index[t][:n]
+            sessions = {e.get("session_id") for e in old}
+            if len(sessions) > 1:
+                raise ValueError("cannot roll up mixed-session index entries")
+            del index[t][:n]
             lo = min(e["lo"] for e in old)
             hi = max(e["hi"] for e in old)
             # "collapse to one line each and merge into the next tier" — one
@@ -91,6 +97,9 @@ def rollup(index, k):
                 if gist
                 else f"{len(old)} spans, seq {lo}-{hi}",
             }
+            session_id = sessions.pop()
+            if session_id is not None:
+                merged["session_id"] = session_id
             if t + 1 == len(index):
                 index.append([])
             index[t + 1].append(merged)
@@ -104,11 +113,14 @@ def render_index(index):
     lines = ["--- evicted (recover with ms.expand(lo, hi)) ---"]
     for t in range(len(index) - 1, -1, -1):
         for e in index[t]:
-            lines.append(f"  [{e['lo']}-{e['hi']}] {e['headline']}")
+            call = f"ms.expand({e['lo']}, {e['hi']}"
+            if "session_id" in e:
+                call += f", session_id={e['session_id']!r}"
+            lines.append(f"  [{e['lo']}-{e['hi']}] {e['headline']} -> {call})")
     return "\n".join(lines)
 
 
-def evict(view, index, budget, k=4, protect_tail=3):
+def evict(view, index, budget, k=4, protect_tail=3, recovery_session=None):
     """Algorithm 1. Mutates and returns (view, index).
 
     view    — list of Block, oldest first
@@ -123,7 +135,7 @@ def evict(view, index, budget, k=4, protect_tail=3):
     older, protected = view[:split], view[split:]
 
     # FOLDPAYLOADS: cheapest reduction first — payloads become seq pointers.
-    fold_payloads(older)
+    fold_payloads(older, recovery_session)
 
     # SELECTSPAN + EVICTTOINDEX: drop the oldest spans until under budget.
     # Their headlines enter the index, anchored to exact seq addresses.
@@ -136,13 +148,14 @@ def evict(view, index, budget, k=4, protect_tail=3):
     if evicted:
         if not index:
             index.append([])
-        index[0].append(
-            {
-                "lo": min(b.seq for b in evicted),
-                "hi": max(b.seq for b in evicted),
-                "headline": "; ".join(b.headline for b in evicted[:2])[:90],
-            }
-        )
+        entry = {
+            "lo": min(b.seq for b in evicted),
+            "hi": max(b.seq for b in evicted),
+            "headline": "; ".join(b.headline for b in evicted[:2])[:90],
+        }
+        if recovery_session is not None:
+            entry["session_id"] = recovery_session
+        index[0].append(entry)
         rollup(index, k)
 
     return older + protected, index
@@ -167,9 +180,10 @@ def demo():
     big = blk("R" * 8000, payload=True)
     view = [big] + [blk("x" * 40) for _ in range(3)]
     before = sum(b.tokens() for b in view)
-    v, idx = evict(view, [], budget=200)
+    v, idx = evict(view, [], budget=200, recovery_session="run")
     assert sum(b.tokens() for b in v) < before
     assert any("ms.expand" in b.text for b in v), "payload not folded to a pointer"
+    assert f"ms.expand({big.seq}, session_id='run')" in v[0].text
 
     # over budget: oldest evicted, tail protected, index anchors addresses
     view = [blk("y" * 4000) for _ in range(10)]
@@ -198,6 +212,29 @@ def demo():
     total_entries = sum(len(t) for t in idx2)
     assert total_entries <= 16, total_entries
     assert len(idx2) >= 3, f"expected multiple tiers, got {len(idx2)}"
+
+    gapped = []
+    for i in range(60):
+        gapped.append([]) if not gapped else None
+        gapped[0].append(
+            {"lo": i * 3, "hi": i * 3 + 1, "headline": f"trace {i}", "session_id": "run"}
+        )
+        rollup(gapped, k=4)
+    rendered_gaps = render_index(gapped)
+    assert rendered_gaps.count("ms.expand(") == sum(len(t) for t in gapped) + 1
+    assert len(rendered_gaps) < 2000, len(rendered_gaps)
+    assert all(e.get("session_id") == "run" for tier in gapped for e in tier)
+
+    try:
+        mixed = [[{"lo": 1, "hi": 1, "headline": "one", "session_id": "a"},
+                  {"lo": 2, "hi": 2, "headline": "two", "session_id": "b"},
+                  {"lo": 3, "hi": 3, "headline": "three"},
+                  {"lo": 4, "hi": 4, "headline": "four"}]]
+        rollup(mixed, k=3)
+        raise AssertionError("mixed-session rollup made a bad recovery handle")
+    except ValueError:
+        pass
+    assert [e["lo"] for e in mixed[0]] == [1, 2, 3, 4]
 
     # rendering is compact and points at the recovery call
     r = render_index(idx)

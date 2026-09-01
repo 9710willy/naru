@@ -1,0 +1,21 @@
+{
+  "beam_commit": "b2da22eac88bb0874c64665f13457eb99835774a",
+  "mode": "deterministic six-turn replay",
+  "questions": 10,
+  "mean_turns": 6.0,
+  "mean_total_prompt_tokens": 11179.7,
+  "mean_peak_prompt_tokens": 2948.8,
+  "mean_final_view_tokens": 2787.0,
+  "prompt_tokens": {
+    "beam-1-abstention-1": [143, 342, 2396, 2596, 2735, 2945],
+    "beam-1-contradiction_resolution-1": [139, 338, 2392, 2592, 2730, 2941],
+    "beam-1-event_ordering-1": [165, 364, 2418, 2618, 2756, 2967],
+    "beam-1-information_extraction-1": [128, 327, 2381, 2581, 2719, 2930],
+    "beam-1-instruction_following-1": [133, 332, 2386, 2586, 2725, 2935],
+    "beam-1-knowledge_update-1": [134, 333, 2387, 2587, 2726, 2936],
+    "beam-1-multi_session_reasoning-1": [141, 341, 2394, 2595, 2733, 2943],
+    "beam-1-preference_following-1": [165, 364, 2418, 2618, 2757, 2967],
+    "beam-1-summarization-1": [171, 371, 2424, 2625, 2763, 2973],
+    "beam-1-temporal_reasoning-1": [149, 348, 2401, 2602, 2740, 2951]
+  }
+}

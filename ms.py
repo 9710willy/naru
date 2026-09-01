@@ -31,26 +31,43 @@ from eviction import est  # one owner for chars-per-token
 DEFAULT_DB = pathlib.Path(
     os.environ.get("NARU_DB", pathlib.Path.home() / ".naru" / "log.db")
 )
+BEGIN = "<!-- naru:begin -->"
+END = "<!-- naru:end -->"
 
 # Age is the right rule for spilled tool output and the wrong one for a
 # decision a human made. Anything else a prune would take, it still takes.
-PRUNE_KEEP = " AND NOT (kind = 'claim' AND promoted <> 0)"
+PRUNE_KEEP = """ AND NOT (
+    (kind IN ('claim','skill') AND promoted <> 0)
+    OR EXISTS (
+        SELECT 1 FROM conversation_history AS curated
+        WHERE curated.kind IN ('claim','skill') AND curated.promoted = 1
+          AND curated.source_run_id = conversation_history.session_id
+          AND conversation_history.seq BETWEEN curated.source_seq_lo
+                                           AND curated.source_seq_hi
+    )
+)"""
 
 # Payloads over this go to disk. One value, no caller has ever varied it.
 BLOB_THRESHOLD = 4000
 # Session preview width in outline().
 OUTLINE_PREVIEW = 90
+_ALL_SESSIONS = object()
+
+
+def _visible_kind(column="kind"):
+    return f"({column} IS NULL OR {column} NOT GLOB 'agent_*')"
 
 
 def _oneline(text):
-    """Collapse a claim to a single line for rendering.
+    """Collapse a claim or skill to a single safe render line.
 
     The doc is written into files other tools parse — CLAUDE.md, AGENTS.md, a
-    shell rc. A newline inside a claim would otherwise break out of its bullet
+    shell rc. A newline inside a claim or skill would otherwise break out of its bullet
     and become a top-level line in the host format, which is how agent-authored
     text turns into a directive the host executes.
     """
-    return re.sub(r"\s+", " ", (text or "").strip())
+    return re.sub(r"\s+", " ", (text or "").replace(BEGIN, "<!-- naru: begin -->")
+                  .replace(END, "<!-- naru: end -->").strip())
 
 
 class Row(dict):
@@ -108,6 +125,7 @@ class MemorySurface:
         m.db.row_factory = sqlite3.Row
         m.db.execute("PRAGMA busy_timeout=30000")
         m.blobs = pathlib.Path(tempfile.gettempdir()) / "naru-blobs-readonly"
+        m._blob_tmp = None
         return m
 
     def __init__(self, db=":memory:", blobs=None):
@@ -150,22 +168,33 @@ class MemorySurface:
                 created_at TEXT,          -- ISO-8601, lexically sortable
                 content    TEXT,
                 payload_path TEXT,        -- externalized big payloads
-                -- curation: a claim is pending (0), promoted (1) or dropped (-1)
+                -- curation: a claim or skill is pending (0), promoted (1) or dropped (-1)
                 promoted   INTEGER NOT NULL DEFAULT 0,
                 topic_key  TEXT,          -- same key, both promoted = contradiction
-                base_seq   INTEGER        -- doc version the author wrote against
+                base_seq   INTEGER,       -- doc version the author wrote against
+                source_run_id TEXT,
+                source_seq_lo INTEGER,
+                source_seq_hi INTEGER
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
                 content, content='conversation_history', content_rowid='seq');
         """)
         self._migrate_fts()
         self._migrate_cols()
-        # per-instance by default: bench.py runs questions in parallel
-        # threads and a shared dir would collide on blobs/<seq>.txt
+        self._blob_tmp = tempfile.TemporaryDirectory(prefix="naru-blobs-") \
+            if db == ":memory:" and blobs is None else None
         self.blobs = pathlib.Path(
-            blobs or pathlib.Path(tempfile.gettempdir()) / f"naru-blobs-{id(self):x}"
+            self._blob_tmp.name if self._blob_tmp else blobs or
+            pathlib.Path(tempfile.gettempdir()) / f"naru-blobs-{id(self):x}"
         )
         self.blob_threshold = BLOB_THRESHOLD
+
+    def close(self):
+        """Close the database and remove only owned temporary blobs."""
+        self.db.close()
+        if self._blob_tmp:
+            self._blob_tmp.cleanup()
+            self._blob_tmp = None
 
     def _migrate_fts(self):
         """Upgrade a store created with a contentless FTS table.
@@ -209,6 +238,9 @@ class MemorySurface:
             ("promoted", "INTEGER NOT NULL DEFAULT 0"),
             ("topic_key", "TEXT"),
             ("base_seq", "INTEGER"),
+            ("source_run_id", "TEXT"),
+            ("source_seq_lo", "INTEGER"),
+            ("source_seq_hi", "INTEGER"),
         ):
             if name not in have:
                 try:
@@ -231,6 +263,11 @@ class MemorySurface:
             "CREATE INDEX IF NOT EXISTS ix_topic_key"
             " ON conversation_history(topic_key, seq) WHERE topic_key IS NOT NULL"
         )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_promoted_sources"
+            " ON conversation_history(source_run_id, source_seq_lo, source_seq_hi)"
+            " WHERE kind IN ('claim','skill') AND promoted=1 AND source_run_id IS NOT NULL"
+        )
         self.db.commit()
 
     # ---- ingest -----------------------------------------------------------
@@ -246,6 +283,9 @@ class MemorySurface:
         payload=None,
         topic_key=None,
         base_seq=None,
+        source_run_id=None,
+        source_seq_lo=None,
+        source_seq_hi=None,
     ):
         """Append one turn. Returns its stable `seq`. `created_at` is caller-
         supplied (the harness stamps it) so ingestion stays deterministic.
@@ -254,11 +294,28 @@ class MemorySurface:
         inserted FIRST so the blob is named by the real seq and the pointer we
         show the model cannot drift.
         """
+        source = (source_run_id, source_seq_lo, source_seq_hi)
+        if any(v is not None for v in source):
+            if not (
+                isinstance(source_run_id, str)
+                and source_run_id
+                and type(source_seq_lo) is int
+                and type(source_seq_hi) is int
+                and source_seq_lo <= source_seq_hi
+            ):
+                raise ValueError("source needs --run plus integer LO:HI")
+            rows = self.db.execute(
+                "SELECT seq FROM conversation_history WHERE session_id=? AND seq IN (?,?)",
+                (source_run_id, source_seq_lo, source_seq_hi),
+            ).fetchall()
+            if {r["seq"] for r in rows} != {source_seq_lo, source_seq_hi}:
+                raise ValueError("source endpoints are not in that run")
         big = payload is not None and len(payload) > self.blob_threshold
         cur = self.db.execute(
             "INSERT INTO conversation_history"
             "(session_id, agent_id, role, kind, created_at, content, payload_path,"
-            " topic_key, base_seq) VALUES(?,?,?,?,?,?,?,?,?)",
+            " topic_key, base_seq, source_run_id, source_seq_lo, source_seq_hi)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 session_id,
                 agent_id,
@@ -269,6 +326,9 @@ class MemorySurface:
                 None,
                 topic_key,
                 base_seq,
+                source_run_id,
+                source_seq_lo,
+                source_seq_hi,
             ),
         )
         seq = cur.lastrowid
@@ -281,9 +341,10 @@ class MemorySurface:
             # bounded preview and a recovery pointer — not the whole payload.
             # Keeping both stored the same bytes twice.
             preview = payload[: self.blob_threshold].rstrip()
+            scope = f", session_id={session_id!r}" if session_id is not None else ""
             content = (
                 f"{preview}\n[payload {len(payload)} chars, preview only "
-                f"-> ms.expand({seq})]"
+                f"-> ms.expand({seq}{scope})]"
             )
             self.db.execute(
                 "UPDATE conversation_history SET content=?, payload_path=? WHERE seq=?",
@@ -329,6 +390,8 @@ class MemorySurface:
         if kind is not None:
             where.append("c.kind = ?")
             params.append(kind)
+        else:
+            where.append(_visible_kind("c.kind"))
         # created_at is ISO-8601, so lexical comparison is date comparison
         if since is not None:
             where.append("c.created_at >= ?")
@@ -355,8 +418,9 @@ class MemorySurface:
             Row(r)
             for r in self.db.execute(
                 "SELECT session_id, MIN(seq) lo, MAX(seq) hi, MIN(created_at) at,"
-                " COUNT(*) n FROM conversation_history"
-                " GROUP BY session_id ORDER BY lo"
+                " COUNT(*) n FROM conversation_history WHERE "
+                + _visible_kind()
+                + " GROUP BY session_id ORDER BY lo"
             ).fetchall()
         ]
 
@@ -376,25 +440,35 @@ class MemorySurface:
             # tool results has no 'user' turn at all.
             first = self.db.execute(
                 "SELECT content FROM conversation_history WHERE session_id IS ?"
-                " ORDER BY (role != 'user'), seq LIMIT 1",
+                " AND " + _visible_kind() + " ORDER BY (role != 'user'), seq LIMIT 1",
                 (r["session_id"],),
             ).fetchone()
             head = (first["content"] if first else "").replace("\n", " ")
             head = head.split("] ", 1)[-1]  # drop the [Session N | date] tag
+            recover = f"ms.expand({r['lo']}, {r['hi']}, session_id={r['session_id']!r})"
             out.append(
                 f"seq {r['lo']}-{r['hi']} | {(r['at'] or '')[:10]} | "
-                f"{r['n']} turns | {head[:OUTLINE_PREVIEW]}"
+                f"{r['n']} turns | {head[:OUTLINE_PREVIEW]} -> {recover}"
             )
         return "\n".join(out)
 
     # ---- MATERIALIZE ------------------------------------------------------
-    def expand(self, lo, hi=None):
+    def expand(self, lo, hi=None, session_id=_ALL_SESSIONS):
         """Recover an exact seq span, verbatim, as Row objects. Externalized
-        payloads are inlined from disk. `expand(seq)` recovers one turn."""
+        payloads are inlined from disk. Omitted session_id returns normal-history
+        rows; an explicit session_id returns that exact session, including trace rows."""
         hi = lo if hi is None else hi
+        where = ["seq BETWEEN ? AND ?"]
+        params = [lo, hi]
+        if session_id is _ALL_SESSIONS:
+            where.append(_visible_kind())
+        else:
+            where.append("session_id IS ?")
+            params.append(session_id)
         rows = self.db.execute(
-            "SELECT * FROM conversation_history WHERE seq BETWEEN ? AND ? ORDER BY seq",
-            (lo, hi),
+            "SELECT * FROM conversation_history WHERE " + " AND ".join(where)
+            + " ORDER BY seq",
+            params,
         ).fetchall()
         out = []
         for r in rows:
@@ -438,10 +512,8 @@ class MemorySurface:
     def prune(self, before_iso):
         """Delete rows created before `before_iso`. Returns rows removed.
 
-        A DECIDED claim is never pruned by age. Claims are stamped with the
-        wall clock at `naru claim` time, so an age-only predicate gives every
-        human promotion a 30-day shelf life and silently empties the doc. Age
-        is the right rule for spilled tool output, not for a curated decision.
+        A decided claim or skill, and the trace it cites, is never pruned by
+        age. Age is the right rule for spilled tool output.
 
         Blob files for the deleted rows are removed too.
         """
@@ -475,38 +547,25 @@ class MemorySurface:
         self.db.execute("VACUUM")
         return len(seqs)
 
-    # ---- CURATE -----------------------------------------------------------
-    # A claim is one agent's proposed fact, appended like any other row and
-    # marked kind='claim'. Only a promoted claim reaches the doc. That is the
-    # whole reason the doc stays small while the log grows without bound.
-
     def pending(self, k=50):
-        """Claims still awaiting a human decision, oldest first."""
+        """Claims and skills still awaiting a human decision, oldest first."""
         return [
             Row(r)
             for r in self.db.execute(
-                "SELECT * FROM conversation_history WHERE kind='claim'"
+                "SELECT * FROM conversation_history WHERE kind IN ('claim','skill')"
                 " AND promoted=0 ORDER BY seq LIMIT ?",
                 (k,),
             ).fetchall()
         ]
 
     def decide(self, seq, keep):
-        """Promote a pending claim, or retire any claim that is not already
-        dropped. Returns rows changed, so 0 is never a silent no-op.
+        """Promote pending claims/skills; drop ones not already dropped.
 
-        Promotion requires promoted=0: deciding the same claim twice is a
-        mistake worth reporting. Retiring does NOT, because otherwise a
-        promoted fact could never be revised — superseding it would leave both
-        versions promoted and park the key under `## Unresolved` forever,
-        which loses the fact the doc used to state.
-
-        ponytail: the verdict is a column on the claim, not an event of its
-        own, so it does not record who decided or when. Make it a
-        kind='verdict' row if that audit trail is ever needed.
+        ponytail: verdicts are columns, not events; add kind='verdict' for who/when.
         """
         cur = self.db.execute(
-            "UPDATE conversation_history SET promoted=? WHERE seq=? AND kind='claim'"
+            "UPDATE conversation_history SET promoted=? WHERE seq=?"
+            " AND kind IN ('claim','skill')"
             + (" AND promoted=0" if keep else " AND promoted<>-1"),
             (1 if keep else -1, seq),
         )
@@ -524,56 +583,54 @@ class MemorySurface:
         ).fetchone()[0]
 
     def _promoted(self):
-        """Every promoted claim, grouped by topic_key. One query, one snapshot.
-
-        `conflicts()` and `doc()` both need this. Reading it twice let a
-        promotion land between them and render a doc that never existed.
-        """
-        keyed, loose = {}, []
+        """Return promoted claims and skills grouped by kind and topic key."""
+        keyed, loose = {}, {"claim": [], "skill": []}
         for r in self.db.execute(
             "SELECT * FROM conversation_history WHERE promoted=1"
             " ORDER BY topic_key IS NULL, topic_key, seq"
         ).fetchall():
             (
-                loose
+                loose.setdefault(r["kind"], [])
                 if r["topic_key"] is None
-                else keyed.setdefault(r["topic_key"], [])
+                else keyed.setdefault((r["kind"], r["topic_key"]), [])
             ).append(Row(r))
         return keyed, loose
 
     def conflicts(self):
-        """Topic keys carrying more than one promoted claim, key -> [rows].
-
-        Two agents can both be promoted on one key. Silently taking the newer
-        one is how the doc starts lying, so surface it and let a human decide.
-        """
+        """Return promoted claim/skill kind-key conflicts."""
         keyed, _ = self._promoted()
         return {k: v for k, v in keyed.items() if len(v) > 1}
 
     def doc(self):
-        """Render the promoted subset. This is what enters a model call.
-
-        Deliberately not a render of the log: the log is unbounded, and a doc
-        that grows with it is just the whole-history prompt wearing a hat.
-        """
+        """Render promoted claims and skills."""
         keyed, loose = self._promoted()
         clashing = {k: v for k, v in keyed.items() if len(v) > 1}
-        settled = sorted(
-            loose + [v[0] for k, v in keyed.items() if len(v) == 1],
-            key=lambda r: r.seq,
-        )
-        head = max([r.seq for r in loose] + [v[-1].seq for v in keyed.values()] or [0])
+        settled = {
+            kind: sorted(
+                loose.get(kind, []) + [v[0] for (row_kind, _), v in keyed.items()
+                                        if row_kind == kind and len(v) == 1],
+                key=lambda r: r.seq,
+            )
+            for kind in ("claim", "skill")
+        }
+        head = max([r.seq for rows in loose.values() for r in rows]
+                   + [v[-1].seq for v in keyed.values()] or [0])
 
         lines = []
-        if settled:
+        if settled["claim"]:
             lines.append("## Decisions")
-            lines += [f"- {_oneline(r.content)}" for r in settled]
+            lines += [f"- {_oneline(r.content)}" for r in settled["claim"]]
+        if settled["skill"]:
+            if lines:
+                lines.append("")
+            lines.append("## Skills")
+            lines += [f"- {_oneline(r.content)}" for r in settled["skill"]]
         if clashing:
             if lines:
                 lines.append("")
             lines.append("## Unresolved")
-            for key, rows in clashing.items():
-                lines.append(f"▲ {key} — {len(rows)} versions")
+            for (kind, key), rows in clashing.items():
+                lines.append(f"▲ {kind} {key} — {len(rows)} versions")
                 lines += [
                     f"  · {r.agent_id or 'unknown'}: {_oneline(r.content)}"
                     for r in rows
@@ -583,25 +640,22 @@ class MemorySurface:
             if lines:
                 lines.append("")
             lines.append("## Archive — not loaded; `naru search \"<terms>\"` to pull one back")
-            lines.append(", ".join(sorted(shelved)))
+            lines.append(", ".join(
+                key if kind == "claim" else f"skill:{key}"
+                for kind, key in sorted(shelved)
+            ))
 
         body = "\n".join(lines) or "(nothing promoted yet)"
         return f"# naru · seq {head} · ~{est(body)} tokens\n\n{body}\n"
 
     def _dropped_keys(self):
-        """Topic keys whose every claim was dropped.
-
-        A dropped fact stays in the log and stays searchable, but nothing tells
-        a fresh session it exists — so the trim reads as a delete. The key is
-        the breadcrumb: ~9% of the body's tokens, and enough to know what to
-        search for.
-        """
+        """Return claim/skill kind-key pairs whose rows were all dropped."""
         return {
-            r[0]
+            (r[0], r[1])
             for r in self.db.execute(
-                "SELECT topic_key FROM conversation_history"
-                " WHERE kind='claim' AND topic_key IS NOT NULL"
-                " GROUP BY topic_key HAVING max(promoted) = -1"
+                "SELECT kind, topic_key FROM conversation_history"
+                " WHERE kind IN ('claim','skill') AND topic_key IS NOT NULL"
+                " GROUP BY kind, topic_key HAVING max(promoted) = -1"
             ).fetchall()
         }
 
@@ -648,8 +702,8 @@ class ReadOnly:
     def search(self, query, k=5, kind=None, since=None, until=None):
         return self._ms.search(query, k=k, kind=kind, since=since, until=until)
 
-    def expand(self, lo, hi=None):
-        return self._ms.expand(lo, hi)
+    def expand(self, lo, hi=None, session_id=_ALL_SESSIONS):
+        return self._ms.expand(lo, hi, session_id)
 
     def outline(self):
         return self._ms.outline()
@@ -734,6 +788,89 @@ def demo():
         h.kind == "context_msg"
         for h in ms.search("economy OR toll", kind="context_msg")
     )
+
+    trace = ms.append(
+        "agent",
+        "trace-only needle",
+        kind="agent_reply",
+        session_id="trace",
+        created_at="2024-07-04T09:00:00",
+    )
+    trace_obs = ms.append(
+        "tool",
+        "trace-observation needle",
+        kind="agent_observation",
+        session_id="trace",
+        created_at="2024-07-04T09:01:00",
+    )
+    trace_payload = "trace-payload," * 400
+    trace_big = ms.append(
+        "tool",
+        "trace observation preview",
+        kind="agent_observation",
+        session_id="trace",
+        created_at="2024-07-04T09:02:00",
+        payload=trace_payload,
+    )
+    assert ms.search("trace-only") == [], "agent trace leaked into default search"
+    assert ms.search("trace-observation") == [], "agent observation leaked into search"
+    assert ms.search("trace-only", kind="agent_reply")[0].seq == trace
+    assert ms.search("trace-observation", kind="agent_observation")[0].seq == trace_obs
+    assert "trace-only" not in ms.outline(), "agent trace leaked into outline"
+    assert ms.expand(trace, trace_obs) == [], "agent trace leaked into default expand"
+    assert [r.seq for r in ms.expand(trace, trace_obs, session_id="trace")] == [
+        trace,
+        trace_obs,
+    ]
+    assert ms.sql_query(
+        "SELECT seq FROM conversation_history WHERE kind='agent_reply'"
+    )[0].seq == trace
+    stored_trace = ms.sql_query(
+        "SELECT content FROM conversation_history WHERE seq=?", (trace_big,)
+    )[0].content
+    assert f"ms.expand({trace_big}, session_id='trace')" in stored_trace
+    assert ms.expand(trace_big, session_id="trace")[0].content == trace_payload
+    state = ms.append(
+        "agent", '{"task":"find","verified":[],"next_action":"answer","status":"working"}',
+        kind="agent_state", session_id="trace", created_at="2024-07-04T09:03:00",
+        source_run_id="trace", source_seq_lo=trace, source_seq_hi=trace_obs,
+    )
+    assert ms.expand(state) == [], "agent state leaked into default expand"
+    assert ms.expand(state, session_id="trace")[0].source_seq_lo == trace
+    for source in (("trace", trace, None), ("", trace, trace_obs), ("wrong", trace, trace_obs), ("trace", trace_obs, trace)):
+        try:
+            ms.append("agent", "bad source", source_run_id=source[0], source_seq_lo=source[1], source_seq_hi=source[2])
+            assert False, source
+        except ValueError:
+            pass
+
+    visible_lo = ms.append(
+        "user", "visible before", kind="context_msg", session_id="s2",
+        created_at="2024-07-05T09:00:00",
+    )
+    ms.append(
+        "agent", "hidden reply", kind="agent_reply", session_id="run",
+        created_at="2024-07-05T09:01:00",
+    )
+    ms.append(
+        "tool", "hidden observation", kind="agent_observation", session_id="run",
+        created_at="2024-07-05T09:02:00",
+    )
+    visible_hi = ms.append(
+        "user", "visible after", kind="context_msg", session_id="s2",
+        created_at="2024-07-05T09:03:00",
+    )
+    handle = f"ms.expand({visible_lo}, {visible_hi}, session_id='s2')"
+    assert handle in ms.outline(), "outline did not scope its recovery handle"
+    assert [r.seq for r in ms.expand(visible_lo, visible_hi)] == [visible_lo, visible_hi]
+    visible = ms.expand(visible_lo, visible_hi, session_id="s2")
+    assert [r.seq for r in visible] == [
+        visible_lo,
+        visible_hi,
+    ]
+    assert all(not r.kind.startswith("agent_") for r in visible)
+    unscoped = ms.append("note", "unscoped row", kind="note")
+    assert ms.expand(unscoped, session_id=None)[0].seq == unscoped
 
     # MATERIALIZE: exact span, verbatim
     span = ms.expand(1, 2)
@@ -836,14 +973,24 @@ def demo():
         created_at="2026-08-27T10:03:00",
     )
     ms.decide(rival, True)
-    assert set(ms.conflicts()) == {"store.engine"}, ms.conflicts()
+    assert set(ms.conflicts()) == {("claim", "store.engine")}, ms.conflicts()
     d2 = ms.doc()
     assert "## Unresolved" in d2 and "store.engine" in d2, d2
     assert "gemini" in d2 and "claude-opus" in d2, "both sides must show"
     assert "## Decisions" not in d2, "the only promoted key is in conflict"
 
-    # decide() only moves claims — it must not touch ordinary log rows
+    # decide() only moves curation rows — it must not touch ordinary log rows
     assert ms.decide(s1, True) == 0, "decide() reached a non-claim row"
+
+    skill = ms.append(
+        "agent", "Use the Event Log before answering.", kind="skill",
+        topic_key="store.engine", created_at="2026-08-27T10:03:30",
+    )
+    assert skill in [row.seq for row in ms.pending()], "pending skill missing"
+    assert ms.decide(skill, True) == 1
+    assert "## Skills" in ms.doc() and "Use the Event Log" in ms.doc()
+    assert ("claim", "store.engine") in ms.conflicts()
+    assert ("skill", "store.engine") not in ms.conflicts()
 
     # a promoted fact must be revisable: retire the loser, conflict clears
     assert ms.decide(rival, False) == 1, "a promoted claim must be retirable"
@@ -855,8 +1002,10 @@ def demo():
     # a wholly-dropped key leaves a breadcrumb; a key still promoted does not
     gone = ms.append("agent", "Retry budget was 5.", kind="claim", topic_key="retry.budget")
     ms.decide(gone, False)
+    gone_skill = ms.append("agent", "Old procedure.", kind="skill", topic_key="retry.budget")
+    ms.decide(gone_skill, False)
     d3 = ms.doc()
-    assert "## Archive" in d3 and "retry.budget" in d3, d3
+    assert "## Archive" in d3 and "retry.budget" in d3 and "skill:retry.budget" in d3, d3
     assert "Retry budget" not in d3, "the archive must list keys, not bodies"
     assert "store.engine" not in d3.split("## Archive")[1], "a live key must not be archived"
 
@@ -890,6 +1039,41 @@ def demo():
         created_at="2000-01-01T00:00:00",
     )
     ms.decide(old, True)
+    old_skill = ms.append(
+        "agent", "ancient decided skill", kind="skill", agent_id="x",
+        created_at="2000-01-01T00:00:00",
+    )
+    ms.decide(old_skill, True)
+    evidence_run = "old-run"
+    evidence_reply = ms.append(
+        "agent", "old reply", kind="agent_reply", session_id=evidence_run,
+        created_at="2000-01-01T00:00:00",
+    )
+    evidence_obs = ms.append(
+        "tool", "old observation", kind="agent_observation", session_id=evidence_run,
+        created_at="2000-01-01T00:00:01",
+    )
+    cited = ms.append(
+        "agent", "claim with trace", kind="claim", topic_key="cited.trace",
+        created_at="2026-08-27T10:05:00", source_run_id=evidence_run,
+        source_seq_lo=evidence_reply, source_seq_hi=evidence_obs,
+    )
+    ms.decide(cited, True)
+    dropped_run = "dropped-run"
+    dropped_reply = ms.append(
+        "agent", "dropped old reply", kind="agent_reply", session_id=dropped_run,
+        created_at="2000-01-01T00:00:00",
+    )
+    dropped_obs = ms.append(
+        "tool", "dropped old observation", kind="agent_observation", session_id=dropped_run,
+        created_at="2000-01-01T00:00:01",
+    )
+    dropped_cited = ms.append(
+        "agent", "dropped claim with trace", kind="claim", topic_key="dropped.trace",
+        created_at="2026-08-27T10:05:00", source_run_id=dropped_run,
+        source_seq_lo=dropped_reply, source_seq_hi=dropped_obs,
+    )
+    ms.decide(dropped_cited, False)
     stale_note = ms.append(
         "note", "ancient note", kind="note", created_at="2000-01-01T00:00:00"
     )
@@ -900,18 +1084,31 @@ def demo():
     before = ms.sql_query("SELECT COUNT(*) n FROM conversation_history")[0].n
     assert n_doomed + n_kept == before, (n_doomed, n_kept, before)
     removed = ms.prune("2001-01-01T00:00:00")
-    assert removed == 1, f"expected only the note to go, removed {removed}"
+    assert removed == 3, f"expected note and dropped evidence to go, removed {removed}"
     assert n_doomed == removed, f"preview said {n_doomed}, prune took {removed}"
     assert ms.expand(old), "prune deleted a promoted claim"
+    assert ms.expand(old_skill), "prune deleted a promoted skill"
+    assert [row.seq for row in ms.expand(
+        evidence_reply, evidence_obs, session_id=evidence_run
+    )] == [evidence_reply, evidence_obs], "prune deleted promoted provenance"
+    assert ms.expand(dropped_reply, dropped_obs, session_id=dropped_run) == [], (
+        "prune kept dropped provenance"
+    )
     assert ms.expand(stale_note) == [], "prune left the ordinary old row"
     assert "ancient decided claim" in ms.doc()
 
-    # the curation columns are indexed, or every doc render is a full scan
     idx = {
         r["name"]
         for r in ms.db.execute("SELECT name FROM sqlite_master WHERE type='index'")
     }
-    assert {"ix_promoted", "ix_topic_key"} <= idx, idx
+    assert {"ix_promoted", "ix_topic_key", "ix_promoted_sources"} <= idx, idx
+    plan = " ".join(r["detail"] for r in ms.db.execute(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM conversation_history AS curated "
+        "WHERE curated.kind IN ('claim','skill') AND curated.promoted=1 "
+        "AND curated.source_run_id=? AND ? BETWEEN curated.source_seq_lo "
+        "AND curated.source_seq_hi", (evidence_run, evidence_reply)
+    ))
+    assert "ix_promoted_sources" in plan, plan
 
     # ---- migration: a store created BEFORE the curation columns existed ----
     # Without this the ALTER TABLE branch never runs in the suite, because a
@@ -935,11 +1132,12 @@ def demo():
 
     m3 = MemorySurface(str(legacy))
     cols = {r["name"] for r in m3.db.execute("PRAGMA table_info(conversation_history)")}
-    assert {"agent_id", "promoted", "topic_key", "base_seq"} <= cols, cols
+    assert {"agent_id", "promoted", "topic_key", "base_seq", "source_run_id", "source_seq_lo", "source_seq_hi"} <= cols, cols
     assert m3.expand(1)[0].content == "legacy row here", "migration lost a row"
     assert m3.search("legacy"), "migration lost the FTS index"
     assert m3.expand(1)[0].promoted == 0, "migrated rows must default to pending"
-    MemorySurface(str(legacy))  # re-opening a migrated store must be a no-op
+    m4 = MemorySurface(str(legacy))
+    m4.close()
 
     # section 2.2: the Event Log is READ-ONLY from the kernel
     ro = ms.readonly()
@@ -966,6 +1164,11 @@ def demo():
 
     # repr stays small (token-frugal)
     assert len(repr(hits[0])) < 140
+
+    owned_blobs = ms.blobs
+    m3.close()
+    ms.close()
+    assert not owned_blobs.exists(), "close left owned temporary blobs"
 
     print("ok — all checks passed")
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """naru — one curated doc, shared across sessions, models and harnesses.
 
-Agents propose. You decide. Only what you promote reaches the doc, which is
+Agents propose claims and skills. You decide. Only what you promote reaches the doc, which is
 why the doc stays small while the log grows without bound.
 
     naru claim "<text>" [--key k] [--by agent]  # an agent proposes a fact
+    naru skill "<procedure>" [--key k] [--by agent]
     naru inbox                                  # decide: promote / drop / skip
     naru inject [path]                          # render the doc: stdout or file
     naru promote SEQ --yes | naru drop SEQ --yes    # decide without the prompt
@@ -13,7 +14,7 @@ why the doc stays small while the log grows without bound.
 That is a speed bump so a tool loop cannot promote by accident, not a security
 boundary — anything that can run this CLI can also pass --yes.
 
-To revise a promoted fact: `naru drop <old> --yes`, then claim and promote the
+To revise a promoted item: `naru drop <old> --yes`, then propose and promote the
 new one. Superseding without retiring leaves both promoted and parks the key
 under ## Unresolved.
 
@@ -24,20 +25,20 @@ pointing it at a CLAUDE.md you maintain by hand is safe.
     naru add "sprint planning" < notes.md   # or: naru add "topic" "text"
     naru search "context budget"
     naru outline
-    naru show 12 18
+    naru show 12 18 [--run ID]
     naru prune [days] [--dry-run]   # default 30; deletes older rows + index
     naru gc                          # remove orphaned blob dirs
     naru stats [days]                # spill/recovery observability
 
 Harness-agnostic by construction: anything that can run a shell command can
-both write claims and read the doc. `inject` targets the context file the
+both write proposals and read the doc. `inject` targets the context file the
 harness already reads.
 
     naru inject CLAUDE.md        # Claude Code
     naru inject AGENTS.md        # Codex, DeepSeek Harness, most others
     naru inject .cursorrules     # Cursor
 
-Notes, claims and hook-spilled tool output share ~/.naru/log.db (override with
+Notes, proposals and hook-spilled tool output share ~/.naru/log.db (override with
 NARU_DB). Recall prints matching lines only, never the whole store, so pulling
 a fact back into a session costs a few hundred tokens instead of everything you
 ever wrote.
@@ -52,7 +53,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import metrics
-from ms import DEFAULT_DB, MemorySurface
+from ms import BEGIN, DEFAULT_DB, END, MemorySurface
 
 DB = pathlib.Path(os.environ.get("NARU_NOTES", DEFAULT_DB))
 
@@ -70,13 +71,12 @@ def _opt(args, name, default=None):
     if name not in args:
         return default
     i = args.index(name)
-    val = args[i + 1] if i + 1 < len(args) else None
+    if i + 1 == len(args) or not args[i + 1].strip() or args[i + 1].startswith("--"):
+        del args[i]
+        raise ValueError(f"{name} needs a value")
+    val = args[i + 1]
     del args[i : i + 2]
     return val
-
-
-BEGIN = "<!-- naru:begin -->"
-END = "<!-- naru:end -->"
 
 
 def _splice(path, text):
@@ -151,29 +151,48 @@ def main(argv):
         ]
         print(f"saved {len(seqs)} chunk(s) as seq {seqs[0]}-{seqs[-1]} -> {DB}")
 
-    elif cmd == "claim":
-        # An agent proposes a fact. A claim never reaches the doc on its own,
-        # which is what makes this safe to wire into a harness's tool loop.
-        # `promote` is the step that needs a person — see below for how weak
-        # that gate really is.
-        key, by, base = _opt(args, "--key"), _opt(args, "--by"), _opt(args, "--base")
+    elif cmd in ("claim", "skill"):
+        try:
+            key, by, base = _opt(args, "--key"), _opt(args, "--by"), _opt(args, "--base")
+            run, source = _opt(args, "--run"), _opt(args, "--source")
+        except ValueError as e:
+            print(e, file=sys.stderr)
+            return 2
         text = " ".join(args).strip() or sys.stdin.read().strip()
         if not text:
-            print('need text: naru claim "<text>" [--key k]', file=sys.stderr)
+            print(f'need text: naru {cmd} "<text>" [--key k]', file=sys.stderr)
             return 2
-        seq = ms.append(
-            "agent",
-            text,
-            kind="claim",
-            agent_id=by,
-            topic_key=key,
-            # The DOC version, not the log head. Staleness means "the doc
-            # changed under the author"; an unrelated note or a spilled tool
-            # result must not read as though it had.
-            base_seq=int(base) if base else ms.doc_version(),
-            created_at=datetime.now().isoformat(timespec="seconds"),
-        )
-        print(f"claim {seq} pending — `naru inbox` to decide")
+        if bool(run) != bool(source):
+            print("--run and --source LO:HI must be used together", file=sys.stderr)
+            return 2
+        if source:
+            try:
+                lo, hi = (int(x) for x in source.split(":", 1))
+                if lo > hi:
+                    raise ValueError
+            except ValueError:
+                print("--source must be LO:HI with LO <= HI", file=sys.stderr)
+                return 2
+        else:
+            lo = hi = None
+        if base:
+            try:
+                base_seq = int(base)
+            except ValueError:
+                print("--base must be an integer", file=sys.stderr)
+                return 2
+        else:
+            base_seq = ms.doc_version()
+        try:
+            seq = ms.append(
+                "agent", text, kind=cmd, agent_id=by, topic_key=key,
+                base_seq=base_seq, created_at=datetime.now().isoformat(timespec="seconds"),
+                source_run_id=run, source_seq_lo=lo, source_seq_hi=hi,
+            )
+        except ValueError as e:
+            print(e, file=sys.stderr)
+            return 2
+        print(f"{cmd} {seq} pending — `naru inbox` to decide")
 
     elif cmd in ("promote", "drop"):
         args = list(args)
@@ -195,8 +214,8 @@ def main(argv):
             return 2
         if not ms.decide(int(args[0]), cmd == "promote"):
             print(
-                f"seq {args[0]} is not a claim this can {cmd}"
-                " (already decided, or not a claim)",
+                f"seq {args[0]} is not a pending claim or skill this can {cmd}"
+                " (already decided, or not a curation item)",
                 file=sys.stderr,
             )
             return 1
@@ -210,7 +229,7 @@ def main(argv):
         version = ms.doc_version()
         for i, c in enumerate(pend, 1):
             print(
-                f"[{i}/{len(pend)}] seq {c.seq} · {c.agent_id or '?'} · "
+                f"[{i}/{len(pend)}] {c.kind} seq {c.seq} · {c.agent_id or '?'} · "
                 f"{(c.created_at or '')[:16]}"
                 + (f" · key: {c.topic_key}" if c.topic_key else "")
             )
@@ -222,6 +241,11 @@ def main(argv):
                     f"the doc is now at {version}"
                 )
             print(f"  + {c.content.strip()}")
+            if c.source_run_id:
+                print(
+                    f"  source: naru show {c.source_seq_lo} {c.source_seq_hi} "
+                    f"--run {c.source_run_id}"
+                )
             try:
                 ans = input("  promote / drop / skip ? ").strip().lower()
             except EOFError:
@@ -277,13 +301,22 @@ def main(argv):
             )
 
     elif cmd == "show":
-        if not args:
-            print("need a seq: naru show 12 [18]", file=sys.stderr)
+        try:
+            run = _opt(args, "--run")
+        except ValueError as e:
+            print(e, file=sys.stderr)
             return 2
-        lo = int(args[0])
-        hi = int(args[1]) if len(args) > 1 else None
+        if not args:
+            print("need a seq: naru show 12 [18] [--run ID]", file=sys.stderr)
+            return 2
+        try:
+            lo = int(args[0])
+            hi = int(args[1]) if len(args) > 1 else None
+        except ValueError:
+            print("show sequence values must be integers", file=sys.stderr)
+            return 2
         metrics.record("show", seq=lo)
-        for r in ms.expand(lo, hi):
+        for r in ms.expand(lo, hi, session_id=run) if run else ms.expand(lo, hi):
             print(f"--- [{r.seq}] {r.created_at} | {r.session_id}")
             print(r.content)
 
@@ -294,7 +327,7 @@ def main(argv):
         n_doomed, b_doomed, n_kept = ms.prune_preview(cutoff)
         print(f"cutoff {cutoff[:10]} (older than {days} days)")
         print(f"  would remove : {n_doomed} rows, {b_doomed:,} chars")
-        print(f"  would keep   : {n_kept} rows (promoted claims are never aged out)")
+        print(f"  would keep   : {n_kept} rows (promoted claims, skills, and evidence are never aged out)")
         if dry:
             print("  --dry-run: nothing deleted")
             return 0
@@ -503,6 +536,9 @@ def _demo(real_stdin):
 
     # _apply is the inbox's decision logic, reachable without a terminal
     ms_a = store()
+    escaped = ms_a.append("agent", f"literal {BEGIN} {END}", kind="claim")
+    assert _apply(ms_a, escaped, "p") == "promoted"
+    assert BEGIN not in ms_a.doc() and END not in ms_a.doc()
     s = ms_a.append(
         "agent",
         "apply path",
@@ -538,6 +574,7 @@ def _demo(real_stdin):
     assert "Always run the tests" in body, "inject destroyed a hand-written file"
     assert "Store is SQLite" in body, "inject did not add the doc"
     assert body.count(BEGIN) == 1 and body.count(END) == 1, body
+    assert "naru: begin" in body and "naru: end" in body, body
 
     # re-injecting replaces the block in place, it does not stack copies
     assert main(["inject", str(hand)]) == 0
@@ -551,6 +588,47 @@ def _demo(real_stdin):
     with contextlib.redirect_stdout(buf):
         main(["inject"])
     assert "not a claim" not in buf.getvalue(), "a note leaked into the doc"
+
+    trace_run = "trace-run"
+    reply = store().append(
+        "agent", "```python\\nprint('evidence')\\n```", kind="agent_reply",
+        session_id=trace_run, created_at="2026-08-27T12:00:00",
+    )
+    observation = store().append(
+        "tool", "evidence", kind="agent_observation", session_id=trace_run,
+        created_at="2026-08-27T12:00:01",
+    )
+    assert main([
+        "claim", "trace fact", "--key", "trace.fact", "--run", trace_run,
+        "--source", f"{reply}:{observation}",
+    ]) == 0
+    trace_claim = store().pending()[-1]
+    assert trace_claim.source_run_id == trace_run
+    assert (trace_claim.source_seq_lo, trace_claim.source_seq_hi) == (reply, observation)
+    assert main(["claim", "partial", "--run", trace_run]) == 2
+    assert main(["claim", "partial", "--source", f"{reply}:{observation}"]) == 2
+    assert main(["claim", "bad", "--run", trace_run, "--source", "4:nope"]) == 2
+    assert main(["claim", "wrong run", "--run", "wrong", "--source", f"{reply}:{observation}"]) == 2
+    assert main(["claim", "bad", "--base", "nope"]) == 2
+    assert main(["claim", "missing", "--key"]) == 2
+    assert main(["claim", "missing", "--key", ""]) == 2
+    assert main(["skill", "missing", "--run"]) == 2
+    assert main(["show", str(reply), "--run"]) == 2
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["inbox"]) == 0
+    assert f"claim seq {trace_claim.seq}" in buf.getvalue()
+    assert f"naru show {reply} {observation} --run {trace_run}" in buf.getvalue()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["show", str(reply), str(observation), "--run", trace_run]) == 0
+    assert "evidence" in buf.getvalue()
+
+    assert main(["skill", "Search the Event Log first.", "--key", "lookup"]) == 0
+    skill = store().pending()[-1]
+    assert skill.kind == "skill" and "Search the Event Log" not in store().doc()
+    assert main(["promote", str(skill.seq), "--yes"]) == 0
+    assert "## Skills" in store().doc() and "Search the Event Log" in store().doc()
 
     # inbox at EOF must not hang and must not decide anything on its own
     pre = len(store().pending())

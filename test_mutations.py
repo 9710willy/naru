@@ -121,6 +121,12 @@ MUTATIONS = [
         'f"exceeded {self.timeout}s wall clock"\n            if not hung',
     ),
     (
+        "a first prose reply is banked as the answer",
+        "agent.py",
+        "if turn == 0 and turn < max_turns - 1:",
+        "if False:",
+    ),
+    (
         "agent.py never takes the sandbox branch",
         "agent.py",
         'if os.environ.get("NARU_KERNEL") == "sandbox" and path and path != ":memory:":',
@@ -131,6 +137,54 @@ MUTATIONS = [
         "agent.py",
         "        kernel.close()",
         "        pass",
+    ),
+    (
+        "agent trace uses a local sequence",
+        "agent.py",
+        "reply_seq = ms.append(",
+        "reply_seq = 0\n            ms.append(",
+    ),
+    (
+        "invalid headline state reaches the log",
+        "agent.py",
+        "or not isinstance(verified, list)",
+        "or False",
+    ),
+    (
+        "headline state is never persisted",
+        "agent.py",
+        'kind="agent_state",',
+        'kind="agent_state_off",',
+    ),
+    (
+        "default search exposes agent trace",
+        "ms.py",
+        "return f\"({column} IS NULL OR {column} NOT GLOB 'agent_*')\"",
+        "return \"1\"",
+    ),
+    (
+        "session-scoped recovery includes other rows",
+        "ms.py",
+        'where.append("session_id IS ?")\n            params.append(session_id)',
+        "pass",
+    ),
+    (
+        "source range accepts another run",
+        "ms.py",
+        'if {r["seq"] for r in rows} != {source_seq_lo, source_seq_hi}:',
+        "if False:",
+    ),
+    (
+        "externalized trace pointer loses its session",
+        "ms.py",
+        'f"-> ms.expand({seq}{scope})]"',
+        'f"-> ms.expand({seq})]"',
+    ),
+    (
+        "folded payload loses its trace session",
+        "eviction.py",
+        "fold_payloads(older, recovery_session)",
+        "fold_payloads(older)",
     ),
     (
         "callback dispatch is unguarded in the parent",
@@ -180,6 +234,24 @@ MUTATIONS = [
             "            (before_iso,),\n        ).fetchone()"
         ),
     ),
+    (
+        "prune deletes promoted provenance",
+        "ms.py",
+        "curated.source_run_id = conversation_history.session_id",
+        "0",
+    ),
+    (
+        "prune keeps dropped provenance",
+        "ms.py",
+        "curated.promoted = 1",
+        "curated.promoted <> 0",
+    ),
+    (
+        "promoted provenance has no range index",
+        "ms.py",
+        "CREATE INDEX IF NOT EXISTS ix_promoted_sources",
+        "CREATE INDEX IF NOT EXISTS ix_promoted_sources_off",
+    ),
 ]
 
 
@@ -205,6 +277,7 @@ def run_mutated(target, find, replace):
         "ms.py": ["ms.py"],
         "kernel.py": ["kernel.py"],
         "agent.py": ["agent.py"],
+        "eviction.py": ["eviction.py"],
     }.get(target, ["bench.py", "--selfcheck"])
     return subprocess.run(
         [sys.executable, *cmd], cwd=work, capture_output=True, text=True, check=False

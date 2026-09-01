@@ -1,0 +1,21 @@
+{
+  "before": {
+    "mean_total_prompt_tokens": 11179.7,
+    "mean_peak_prompt_tokens": 2948.8,
+    "mean_final_view_tokens": 2787.0
+  },
+  "after": {
+    "mean_total_prompt_tokens": 1992.1,
+    "mean_peak_prompt_tokens": 395.0,
+    "mean_final_view_tokens": 180.0
+  },
+  "reduction_percent": {
+    "mean_total_prompt_tokens": 82.2,
+    "mean_peak_prompt_tokens": 86.6,
+    "mean_final_view_tokens": 93.5
+  },
+  "answer_quality": {
+    "status": "unmeasured",
+    "reason": "Claude CLI was logged out and Codex returned HTTP 401 for its saved key"
+  }
+}
