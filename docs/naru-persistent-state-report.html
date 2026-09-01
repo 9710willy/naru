@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Naru persistent state and skills report</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #5c667a;
+      --line: #dbe1ea;
+      --accent: #4355db;
+      --accent-soft: #e8ebff;
+      --good: #087f5b;
+      --good-soft: #dff7ee;
+      --warn: #9a6700;
+      --warn-soft: #fff4ce;
+      --shadow: 0 12px 32px rgb(30 42 70 / 9%);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #10131b;
+        --panel: #191e2a;
+        --text: #eef1f7;
+        --muted: #adb6c7;
+        --line: #343c4c;
+        --accent: #aab4ff;
+        --accent-soft: #292f55;
+        --good: #62d9b2;
+        --good-soft: #173d34;
+        --warn: #f4ca64;
+        --warn-soft: #443716;
+        --shadow: none;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 48px 0 80px;
+    }
+
+    h1, h2, h3 { line-height: 1.18; }
+    h1 { max-width: 760px; margin: 14px 0; font-size: clamp(2.25rem, 6vw, 4.5rem); letter-spacing: -0.045em; }
+    h2 { margin: 0 0 18px; font-size: 1.55rem; }
+    h3 { margin: 0 0 8px; font-size: 1rem; }
+    p { margin: 0 0 16px; }
+    a { color: var(--accent); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; }
+
+    .eyebrow, .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      font-size: .78rem;
+      font-weight: 750;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow { color: var(--accent); }
+    .badge { padding: 6px 10px; background: var(--good-soft); color: var(--good); }
+    .lede { max-width: 760px; color: var(--muted); font-size: 1.2rem; }
+    .meta { display: flex; flex-wrap: wrap; gap: 10px 20px; margin-top: 24px; color: var(--muted); font-size: .9rem; }
+
+    section { margin-top: 56px; }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+    }
+
+    .metric { padding: 22px; }
+    .metric strong { display: block; color: var(--good); font-size: 2.2rem; line-height: 1; }
+    .metric span { display: block; margin-top: 9px; color: var(--muted); }
+
+    .flow {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+      align-items: stretch;
+      gap: 12px;
+    }
+
+    .flow-card { padding: 22px; }
+    .flow-card ul { margin: 10px 0 0; padding-left: 20px; }
+    .flow-card.current { border-color: var(--accent); }
+    .arrow { align-self: center; color: var(--accent); font-size: 1.8rem; font-weight: 800; }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 14px 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: .78rem; letter-spacing: .04em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    td strong { color: var(--good); }
+
+    .sources, .code-map {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .source, .code-item { padding: 20px; }
+    .source p, .code-item p { margin: 0; color: var(--muted); }
+
+    .timeline { margin: 0; padding: 0; list-style: none; counter-reset: steps; }
+    .timeline li { position: relative; margin-left: 15px; padding: 0 0 26px 34px; border-left: 2px solid var(--line); counter-increment: steps; }
+    .timeline li:last-child { padding-bottom: 0; border-color: transparent; }
+    .timeline li::before {
+      content: counter(steps);
+      position: absolute;
+      left: -17px;
+      top: -2px;
+      width: 32px;
+      height: 32px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 800;
+    }
+    .timeline p { margin: 4px 0 0; color: var(--muted); }
+
+    .inbox { padding: 22px; }
+    .bar { display: flex; height: 22px; margin: 16px 0 10px; overflow: hidden; border-radius: 999px; background: var(--line); }
+    .bar span:first-child { width: 75.4%; background: var(--accent); }
+    .bar span:last-child { width: 24.6%; background: var(--good); }
+    .legend { display: flex; flex-wrap: wrap; gap: 10px 22px; color: var(--muted); font-size: .9rem; }
+
+    .proof { padding: 22px; }
+    pre { margin: 0; overflow-x: auto; white-space: pre-wrap; color: var(--good); font: 14px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .note { padding: 16px 18px; border-left: 4px solid var(--warn); border-radius: 8px; background: var(--warn-soft); color: var(--text); }
+    footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: .9rem; }
+
+    @media (max-width: 760px) {
+      main { padding-top: 28px; }
+      .metrics, .sources, .code-map, .flow { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); justify-self: center; }
+    }
+
+    @media print {
+      body { background: white; color: black; }
+      main { width: 100%; padding: 0; }
+      .panel { box-shadow: none; break-inside: avoid; }
+      a { color: black; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <span class="eyebrow">Naru change report</span>
+      <h1>Persistent agent state without a growing prompt</h1>
+      <p class="lede">Naru now keeps a compact current state in the active prompt. It stores the full agent trace in SQLite and restores older details through an exact run-scoped pointer.</p>
+      <div class="meta">
+        <span class="badge">Shipped and verified</span>
+        <span>September 1, 2026</span>
+        <a href="https://github.com/9710willy/naru/commit/f742c45d026ef5475ef2bfbc451400a1f99a6404">Implementation commit f742c45</a>
+      </div>
+    </header>
+
+    <section aria-labelledby="result-heading">
+      <h2 id="result-heading">Measured result</h2>
+      <div class="metrics">
+        <article class="metric panel"><strong>93.5%</strong><span>smaller final active view</span></article>
+        <article class="metric panel"><strong>86.6%</strong><span>lower peak prompt size</span></article>
+        <article class="metric panel"><strong>82.2%</strong><span>less total prompt input</span></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="behavior-heading">
+      <h2 id="behavior-heading">What changed for an agent</h2>
+      <div class="flow">
+        <article class="flow-card panel">
+          <h3>Previous prompt</h3>
+          <ul>
+            <li>Prior trace kept growing</li>
+            <li>State was free text</li>
+            <li>Recovery had loose scope</li>
+          </ul>
+        </article>
+        <div class="arrow" aria-hidden="true">→</div>
+        <article class="flow-card current panel">
+          <h3>Current prompt</h3>
+          <ul>
+            <li>Validated current state</li>
+            <li>Latest observation</li>
+            <li>Exact pointer to older trace</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="table-wrap panel" style="margin-top: 16px">
+        <table>
+          <thead><tr><th>Area</th><th>Previous behavior</th><th>Current behavior</th></tr></thead>
+          <tbody>
+            <tr><td>State</td><td>Free text</td><td>Canonical JSON with <code>task</code>, <code>verified</code>, <code>next_action</code>, and <code>status</code></td></tr>
+            <tr><td>Trace</td><td>More history entered each prompt</td><td>Replies and observations stay in the Event Log</td></tr>
+            <tr><td>Recovery</td><td>Older context had loose boundaries</td><td>A run ID and exact sequence range select the source</td></tr>
+            <tr><td>Skills</td><td>No skill proposal type</td><td><code>naru skill</code> sends a procedure through human review</td></tr>
+            <tr><td>Search</td><td>Internal trace could appear</td><td>Agent trace stays hidden unless the request has a run scope</td></tr>
+            <tr><td>Pruning</td><td>Age could remove cited evidence</td><td>Evidence for promoted claims and skills survives normal pruning</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="research-heading">
+      <h2 id="research-heading">How the research shaped the design</h2>
+      <div class="sources">
+        <article class="source panel">
+          <h3><a href="https://arxiv.org/html/2608.27454v1">WikiSkill</a></h3>
+          <p>Keep raw experience recoverable. Promote useful procedures into a curated skill collection. Naru maps this to trace rows, <code>naru skill</code>, and the existing inbox.</p>
+        </article>
+        <article class="source panel">
+          <h3><a href="https://arxiv.org/html/2608.26263">SKILL.state</a></h3>
+          <p>Separate stable instructions from compact changing state. Naru now carries current state and the latest observation instead of a growing reasoning history.</p>
+        </article>
+        <article class="source panel">
+          <h3><a href="https://github.com/Tencent/ContextPilot">ContextPilot</a></h3>
+          <p>Move older details out of active context and restore selected parts when needed. Naru uses scoped Event Log pointers for this soft offload.</p>
+        </article>
+        <article class="source panel">
+          <h3><a href="https://github.com/mohammadtavakoli78/BEAM">BEAM</a></h3>
+          <p>Measure long-term memory behavior with repeatable tasks. Naru adds a standard-library adapter and a fixed six-turn replay for prompt measurements.</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="journey-heading">
+      <h2 id="journey-heading">How we got here</h2>
+      <ol class="timeline">
+        <li><strong>Read the repository decisions and clear the inbox.</strong><p>We reviewed 65 items. We kept 16 and dropped 49.</p></li>
+        <li><strong>Study the papers and ContextPilot.</strong><p>The common shape was compact state, recoverable experience, and curated procedures.</p></li>
+        <li><strong>Keep one store.</strong><p>The existing SQLite Event Log already owned ordering, recovery, pruning, and promotion. The change reuses it.</p></li>
+        <li><strong>Record a baseline.</strong><p>A fixed replay covered ten BEAM question types with six turns each.</p></li>
+        <li><strong>Implement and review.</strong><p>The first review found seven faults. We fixed marker safety, temporary cleanup, run mixing, empty benchmark slices, sandbox cleanup, retry trace loss, and source lookup speed.</p></li>
+        <li><strong>Rerun the full checks and push.</strong><p>All offline checks passed. The branch now tracks GitHub at the same commit.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="numbers-heading">
+      <h2 id="numbers-heading">Before and after</h2>
+      <div class="table-wrap panel">
+        <table>
+          <thead><tr><th>Measure</th><th>Baseline</th><th>Current</th><th>Change</th></tr></thead>
+          <tbody>
+            <tr><td>Final active view</td><td>2,787 tokens</td><td><strong>180 tokens</strong></td><td>93.5% smaller</td></tr>
+            <tr><td>Peak prompt</td><td>2,948.8 tokens</td><td><strong>395.0 tokens</strong></td><td>86.6% lower</td></tr>
+            <tr><td>Total prompt input</td><td>11,179.7 tokens</td><td><strong>1,992.1 tokens</strong></td><td>82.2% lower</td></tr>
+            <tr><td>Turns per question</td><td>6</td><td>6</td><td>Unchanged</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="note" style="margin-top: 16px">This replay measures context size. Live answer quality remains unmeasured. The Claude CLI needs login, and Codex returned HTTP 401 for its saved key.</p>
+    </section>
+
+    <section aria-labelledby="code-heading">
+      <h2 id="code-heading">Where the behavior lives</h2>
+      <div class="code-map">
+        <article class="code-item panel"><h3><a href="../agent.py">agent.py</a></h3><p>Validates state, records replies and observations, and builds the bounded next prompt.</p></article>
+        <article class="code-item panel"><h3><a href="../ms.py">ms.py</a></h3><p>Stores source ranges, renders skills, protects promoted evidence, and neutralizes block markers.</p></article>
+        <article class="code-item panel"><h3><a href="../naru.py">naru.py</a></h3><p>Adds skill proposals, source options, run-scoped inspection, and CLI validation.</p></article>
+        <article class="code-item panel"><h3><a href="../eviction.py">eviction.py</a></h3><p>Carries the run scope through folded trace and rejects mixed-run folds.</p></article>
+        <article class="code-item panel"><h3><a href="../beam.py">beam.py</a></h3><p>Runs the BEAM adapter, fixed replay, and local self-check.</p></article>
+        <article class="code-item panel"><h3><a href="adr/0008-persistent-state-and-skills.md">ADR 0008</a></h3><p>Records the durable choice to keep state, trace, and skills in the Event Log.</p></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="inbox-heading">
+      <h2 id="inbox-heading">Inbox result</h2>
+      <div class="inbox panel">
+        <strong>49 of 65 items dropped</strong>
+        <div class="bar" role="img" aria-label="49 items dropped and 16 items kept"><span></span><span></span></div>
+        <div class="legend"><span>75.4% dropped</span><span>24.6% kept</span></div>
+        <p style="margin-top: 16px">Claims <code>698</code> and <code>699</code> describe the new agent state and skill behavior. They remain pending for human review.</p>
+      </div>
+    </section>
+
+    <section aria-labelledby="proof-heading">
+      <h2 id="proof-heading">Proof</h2>
+      <div class="proof panel">
+        <pre>ok — all checks passed
+ok — kernel checks passed (in-process and sandboxed)
+ok — agent checks passed
+ok — BEAM adapter self-check passed
+ok — 35/35 mutations caught
+reviewed by gpt-5.6-luna: no flags
+comment audit: no flags</pre>
+      </div>
+    </section>
+
+    <footer>
+      <p><strong>Git branch:</strong> <a href="https://github.com/9710willy/naru/tree/feat/persistent-state-skills"><code>feat/persistent-state-skills</code></a></p>
+      <p><strong>Measurement data:</strong> <a href="../.audit/beam-comparison.json"><code>.audit/beam-comparison.json</code></a></p>
+      <p>The existing README edit stayed outside the implementation commit.</p>
+    </footer>
+  </main>
+</body>
+</html>
