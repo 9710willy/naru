@@ -20,6 +20,12 @@ When you open a writable Event Log, Naru creates one random `store_uuid` in
 the `naru_meta` table if it does not exist. It derives `store_id` from the
 resolved database path and that UUID.
 
+Naru also reads the earlier key/value metadata layout. Existing stores keep
+their UUID and do not need a schema rewrite.
+
+After the UUID exists, opening the store does not write the metadata row again.
+This lets read-only commands use an up-to-date store on a read-only mount.
+
 Version 2 show receipts record `store_id`. File-backed stores also use it in
 their blob directory name. `naru gc` scans only that directory and deletes
 only files that the current Event Log does not reference.

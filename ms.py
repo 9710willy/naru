@@ -182,17 +182,32 @@ class MemorySurface:
         """)
         self._migrate_fts()
         self._migrate_cols()
-        self.db.executescript("""
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS naru_meta(
                 id INTEGER PRIMARY KEY,
                 store_uuid TEXT NOT NULL
-            );
-            INSERT OR IGNORE INTO naru_meta(id, store_uuid)
-            VALUES(1, lower(hex(randomblob(16))));
+            )
         """)
-        store_uuid = self.db.execute(
-            "SELECT store_uuid FROM naru_meta WHERE id=1"
-        ).fetchone()["store_uuid"]
+        meta_cols = {
+            r["name"] for r in self.db.execute("PRAGMA table_info(naru_meta)")
+        }
+        if "key" in meta_cols:
+            select_uuid = "SELECT value FROM naru_meta WHERE key='store_uuid'"
+            insert_uuid = (
+                "INSERT OR IGNORE INTO naru_meta(key, value)"
+                " VALUES('store_uuid', lower(hex(randomblob(16))))"
+            )
+        else:
+            select_uuid = "SELECT store_uuid FROM naru_meta WHERE id=1"
+            insert_uuid = (
+                "INSERT OR IGNORE INTO naru_meta(id, store_uuid)"
+                " VALUES(1, lower(hex(randomblob(16))))"
+            )
+        row = self.db.execute(select_uuid).fetchone()
+        if row is None:
+            self.db.execute(insert_uuid)
+            row = self.db.execute(select_uuid).fetchone()
+        store_uuid = row[0]
         location = ":memory:" if db == ":memory:" else str(pathlib.Path(db).resolve())
         self.store_id = hashlib.sha256(f"{location}\0{store_uuid}".encode()).hexdigest()
         self.db.commit()
@@ -764,7 +779,13 @@ def demo():
     replaced = MemorySurface(str(identity_path))
     assert replaced.store_id != first_id, "a replacement DB reused the old identity"
     assert replaced.blobs != first_blobs, "a replacement DB reused the old blob root"
+    replaced_id = replaced.store_id
     replaced.close()
+    identity_path.chmod(0o444)
+    read_only = MemorySurface(str(identity_path))
+    assert read_only.store_id == replaced_id, "opening an existing store tried to write"
+    read_only.close()
+    identity_path.chmod(0o600)
 
     owner_a = MemorySurface(str(identity_dir / "a.db"))
     owner_b = MemorySurface(str(identity_dir / "b.db"))
@@ -1188,6 +1209,9 @@ def demo():
             session_id TEXT, role TEXT, kind TEXT,
             created_at TEXT, content TEXT, payload_path TEXT);
         CREATE VIRTUAL TABLE fts USING fts5(content, content='');
+        CREATE TABLE naru_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO naru_meta(key, value)
+        VALUES('store_uuid', 'legacy-store-uuid');
     """)
     old_db.execute(
         "INSERT INTO conversation_history(role, kind, created_at, content)"
@@ -1197,6 +1221,10 @@ def demo():
     old_db.close()
 
     m3 = MemorySurface(str(legacy))
+    expected_id = hashlib.sha256(
+        f"{legacy.resolve()}\0legacy-store-uuid".encode()
+    ).hexdigest()
+    assert m3.store_id == expected_id, "migration changed the legacy store identity"
     cols = {r["name"] for r in m3.db.execute("PRAGMA table_info(conversation_history)")}
     assert {"agent_id", "promoted", "topic_key", "base_seq", "source_run_id", "source_seq_lo", "source_seq_hi"} <= cols, cols
     assert m3.expand(1)[0].content == "legacy row here", "migration lost a row"

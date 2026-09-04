@@ -291,6 +291,18 @@ MUTATIONS = [
         "location.encode()",
     ),
     (
+        "legacy store metadata is rejected",
+        "ms.py",
+        'if "key" in meta_cols:',
+        "if False:",
+    ),
+    (
+        "an existing store gets a no-op metadata write",
+        "ms.py",
+        "if row is None:",
+        "if True:",
+    ),
+    (
         "blob gc deletes live payloads",
         "ms.py",
         "if not path.is_file() or str(path) in live:",
@@ -360,6 +372,19 @@ MUTATIONS = [
 ]
 
 
+def selfcheck_command(target):
+    """Return the command that owns invariants in target."""
+    return {
+        "ms.py": ["ms.py"],
+        "kernel.py": ["kernel.py"],
+        "agent.py": ["agent.py"],
+        "eviction.py": ["eviction.py"],
+        "naru.py": ["naru.py", "--selfcheck"],
+        "noise.py": ["noise.py", "--selfcheck"],
+        "metrics.py": ["metrics.py", "--selfcheck"],
+    }.get(target, ["bench.py", "--selfcheck"])
+
+
 def run_mutated(target, find, replace):
     """Apply one edit in a throwaway copy and return the self-check's exit code."""
     body = (REPO / target).read_text()
@@ -377,22 +402,27 @@ def run_mutated(target, find, replace):
         for f in published.glob("*.json"):
             shutil.copy(f, work / "results" / "published" / f.name)
     (work / target).write_text(body.replace(find, replace))
-    # each invariant belongs to the module whose demo asserts it
-    cmd = {
-        "ms.py": ["ms.py"],
-        "kernel.py": ["kernel.py"],
-        "agent.py": ["agent.py"],
-        "eviction.py": ["eviction.py"],
-        "naru.py": ["naru.py", "--selfcheck"],
-        "noise.py": ["noise.py", "--selfcheck"],
-        "metrics.py": ["metrics.py", "--selfcheck"],
-    }.get(target, ["bench.py", "--selfcheck"])
     return subprocess.run(
-        [sys.executable, *cmd], cwd=work, capture_output=True, text=True, check=False
+        [sys.executable, *selfcheck_command(target)],
+        cwd=work, capture_output=True, text=True, check=False,
     ).returncode
 
 
 def main():
+    for target in dict.fromkeys(m[1] for m in MUTATIONS):
+        result = subprocess.run(
+            [sys.executable, *selfcheck_command(target)],
+            cwd=REPO, capture_output=True, text=True, check=False,
+        )
+        if result.returncode:
+            print(
+                f"baseline failed for {target}, exit {result.returncode}",
+                file=sys.stderr,
+            )
+            print(result.stdout, end="", file=sys.stderr)
+            print(result.stderr, end="", file=sys.stderr)
+            return 1
+
     survivors, skipped = [], []
     for mutation in MUTATIONS:
         name, target, find, replace = mutation[:4]
