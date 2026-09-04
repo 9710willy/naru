@@ -108,7 +108,7 @@ def _log_path():
     return str(pathlib.Path(tempfile.mkdtemp(prefix="naru-bench-")) / "log.db")
 
 
-def ingest(q, build_index=True):
+def ingest(q, build_index=True, db=None):
     """Build the Event Log for one question, session by session.
 
     Section 3.3: "we ingest each conversation history into Scroll session by
@@ -125,7 +125,7 @@ def ingest(q, build_index=True):
     # open an in-memory database. Without a file the sandbox was unreachable
     # from the only entry point that runs the agent, so it was a feature with
     # no caller. The default stays in-memory and fast.
-    ms = MemorySurface(_log_path())
+    ms = MemorySurface(_log_path() if db is None else db)
     index = []
     for i, (date, sid, turns) in enumerate(sessions(q), 1):
         stamp = iso(date)
@@ -161,6 +161,14 @@ def ingest(q, build_index=True):
             )
             rollup(index, 4)
     return ms, index
+
+
+def discard_log(ms):
+    """Close and remove one file-backed benchmark Event Log."""
+    path = ms.path
+    ms.close()
+    if path != ":memory:":
+        shutil.rmtree(pathlib.Path(path).parent, ignore_errors=True)
 
 
 def history_text(q):
@@ -286,8 +294,11 @@ def build_prompt(q, arm, rag_k=8):
     goes in the prompt.
     """
     if arm == "rag":
-        ms, _ = ingest(q, build_index=False)
-        body = rag_context(ms, q["question"], rag_k)
+        ms, _ = ingest(q, build_index=False, db=":memory:")
+        try:
+            body = rag_context(ms, q["question"], rag_k)
+        finally:
+            ms.close()
     else:
         body = history_text(q)
     return (
@@ -307,6 +318,7 @@ def one(
     rubric=True,
     no_index=False,
     rag_k=8,
+    trace=None,
 ):
     """Run a single question through one arm. Returns a result record."""
     be = get_backend(model)
@@ -323,14 +335,12 @@ def one(
                 max_turns=max_turns,
                 budget=budget,
                 verbose=verbose,
+                trace=trace,
                 rubric=LONGMEMEVAL_RUBRIC if rubric else None,
                 index=index,
             )
         finally:
-            # A sandboxed run leaves a real file behind; 96 questions leave 96.
-            if ms.path != ":memory:":
-                ms.db.close()
-                shutil.rmtree(pathlib.Path(ms.path).parent, ignore_errors=True)
+            discard_log(ms)
     else:
         prompt = build_prompt(q, arm, rag_k)
         ans, turns, peak = be(prompt, system=FULL_SYSTEM), 1, est(prompt)
@@ -339,7 +349,7 @@ def one(
     jb = get_backend(judge_model)
     ok = judge(q, ans, jb)
 
-    return {
+    row = {
         "qid": q["question_id"],
         "type": q["question_type"],
         "arm": arm,
@@ -369,6 +379,9 @@ def one(
         "call_retries": be.usage.call_retries,
         "empty_retries": be.usage.empty_retries,
     }
+    if trace is not None:
+        row["trace"] = trace
+    return row
 
 
 def wilson(k, n, z=1.96):
@@ -837,7 +850,21 @@ def demo():
         ],
     }
     full_p = build_prompt(synth, "full")
-    rag_p = build_prompt(synth, "rag", rag_k=1)
+    old_kernel = os.environ.get("NARU_KERNEL")
+    old_tempdir = tempfile.tempdir
+    with tempfile.TemporaryDirectory() as temp_root:
+        tempfile.tempdir = temp_root
+        os.environ["NARU_KERNEL"] = "sandbox"
+        try:
+            rag_p = build_prompt(synth, "rag", rag_k=1)
+            leftovers = list(pathlib.Path(temp_root).glob("naru-bench-*"))
+        finally:
+            tempfile.tempdir = old_tempdir
+            if old_kernel is None:
+                os.environ.pop("NARU_KERNEL", None)
+            else:
+                os.environ["NARU_KERNEL"] = old_kernel
+    assert not leftovers, f"rag left benchmark logs: {leftovers}"
     assert "kayak" in rag_p and "kayak" in full_p
     assert "tarragon" in full_p, "the full arm must carry the whole history"
     assert "tarragon" not in rag_p, "the rag arm must carry retrieved hits only"

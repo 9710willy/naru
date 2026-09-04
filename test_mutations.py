@@ -43,8 +43,14 @@ MUTATIONS = [
     (
         "rag falls through to full",
         "bench.py",
-        'if arm == "rag":\n        ms, _ = ingest(q, build_index=False)',
-        "if False:\n        ms, _ = ingest(q, build_index=False)",
+        'if arm == "rag":\n        ms, _ = ingest(q, build_index=False, db=":memory:")',
+        'if False:\n        ms, _ = ingest(q, build_index=False, db=":memory:")',
+    ),
+    (
+        "rag creates a sandbox file log",
+        "bench.py",
+        'ms, _ = ingest(q, build_index=False, db=":memory:")',
+        "ms, _ = ingest(q, build_index=False)",
     ),
     (
         "errored runs score as wrong answers",
@@ -113,6 +119,18 @@ MUTATIONS = [
         "return a_only, b_only, min(1.0, tail)",
     ),
     (
+        "noise keeps errored rows",
+        "noise.py",
+        "if backend or judge:",
+        "if False:",
+    ),
+    (
+        "noise hides exclusion counts",
+        "noise.py",
+        'f"  {name} | excluded {excluded[\'rows\']} error row(s)"',
+        'f"  {name} | excluded {0} error row(s)"',
+    ),
+    (
         "a refused rlimit is reported as applied",
         "kernel.py",
         'applied[name] = f"NOT APPLIED: {type(e).__name__}"',
@@ -127,6 +145,12 @@ MUTATIONS = [
         "kernel.py",
         'f"exceeded {self.timeout}s wall clock"\n            if hung',
         'f"exceeded {self.timeout}s wall clock"\n            if not hung',
+    ),
+    (
+        "sandbox stderr becomes a blocking pipe",
+        "kernel.py",
+        "stderr=self._stderr,",
+        "stderr=subprocess.PIPE,",
     ),
     (
         "a first prose reply is banked as the answer",
@@ -261,6 +285,61 @@ MUTATIONS = [
         "CREATE INDEX IF NOT EXISTS ix_promoted_sources_off",
     ),
     (
+        "store identity ignores database incarnation",
+        "ms.py",
+        'f"{location}\\0{store_uuid}".encode()',
+        "location.encode()",
+    ),
+    (
+        "blob gc deletes live payloads",
+        "ms.py",
+        "if not path.is_file() or str(path) in live:",
+        "if not path.is_file():",
+    ),
+    (
+        "outline has no session index",
+        "ms.py",
+        "CREATE INDEX IF NOT EXISTS ix_session_id",
+        "CREATE INDEX IF NOT EXISTS ix_session_id_off",
+    ),
+    (
+        "show receipt ignores store identity",
+        "metrics.py",
+        'and e.get("store") == store_id',
+        "and True",
+    ),
+    (
+        "show receipt ignores run identity",
+        "metrics.py",
+        'and e.get("run") == run_id',
+        "and True",
+    ),
+    (
+        "legacy show receipt authorizes a claim",
+        "metrics.py",
+        'e.get("v") == 2',
+        "True",
+    ),
+    (
+        "separate endpoint receipts cover a span",
+        "metrics.py",
+        'and e["lo"] <= lo <= hi <= e["hi"]',
+        'and (e["lo"] <= lo <= e["hi"] or e["lo"] <= hi <= e["hi"])',
+    ),
+    (
+        "empty show records evidence",
+        "naru.py",
+        (
+            "        if rows:\n"
+            "            metrics.record_show(ms.store_id, run, rows[0].seq, rows[-1].seq)"
+        ),
+        (
+            "        metrics.record_show(ms.store_id, run, "
+            "rows[0].seq if rows else lo, "
+            "rows[-1].seq if rows else (hi if hi is not None else lo))"
+        ),
+    ),
+    (
         "Codex repeats unchanged Naru context",
         "naru.py",
         'if event_name == "UserPromptSubmit" and _codex_seen(ms, session_id) == doc_hash:',
@@ -305,6 +384,8 @@ def run_mutated(target, find, replace):
         "agent.py": ["agent.py"],
         "eviction.py": ["eviction.py"],
         "naru.py": ["naru.py", "--selfcheck"],
+        "noise.py": ["noise.py", "--selfcheck"],
+        "metrics.py": ["metrics.py", "--selfcheck"],
     }.get(target, ["bench.py", "--selfcheck"])
     return subprocess.run(
         [sys.executable, *cmd], cwd=work, capture_output=True, text=True, check=False

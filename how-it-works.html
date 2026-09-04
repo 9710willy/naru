@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>naru — how the build works</title>
+    <title>naru | how it works</title>
     <style>
       :root {
         --bg: #0f1115;
@@ -16,8 +16,6 @@
         --accent: #5b9dff;
         --good: #3fbf8f;
         --bad: #e0685f;
-        --warn: #e6b455;
-        --purple: #a78bfa;
         --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         --sans:
           system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial,
@@ -95,21 +93,26 @@
         border-radius: 14px;
         padding: 20px 22px;
         margin: 16px 0;
+        overflow-x: auto;
       }
       .cols {
         display: grid;
         grid-template-columns: 1fr 1fr;
         gap: 14px;
       }
-      .cols3 {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 14px;
-      }
       @media (max-width: 700px) {
-        .cols,
-        .cols3 {
+        .cols {
           grid-template-columns: 1fr;
+        }
+        .track {
+          flex-direction: column;
+        }
+        .track div {
+          border-right: none;
+          border-bottom: 1px solid var(--line);
+        }
+        .track div:last-child {
+          border-bottom: none;
         }
       }
       code {
@@ -145,9 +148,6 @@
       .str {
         color: var(--good);
       }
-      .hl {
-        color: var(--warn);
-      }
       table {
         border-collapse: collapse;
         width: 100%;
@@ -182,40 +182,6 @@
         color: var(--dim);
         margin-top: 8px;
       }
-      .row {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        margin: 7px 0;
-      }
-      .row .lbl {
-        width: 118px;
-        flex: none;
-        font-size: 12.5px;
-        color: var(--muted);
-        text-align: right;
-      }
-      .barwrap {
-        flex: 1;
-        display: flex;
-        align-items: center;
-      }
-      .bar {
-        height: 20px;
-        border-radius: 4px;
-        min-width: 2px;
-        position: relative;
-      }
-      .bar span {
-        position: absolute;
-        right: -8px;
-        top: 50%;
-        transform: translate(100%, -50%);
-        font-family: var(--mono);
-        font-size: 12px;
-        white-space: nowrap;
-        color: var(--ink);
-      }
       .step {
         display: flex;
         gap: 12px;
@@ -241,24 +207,6 @@
       }
       .step .b b {
         color: var(--ink);
-      }
-      .pill {
-        display: inline-block;
-        font-family: var(--mono);
-        font-size: 11px;
-        padding: 2px 7px;
-        border-radius: 20px;
-        border: 1px solid var(--line);
-        background: var(--panel2);
-        color: var(--muted);
-      }
-      .pill.g {
-        color: var(--good);
-        border-color: var(--good);
-      }
-      .pill.r {
-        color: var(--bad);
-        border-color: var(--bad);
       }
       .box {
         border: 1px solid var(--line);
@@ -288,13 +236,6 @@
       }
       .mini code {
         font-size: 12px;
-      }
-      .flowarrow {
-        text-align: center;
-        color: var(--dim);
-        font-family: var(--mono);
-        font-size: 12px;
-        margin: 8px 0;
       }
       .track {
         display: flex;
@@ -330,498 +271,560 @@
       a:hover {
         text-decoration: underline;
       }
-      .big {
-        font-family: var(--mono);
-        font-size: 26px;
-        font-weight: 700;
-        letter-spacing: -0.02em;
-      }
     </style>
   </head>
   <body>
     <div class="wrap">
-      <div class="kicker">What we built · naru</div>
-      <h1>naru, explained by what the code actually does</h1>
+      <div class="kicker">Current design · September 2026</div>
+      <h1>Naru stores history in SQLite and loads selected context</h1>
       <p class="lede">
-        One idea: the conversation history never enters the prompt. It lives in
-        a database. The model writes Python to reach it, and only what it prints
-        comes back.
+        Naru puts raw history, tool output, agent trace, claims, and skills in
+        one SQLite Event Log. The Python agent builds each view from current
+        state and selected rows. Coding-agent hooks load the approved doc.
       </p>
 
-      <!-- ============ 1. THE MENTAL MODEL ============ -->
-      <h2>1 · The mental model</h2>
+      <h2>1 · Start with the Event Log</h2>
       <p class="sub">
-        Two zones. Everything hinges on which zone your data sits in.
-      </p>
-
-      <div class="card">
-        <div class="cols">
-          <div class="box out">
-            <h4>Outside the prompt — free</h4>
-            <div class="mini">
-              <p>
-                <b>Event Log</b> — SQLite table, one row per turn, each with a
-                stable address <code>seq</code>. Full-text searchable.
-              </p>
-              <pre><code>seq 1  user  "I drive a blue Subaru"
-seq 2  asst  "Nice car!"
- …  487 turns, 47 sessions …</code></pre>
-              <p style="margin-top: 10px">
-                <b>Python kernel</b> — variables survive between model calls.
-              </p>
-              <pre><code>flights = [ …1,200 rows… ]
-bulk    = [ …40 hits… ]</code></pre>
-            </div>
-          </div>
-          <div class="box">
-            <h4>Inside the prompt — you pay, every turn</h4>
-            <div class="mini">
-              <pre><code>Question: What car do I drive?
-
-<span class="cmt">resident: bulk: list[40]</span>   <span class="hl">← digest, not data</span>
-
-[obs 2]
-&lt;seq 1 user: I drive a blue Subaru&gt;
-
-<span class="cmt">--- evicted ---</span>
-  [3-18] ms.expand(3,18)   <span class="hl">← pointer</span></code></pre>
-              <p style="margin-top: 12px">
-                <span class="pill g">97 tokens</span> instead of 124,609.
-              </p>
-            </div>
-          </div>
-        </div>
-        <p class="note">
-          The kernel holds a 40-row result. The prompt learns only that it
-          exists and how big it is. That single gap is the whole technique.
-        </p>
-      </div>
-
-      <!-- ============ 2. WHY IT SAVES ============ -->
-      <h2>2 · Why this saves anything</h2>
-      <p class="sub">
-        Because an LLM call is stateless — the harness re-sends the whole
-        conversation every single turn.
+        The Event Log is the stored record. Each row gets a stable
+        <code>seq</code> number and a full-text search entry.
       </p>
 
       <div class="card">
-        <h3>A 7,000-token page read once, on turn 5</h3>
-        <div class="row">
-          <div class="lbl">turn 5 · read</div>
-          <div class="barwrap">
-            <div class="bar" style="width: 72%; background: var(--bad)">
-              <span>7k</span>
-            </div>
-          </div>
-        </div>
-        <div class="row">
-          <div class="lbl">turn 6 · re-sent</div>
-          <div class="barwrap">
-            <div class="bar" style="width: 72%; background: var(--bad)">
-              <span>7k</span>
-            </div>
-          </div>
-        </div>
-        <div class="row">
-          <div class="lbl">turn 7 · re-sent</div>
-          <div class="barwrap">
-            <div class="bar" style="width: 72%; background: var(--bad)">
-              <span>7k</span>
-            </div>
-          </div>
-        </div>
-        <div class="row">
-          <div class="lbl">…all session</div>
-          <div class="barwrap">
-            <div class="bar" style="width: 72%; background: var(--bad)">
-              <span>7k …</span>
-            </div>
-          </div>
-        </div>
-        <div style="height: 14px"></div>
-        <div class="row">
-          <div class="lbl" style="color: var(--good)">with naru</div>
-          <div class="barwrap">
-            <div class="bar" style="width: 3%; background: var(--good)">
-              <span>~300 · flat</span>
-            </div>
+        <h3>First, save the full record</h3>
+        <div class="track">
+          <div>conversation turns<br />tool output<br />agent claims</div>
+          <div style="color: var(--accent)">
+            SQLite Event Log<br /><b>stable seq</b>
           </div>
         </div>
         <p class="note">
-          It also stops the context <i>window</i> filling with stale text — the
-          harder limit, and the one that quietly wrecks accuracy.
+          The log sits outside the model's token budget. Disk and code still
+          have a cost.
         </p>
       </div>
 
-      <!-- ============ 3. THE TURN LOOP ============ -->
-      <h2>3 · One turn, start to finish</h2>
+      <div class="card">
+        <h3>Then, retrieve a small part</h3>
+        <div class="track">
+          <div>conversation turns<br />tool output<br />agent claims</div>
+          <div style="color: var(--accent)">SQLite Event Log</div>
+          <div><code>search</code><br /><code>expand</code></div>
+          <div style="color: var(--good)">current model view</div>
+        </div>
+        <p class="note">
+          Search results stay in the Python kernel. A result enters the next
+          model call only when the model prints it.
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>Shared memory adds review</h3>
+        <div class="track">
+          <div>claim or skill</div>
+          <div style="color: var(--accent)">same Event Log</div>
+          <div><code>naru inbox</code></div>
+          <div style="color: var(--good)">approved doc</div>
+          <div>Codex hook<br />or context file</div>
+        </div>
+        <p class="note">
+          A dropped item remains searchable at its sequence number and is
+          omitted from the approved doc.
+        </p>
+      </div>
+
+      <h2>2 · The row type controls where data appears</h2>
       <p class="sub">
-        This loop is <code>agent.py</code>. Four moves, repeated.
+        One table holds several kinds of data. The <code>kind</code> field keeps
+        their read rules separate.
+      </p>
+
+      <div class="card">
+        <table>
+          <thead>
+            <tr>
+              <th>Kind</th>
+              <th>What it stores</th>
+              <th>How it returns</th>
+              <th>Age rule</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>context_msg</code>, <code>model_turn</code>, <code>note</code></td>
+              <td>Conversation and saved notes</td>
+              <td>Normal search, outline, and expand</td>
+              <td>Old rows can be pruned</td>
+            </tr>
+            <tr>
+              <td><code>tool_result</code></td>
+              <td>Large tool output</td>
+              <td><code>naru show</code> or <code>naru search</code></td>
+              <td>Old rows can be pruned</td>
+            </tr>
+            <tr>
+              <td><code>agent_reply</code>, <code>agent_observation</code></td>
+              <td>The model's code and the result it saw</td>
+              <td>Hidden by default. Exact run plus sequence range restores it</td>
+              <td>A promoted item's cited range stays</td>
+            </tr>
+            <tr>
+              <td><code>agent_state</code></td>
+              <td>Current task state or Codex doc hash</td>
+              <td>Hidden from normal recall</td>
+              <td>Old uncited rows can be pruned</td>
+            </tr>
+            <tr>
+              <td><code>claim</code>, <code>skill</code></td>
+              <td>Facts and procedures proposed for later sessions</td>
+              <td>Only promoted rows enter the approved doc</td>
+              <td>Decided rows never age out</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>3 · One turn in the Python agent</h2>
+      <p class="sub">
+        <code>agent.py</code> builds the prompt, runs one model-written Python
+        cell, and stores the trace.
       </p>
 
       <div class="card">
         <div class="step">
           <div class="n">1</div>
           <div class="b">
-            <b>Build a small working view.</b> Question + what's resident in the
-            kernel + the last few observations + the eviction index. Typically
-            100–1,500 tokens.
+            <b>Build the prompt.</b> It contains the question, source and trace
+            indexes, the kernel digest, the current state, and the latest
+            observation.
           </div>
         </div>
         <div class="step">
           <div class="n">2</div>
           <div class="b">
-            <b>Model replies with one Python cell.</b> No prose, just code.
+            <b>Get one Python cell.</b> The system asks for a fenced cell.
+            <code>extract_code()</code> also accepts code without fences and
+            gives a first no-code answer one retry.
           </div>
         </div>
         <div class="step">
           <div class="n">3</div>
           <div class="b">
-            <b>The kernel runs it.</b> Searches hit the log. Big results bind to
-            <i>variables</i> and stay there.
+            <b>Run the cell.</b> Variables stay in the kernel. Its digest shows
+            names, types, sizes, and source sequence numbers instead of full
+            values.
           </div>
         </div>
         <div class="step">
           <div class="n">4</div>
           <div class="b">
-            <b>Only <code>print()</code> output returns</b> as the next
-            observation. Loop until the model calls
-            <code>submit_answer()</code>.
+            <b>Store the result.</b> Naru appends the reply, printed
+            observation, and any valid state under one run ID. The next prompt
+            keeps the newest state and observation.
           </div>
         </div>
       </div>
 
       <div class="card">
-        <h3>What the model writes — the four verbs</h3>
-        <pre><code><span class="cmt"># LOCATE — BM25 over the log, falls back to OR if AND finds nothing</span>
-hits = ms.<span class="kw">search</span>(<span class="str">"Subaru"</span>, k=<span class="kw">5</span>)
+        <h3>The model-facing calls</h3>
+        <pre><code><span class="kw">headline</span>(
+    task=<span class="str">"find the current car"</span>,
+    verified=[],
+    next_action=<span class="str">"search the history"</span>,
+    status=<span class="str">"working"</span>,
+)
 
-<span class="cmt"># NAVIGATE — when the question's words don't appear in the history at all</span>
-<span class="kw">print</span>(ms.<span class="kw">outline</span>())          <span class="cmt"># 47 sessions, 1 line each</span>
+hits = ms.<span class="kw">search</span>(<span class="str">"Subaru"</span>, kind=<span class="str">"context_msg"</span>)
+<span class="kw">print</span>(hits[:3])                 <span class="cmt"># only this crosses into the next prompt</span>
 
-<span class="cmt"># MATERIALIZE — recover an exact span, verbatim, from any address</span>
-turns = ms.<span class="kw">expand</span>(<span class="kw">87</span>, <span class="kw">912</span>)
+<span class="cmt"># If words do not match, browse session anchors.</span>
+<span class="kw">print</span>(ms.<span class="kw">outline</span>())
 
-<span class="cmt"># COMPUTE — plain Python; nothing here costs a token</span>
-best = min(turns, key=<span class="kw">lambda</span> t: t.created_at)
+<span class="cmt"># Use SQL for dates, kinds, counts, and ordered ranges.</span>
+updates = ms.<span class="kw">sql_query</span>(
+    <span class="str">"SELECT seq, content FROM conversation_history "</span>
+    <span class="str">"WHERE kind='context_msg' ORDER BY seq LIMIT 50"</span>
+)
+days = ms.<span class="kw">days_between</span>(<span class="str">"2026-08-01"</span>, <span class="str">"2026-09-02"</span>)
 
-<span class="cmt"># EXPOSE — the ONLY line that costs anything</span>
-<span class="kw">print</span>(best.content)</code></pre>
+<span class="cmt"># Old agent trace needs both its address and its run.</span>
+trace = ms.<span class="kw">expand</span>(210, 211, session_id=<span class="str">"4f1c..."</span>)
+
+<span class="kw">submit_answer</span>(<span class="str">"You drive a blue Subaru Outback."</span>)</code></pre>
       </div>
 
-      <!-- ============ 4. EVICTION ============ -->
-      <h2>4 · The part that isn't just "summarize"</h2>
+      <div class="card">
+        <h3>Current state points back to its evidence</h3>
+        <div class="cols">
+          <div class="box">
+            <h4>Active prompt</h4>
+            <pre><code>{
+  "task": "find the current car",
+  "verified": ["blue Subaru"],
+  "next_action": "check later turns",
+  "status": "working"
+}</code></pre>
+          </div>
+          <div class="box out">
+            <h4>Stored trace</h4>
+            <pre><code>run 4f1c...
+  seq 210  agent_reply
+  seq 211  agent_observation
+  seq 212  agent_state
+
+recover:
+ms.expand(210, 211,
+  session_id="4f1c...")</code></pre>
+          </div>
+        </div>
+        <p class="note">
+          A
+          <a href="docs/naru-persistent-state-report.html">fixed six-turn replay</a>
+          measured the final active view at 180 estimated tokens, down from
+          2,787. That check measures prompt size. It does not measure answer
+          quality.
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>Older trace becomes an address</h3>
+        <div class="cols">
+          <div>
+            <h3 class="lose">Growing replay</h3>
+            <pre><code>reply 1
+observation 1
+reply 2
+observation 2
+reply 3
+observation 3</code></pre>
+          </div>
+          <div>
+            <h3 class="win">Naru working view</h3>
+            <pre><code>current state
+latest observation
+
+[210-247] prior work
+  -> ms.expand(210, 247,
+       session_id="4f1c...")</code></pre>
+          </div>
+        </div>
+        <p class="note">
+          The tiered index stays small as more spans leave the view. The
+          self-check turns 60 evictions into 10 index entries across four tiers.
+        </p>
+      </div>
+
+      <h2>4 · Claims become shared memory after review</h2>
       <p class="sub">
-        Eviction shrinks the <i>view</i>, never the <i>record</i>.
+        Agents propose a row, and the inbox records the review result. The doc
+        renders only promoted rows.
+      </p>
+
+      <div class="card">
+        <div class="track">
+          <div><code>naru claim</code><br /><code>naru skill</code></div>
+          <div>pending row<br /><code>promoted=0</code></div>
+          <div><code>naru inbox</code></div>
+          <div style="color: var(--good)">promoted row<br /><code>promoted=1</code></div>
+          <div>Decisions<br />Skills</div>
+        </div>
+        <pre><code>naru claim "The store uses SQLite." --key store.engine --by codex
+naru inbox
+naru inject AGENTS.md</code></pre>
+      </div>
+
+      <div class="card">
+        <table>
+          <thead>
+            <tr>
+              <th>Field or rule</th>
+              <th>Why it exists</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>topic_key</code></td>
+              <td>Two promoted values on one key appear under <code>## Unresolved</code></td>
+            </tr>
+            <tr>
+              <td><code>base_seq</code></td>
+              <td>The inbox warns when the approved doc changed after the claim was written</td>
+            </tr>
+            <tr>
+              <td><code>source_run_id</code> and sequence range</td>
+              <td>A reviewer can open the exact trace used as evidence</td>
+            </tr>
+            <tr>
+              <td>Marker-safe injection</td>
+              <td><code>naru inject</code> changes only the Naru block in a file you own</td>
+            </tr>
+            <tr>
+              <td>One-line rendering</td>
+              <td>Agent text cannot break out of its Markdown bullet</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="note">
+          Promote and drop ask for a terminal unless the caller passes
+          <code>--yes</code>. An agent with shell access can pass that flag, so
+          this rule only guards against accidents.
+        </p>
+      </div>
+
+      <h2>5 · Codex receives the latest approved doc</h2>
+      <p class="sub">
+        Codex does not reload a changed <code>AGENTS.md</code> block during an
+        existing thread. The plugin uses native start and prompt hooks instead.
+      </p>
+
+      <div class="card">
+        <div class="track">
+          <div>promoted claims<br />and skills</div>
+          <div><code>ms.doc()</code></div>
+          <div><code>naru codex-hook</code></div>
+          <div style="color: var(--good)">Codex additional context</div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Hook event</th>
+              <th>Behavior</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>SessionStart</code></td>
+              <td>Loads the current doc for startup, resume, clear, and compact</td>
+            </tr>
+            <tr>
+              <td><code>UserPromptSubmit</code></td>
+              <td>Loads the doc only when its SHA-256 value changed with the doc</td>
+            </tr>
+            <tr>
+              <td><code>SubagentStart</code></td>
+              <td>Gives each subagent the current doc</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="note">
+          Hidden <code>agent_state</code> stores the Codex session ID, doc
+          sequence, and hash. It never stores the user prompt.
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>Codex tool output stays untouched</h3>
+        <p class="mini">
+          Codex 0.152 reports a completed replacement as blocked. An agent can
+          then repeat a write that already ran. The plugin leaves
+          <code>PostToolUse</code> unused and handles approved context only.
+        </p>
+      </div>
+
+      <h2>6 · Claude Code can spill large tool results</h2>
+      <p class="sub">
+        This is a separate <code>PostToolUse</code> hook. It keeps a large
+        command result recoverable while replacing the model-facing copy.
+      </p>
+
+      <div class="card">
+        <div class="track">
+          <div>tool result<br /><b>over 4,000 chars</b></div>
+          <div style="color: var(--accent)">Event Log<br /><code>seq 912</code></div>
+          <div>600-char preview<br />line signposts</div>
+          <div style="color: var(--good)"><code>naru show 912</code><br /><code>naru search</code></div>
+        </div>
+        <p class="note">
+          The hook keeps the tool's original response shape. If storage fails,
+          it leaves the full result inline so the tool call still works.
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>Why the default is 4,000 characters</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Measured sample</th>
+              <th>Finding</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>One day, old 10,000-char threshold</td>
+              <td>87 skipped outputs between 4,000 and 10,000 chars carried about 129,000 tokens</td>
+            </tr>
+            <tr>
+              <td>36 old-threshold spills</td>
+              <td>10 were recovered, so most full payloads were never needed again</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="note">
+          <code>metrics.py</code> also records outputs that stay inline and
+          later <code>show</code> or <code>search</code> calls. Those facts do
+          not exist in the Event Log. Metrics failures never stop a tool call.
+        </p>
+      </div>
+
+      <h2>7 · Child-process mode limits crashes</h2>
+      <p class="sub">
+        Set <code>NARU_KERNEL=sandbox</code> for a file-backed log.
       </p>
 
       <div class="card">
         <div class="cols">
-          <div>
-            <h3 class="lose">Compaction (everyone else)</h3>
+          <div class="box">
+            <h4>Default kernel</h4>
             <div class="mini">
-              <pre><code>turns 3-18  ──►  "user discussed
-                  travel plans"
-
-original text: <span style="color:var(--bad)">GONE</span></code></pre>
-              <p style="margin-top: 10px">
-                You chose what mattered <b>before</b> you knew the question.
-                Wrong guess = unrecoverable.
-              </p>
+              <p>Runs in the harness process. It supports in-memory benchmark databases.</p>
+              <p>Model code shares that Python process.</p>
             </div>
           </div>
-          <div>
-            <h3 class="win">naru's eviction</h3>
+          <div class="box out">
+            <h4>Child-process mode</h4>
             <div class="mini">
-              <pre><code>turns 3-18  ──►  [3-18] travel plans
-                 ms.expand(3,18)
-
-original text: <span style="color:var(--good)">still in the log</span></code></pre>
-              <p style="margin-top: 10px">
-                The pointer is the point. Any evicted span is one call from
-                coming back <b>verbatim</b>.
-              </p>
+              <p>Opens SQLite in read-only mode. CPU, file size, output, and wall time have limits.</p>
+              <p>A dead child restarts on the next call and loses its resident variables.</p>
             </div>
           </div>
         </div>
         <p class="note">
-          The index is tiered so it can't grow linearly. Measured in
-          <code>eviction.py</code>:
-          <b>60 evictions → 10 index entries, 4 tiers</b>.
+          The child still has the user's filesystem and network. Add an
+          operator-supplied jail for that boundary. macOS refuses the address
+          space memory limit, and <code>limits()</code> reports the refusal.
         </p>
       </div>
 
-      <!-- ============ 5. HILLCLIMB ============ -->
-      <h2>5 · Hillclimbing it on LongMemEval</h2>
+      <h2>8 · Which research shaped each part</h2>
       <p class="sub">
-        Real runs, real judge. 12 questions, oracle split, Haiku 4.5.
+        Naru combines ideas from several papers and one research project.
       </p>
 
       <div class="card">
-        <div class="row">
-          <div class="lbl">v1 baseline</div>
-          <div class="barwrap">
-            <div class="bar" style="width: 50%; background: var(--bad)">
-              <span>50.0%</span>
-            </div>
-          </div>
-        </div>
-        <div class="row">
-          <div class="lbl">v2 plumbing</div>
-          <div class="barwrap">
-            <div class="bar" style="width: 50%; background: var(--warn)">
-              <span>50.0%</span>
-            </div>
-          </div>
-        </div>
-        <div class="row">
-          <div class="lbl">v3 navigation</div>
-          <div class="barwrap">
-            <div class="bar" style="width: 83.3%; background: var(--good)">
-              <span>83.3%</span>
-            </div>
-          </div>
-        </div>
-
-        <table style="margin-top: 20px">
-          <tr>
-            <th>Version</th>
-            <th>What changed</th>
-            <th class="num">Score</th>
-          </tr>
-          <tr>
-            <td>v1</td>
-            <td>first working end-to-end run</td>
-            <td class="num">50.0%</td>
-          </tr>
-          <tr>
-            <td>v2</td>
-            <td>retry empty CLI replies; execute unfenced code cells</td>
-            <td class="num">50.0%</td>
-          </tr>
-          <tr>
-            <td>v3</td>
-            <td>
-              <b>+ <code>ms.outline()</code></b
-              >, + auto-OR search fallback
-            </td>
-            <td class="num win">83.3%</td>
-          </tr>
-        </table>
-        <p class="note">
-          v2 fixed real bugs but moved the score zero — it traded old failures
-          for new ones. Honest result, kept in the record.
-        </p>
-      </div>
-
-      <div class="card">
-        <h3>The find that produced the jump</h3>
-        <div class="mini">
-          <p>
-            Three questions failed with the agent insisting the fact wasn't
-            there. It was. The question said <b>"homegrown ingredients"</b>; the
-            conversation said <b>"basil"</b> and <b>"cherry tomatoes"</b>.
-          </p>
-          <pre><code>ms.search(<span class="str">"homegrown"</span>)   <span class="cmt">→ 0 hits   (word never appears)</span>
-ms.search(<span class="str">"basil"</span>)       <span class="cmt">→ 3 hits</span>
-ms.outline()             <span class="cmt">→ "…recipe ideas that use fresh</span>
-                         <span class="cmt">    basil and mint…"  ← found it</span></code></pre>
-          <p style="margin-top: 10px">
-            Lexical search can't bridge a vocabulary gap. So we gave it a
-            structural map instead — the same outline-then-expand move the paper
-            calls <i>navigation anchors</i>. <b>+33 points.</b>
-          </p>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>What's still failing, and why it's not the harness</h3>
-        <div class="mini">
-          <p>
-            2 of 12 remain. One is a flaky empty reply from the CLI. The other:
-            the agent claimed <code>search('Kg2')</code> and
-            <code>search('Bd5')</code> returned nothing, then gave up.
-          </p>
-          <pre><code>ms.search(<span class="str">"Kg2"</span>) → <span class="hl">3 hits</span>    <span class="cmt">the agent said 0</span>
-ms.search(<span class="str">"Bd5"</span>) → <span class="hl">3 hits</span>    <span class="cmt">the agent said 0</span></code></pre>
-          <p style="margin-top: 10px">
-            The search layer was correct. The model hallucinated the failure.
-            That is the paper's own finding — weaker backbones
-            <i>"commit more execution errors or terminate prematurely"</i> — not
-            a bug we can patch in the harness.
-          </p>
-        </div>
-      </div>
-
-      <!-- ============ 6. HONEST SCOREBOARD ============ -->
-      <h2>6 · Where naru wins, and where it doesn't</h2>
-
-      <div class="card">
-        <h3>Oracle split — history is only 5.6k tokens</h3>
         <table>
-          <tr>
-            <th>Arm</th>
-            <th class="num">Accuracy</th>
-            <th class="num">Net input / q</th>
-            <th class="num">View size</th>
-          </tr>
-          <tr>
-            <td>full context</td>
-            <td class="num win">100%</td>
-            <td class="num">15,140</td>
-            <td class="num">5,669t</td>
-          </tr>
-          <tr>
-            <td>naru (v3)</td>
-            <td class="num">83.3%</td>
-            <td class="num lose">100,206</td>
-            <td class="num win">1,310t</td>
-          </tr>
+          <thead>
+            <tr>
+              <th>Naru part</th>
+              <th>Research source</th>
+              <th>Idea used</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Event Log and Python retrieval</td>
+              <td><a href="https://arxiv.org/abs/2608.21690"><i>Context as an Environment</i></a></td>
+              <td>Keep history outside the prompt and load selected evidence through code.</td>
+            </tr>
+            <tr>
+              <td>Reviewed skills</td>
+              <td><a href="https://arxiv.org/abs/2608.27454"><i>WikiSkill</i></a></td>
+              <td>Keep raw experience recoverable and promote useful procedures.</td>
+            </tr>
+            <tr>
+              <td>Compact agent state</td>
+              <td><a href="https://arxiv.org/abs/2608.26263"><i>SKILL.state</i></a></td>
+              <td>Separate stable instructions from changing task state.</td>
+            </tr>
+            <tr>
+              <td>Scoped recovery</td>
+              <td><a href="https://github.com/Tencent/ContextPilot">ContextPilot</a></td>
+              <td>Move old detail out of active context and restore only what the task needs.</td>
+            </tr>
+            <tr>
+              <td>Long-memory checks</td>
+              <td><a href="https://arxiv.org/abs/2510.27246">BEAM</a></td>
+              <td>Test recall and reasoning across long chat histories.</td>
+            </tr>
+          </tbody>
         </table>
         <p class="note">
-          <b>Full context wins here, and it should.</b> A 5.6k history fits in
-          one prompt with room to spare, so there is no pressure to relieve —
-          and naru pays for multiple turns to reach the same facts. Reporting
-          this is the point: a technique that only ever looks good is being
-          measured wrong.
+          Naru combines these parts in one SQLite log. The implementation adds
+          its own review, conflict, and retention rules.
         </p>
       </div>
+
+      <h2>9 · What the benchmark says</h2>
+      <p class="sub">
+        Current reference run: LongMemEval-s, 96 questions, Sonnet 5, judge
+        Haiku 4.5.
+      </p>
 
       <div class="card" style="border-color: var(--accent)">
-        <h3>Where the claim actually lives — the <code>_s</code> split</h3>
-        <div class="mini">
-          <div class="track">
-            <div>history<br /><b style="color: var(--bad)">124,609t</b></div>
-            <div>487 turns<br />47 sessions</div>
-            <div>outline<br /><b style="color: var(--good)">1,444t</b></div>
-            <div>ratio<br /><b style="color: var(--good)">86× smaller</b></div>
-          </div>
-          <p>
-            Every question carries ~125k tokens of history. Full context must
-            ship all of it, every turn. naru ships an outline and a few
-            printed lines.
-          </p>
-        </div>
-        <table>
-          <tr>
-            <th>Arm</th>
-            <th class="num">Correct</th>
-            <th class="num">Net input / q</th>
-            <th class="num">View size</th>
-            <th class="num">Model $/q</th>
-          </tr>
-          <tr>
-            <td>full context</td>
-            <td class="num">16/24</td>
-            <td class="num lose">116,727</td>
-            <td class="num lose">124,484t</td>
-            <td class="num lose">$0.2524</td>
-          </tr>
-          <tr>
-            <td>naru</td>
-            <td class="num">19/24</td>
-            <td class="num">73,199</td>
-            <td class="num">2,552t</td>
-            <td class="num">$0.1409</td>
-          </tr>
-          <tr>
-            <td>rag (BM25 top-8)</td>
-            <td class="num win">21/24</td>
-            <td class="num win">1,816</td>
-            <td class="num win">1,805t</td>
-            <td class="num win">$0.0251</td>
-          </tr>
-        </table>
-        <p class="note">
-          LongMemEval-s, n=24, Haiku 4.5, judge Haiku 4.5. <b>No pair separates
-          on accuracy</b> &mdash; paired McNemar puts every comparison between
-          p=0.125 and p=0.625, so at this n the harness cannot tell the three
-          apart. What is not close is cost: <code>rag</code> answers in one call
-          on 1,816 input tokens against naru's 4.4 calls and 73,199, forty times
-          the input for no measurable gain (5.6&times; the money &mdash; most of
-          naru's tokens are cache reads, which bill at a tenth). <b>On this benchmark the kernel does
-          not earn its keep.</b> ADR 0006 records why that is the expected
-          result for LongMemEval's question shape and what would actually test
-          it. The judge is not LongMemEval's official prompt; these numbers
-          track this repo and nothing else.
+        <p class="mini">
+          <code>full</code> sends all history in one call.
+          <code>rag</code> sends the top eight BM25 search hits.
+          <code>naru</code> lets the model search and compute across calls.
         </p>
-      </div>
-
-      <!-- ============ 7. FILES ============ -->
-      <h2>7 · The code</h2>
-      <div class="card">
         <table>
-          <tr>
-            <th>File</th>
-            <th>Job</th>
-            <th>Its own check</th>
-          </tr>
-          <tr>
-            <td><code>ms.py</code></td>
-            <td>Event Log: search / outline / expand / sql_query</td>
-            <td class="win">passes</td>
-          </tr>
-          <tr>
-            <td><code>kernel.py</code></td>
-            <td>persistent namespace, exec, print capture</td>
-            <td class="win">passes</td>
-          </tr>
-          <tr>
-            <td><code>eviction.py</code></td>
-            <td>Algorithm 1 + tiered index</td>
-            <td class="win">passes</td>
-          </tr>
-          <tr>
-            <td><code>agent.py</code></td>
-            <td>the turn loop + system prompt</td>
-            <td class="win">passes</td>
-          </tr>
-          <tr>
-            <td><code>backend.py</code></td>
-            <td>model calls via the <code>claude</code> CLI</td>
-            <td class="win">live</td>
-          </tr>
-          <tr>
-            <td><code>bench.py</code></td>
-            <td>LongMemEval ingest → judge → score</td>
-            <td class="win">running</td>
-          </tr>
+          <thead>
+            <tr>
+              <th>Arm</th>
+              <th class="num">Correct</th>
+              <th class="num">95% range</th>
+              <th class="num">Largest view</th>
+              <th class="num">Calls</th>
+              <th class="num">Model cost / q</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>naru</code></td>
+              <td class="num win">72/96</td>
+              <td class="num">65-83%</td>
+              <td class="num">2,174t</td>
+              <td class="num">3.7</td>
+              <td class="num">$0.3547</td>
+            </tr>
+            <tr>
+              <td><code>full</code></td>
+              <td class="num">64/96</td>
+              <td class="num">57-75%</td>
+              <td class="num lose">124,073t</td>
+              <td class="num win">1.0</td>
+              <td class="num lose">$0.8036</td>
+            </tr>
+            <tr>
+              <td><code>rag</code></td>
+              <td class="num">59/96</td>
+              <td class="num">51-71%</td>
+              <td class="num win">2,142t</td>
+              <td class="num win">1.0</td>
+              <td class="num win">$0.0753</td>
+            </tr>
+          </tbody>
         </table>
         <p class="note">
-          Stdlib only — no pip install. Every file runs its own check with
-          <code>python3 &lt;file&gt;</code>; the first four need no network.
+          Naru had the highest accuracy in this run. No pair passed the
+          paired-test cutoff of 0.0167, which is lower because the report tests
+          three pairs. The run does not prove an accuracy winner. The ranking
+          reversed on the smaller Haiku run. <code>rag</code> stayed cheapest.
         </p>
       </div>
 
       <div class="card">
-        <h3>Swapping the model</h3>
-        <div class="mini">
-          <p>
-            Only <code>backend.py</code> knows about Claude, and its whole
-            contract is one function:
-          </p>
-          <pre><code><span class="kw">def</span> backend(prompt: str, system: str | <span class="kw">None</span>) -> str</code></pre>
-          <p style="margin-top: 10px">
-            Codex CLI (<code>codex exec</code>), an OpenAI or Gemini SDK call, a
-            local Ollama endpoint — anything matching that signature drops in.
-            The paper swaps six different backbones with the harness held fixed.
-          </p>
-        </div>
+        <h3>How to read that result</h3>
+        <p class="mini">
+          LongMemEval often asks for one stored fact, so a top-eight BM25
+          retrieval can do well. The category gap in this run appeared in
+          temporal reasoning and preference following, where the answer needs
+          work across several rows. These category checks were done after the
+          run and remain descriptive.
+        </p>
+        <p class="note">
+          The page omits the CLI's billed-input field. It does not reconcile
+          across runs. View size and the CLI's own cost stay consistent.
+        </p>
       </div>
 
       <footer>
-        Implementation of
-        <i
-          >Context as an Environment: Programmatic Context Management for
-          Long-Horizon Agents</i
-        >, Lin et al.,
-        <a href="https://arxiv.org/abs/2608.21690">arXiv&nbsp;2608.21690</a>.
-        Benchmark:
-        <a href="https://github.com/xiaowu0162/LongMemEval">LongMemEval</a>
-        (ICLR&nbsp;2025). Scores above are from our own runs with Haiku&nbsp;4.5
-        and an LLM judge that is <b>not</b> the benchmark's official judge
-        prompt — they are indicative of our own progress, not comparable to
-        published leaderboard numbers.
+        Naru combines several research ideas and adds shared, reviewed memory
+        for coding agents. Read
+        <a href="README.md">README.md</a> for setup and
+        <a href="docs/adr/">docs/adr/</a> for the recorded reasons behind the
+        design. The benchmark uses
+        <a href="https://github.com/xiaowu0162/LongMemEval">LongMemEval</a>.
+        Its judge prompt differs from the official benchmark prompt, so the
+        scores track this repository only.
       </footer>
     </div>
   </body>

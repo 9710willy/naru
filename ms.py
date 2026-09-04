@@ -15,6 +15,7 @@ Interface follows the Appendix-C spec of arXiv 2608.21690:
 Stdlib only. No embeddings, no service, deterministic.
 """
 
+import hashlib
 import os
 import pathlib
 import re
@@ -181,11 +182,25 @@ class MemorySurface:
         """)
         self._migrate_fts()
         self._migrate_cols()
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS naru_meta(
+                id INTEGER PRIMARY KEY,
+                store_uuid TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO naru_meta(id, store_uuid)
+            VALUES(1, lower(hex(randomblob(16))));
+        """)
+        store_uuid = self.db.execute(
+            "SELECT store_uuid FROM naru_meta WHERE id=1"
+        ).fetchone()["store_uuid"]
+        location = ":memory:" if db == ":memory:" else str(pathlib.Path(db).resolve())
+        self.store_id = hashlib.sha256(f"{location}\0{store_uuid}".encode()).hexdigest()
+        self.db.commit()
         self._blob_tmp = tempfile.TemporaryDirectory(prefix="naru-blobs-") \
             if db == ":memory:" and blobs is None else None
         self.blobs = pathlib.Path(
             self._blob_tmp.name if self._blob_tmp else blobs or
-            pathlib.Path(tempfile.gettempdir()) / f"naru-blobs-{id(self):x}"
+            pathlib.Path(tempfile.gettempdir()) / f"naru-blobs-{self.store_id}"
         )
         self.blob_threshold = BLOB_THRESHOLD
 
@@ -267,6 +282,10 @@ class MemorySurface:
             "CREATE INDEX IF NOT EXISTS ix_promoted_sources"
             " ON conversation_history(source_run_id, source_seq_lo, source_seq_hi)"
             " WHERE kind IN ('claim','skill') AND promoted=1 AND source_run_id IS NOT NULL"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_session_id"
+            " ON conversation_history(session_id)"
         )
         self.db.commit()
 
@@ -547,6 +566,34 @@ class MemorySurface:
         self.db.execute("VACUUM")
         return len(seqs)
 
+    def gc_blobs(self):
+        """Delete unreferenced payload files owned by this Event Log."""
+        if not self.blobs.is_dir():
+            return 0, 0
+        live = {
+            r["payload_path"]
+            for r in self.db.execute(
+                "SELECT payload_path FROM conversation_history"
+                " WHERE payload_path IS NOT NULL"
+            )
+        }
+        removed = freed = 0
+        for path in self.blobs.iterdir():
+            if not path.is_file() or str(path) in live:
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+            freed += size
+        try:
+            self.blobs.rmdir()
+        except OSError:
+            pass
+        return removed, freed
+
     def pending(self, k=50):
         """Claims and skills still awaiting a human decision, oldest first."""
         return [
@@ -635,29 +682,8 @@ class MemorySurface:
                     f"  · {r.agent_id or 'unknown'}: {_oneline(r.content)}"
                     for r in rows
                 ]
-        shelved = self._dropped_keys() - set(keyed)
-        if shelved:
-            if lines:
-                lines.append("")
-            lines.append("## Archive — not loaded; `naru search \"<terms>\"` to pull one back")
-            lines.append(", ".join(
-                key if kind == "claim" else f"skill:{key}"
-                for kind, key in sorted(shelved)
-            ))
-
         body = "\n".join(lines) or "(nothing promoted yet)"
         return f"# naru · seq {head} · ~{est(body)} tokens\n\n{body}\n"
-
-    def _dropped_keys(self):
-        """Return claim/skill kind-key pairs whose rows were all dropped."""
-        return {
-            (r[0], r[1])
-            for r in self.db.execute(
-                "SELECT kind, topic_key FROM conversation_history"
-                " WHERE kind IN ('claim','skill') AND topic_key IS NOT NULL"
-                " GROUP BY kind, topic_key HAVING max(promoted) = -1"
-            ).fetchall()
-        }
 
     # ---- COMPUTE (read-only SQL) -----------------------------------------
     def sql_query(self, sql, params=()):
@@ -725,6 +751,45 @@ class ReadOnly:
 def demo():
     """Runnable self-check. Fails loudly if any core behavior breaks."""
     ms = MemorySurface(":memory:")
+
+    identity_dir = pathlib.Path(tempfile.mkdtemp())
+    identity_path = identity_dir / "identity.db"
+    first = MemorySurface(str(identity_path))
+    first_id, first_blobs = first.store_id, first.blobs
+    first.close()
+    reopened = MemorySurface(str(identity_path))
+    assert (reopened.store_id, reopened.blobs) == (first_id, first_blobs)
+    reopened.close()
+    identity_path.unlink()
+    replaced = MemorySurface(str(identity_path))
+    assert replaced.store_id != first_id, "a replacement DB reused the old identity"
+    assert replaced.blobs != first_blobs, "a replacement DB reused the old blob root"
+    replaced.close()
+
+    owner_a = MemorySurface(str(identity_dir / "a.db"))
+    owner_b = MemorySurface(str(identity_dir / "b.db"))
+    seq_a = owner_a.append("tool", "preview", payload="A" * 5000)
+    payload_a = pathlib.Path(owner_a.sql_query(
+        "SELECT payload_path FROM conversation_history WHERE seq=?", (seq_a,)
+    )[0].payload_path)
+    seq_b = owner_b.append("tool", "preview", payload="B" * 5000)
+    payload_b = pathlib.Path(owner_b.sql_query(
+        "SELECT payload_path FROM conversation_history WHERE seq=?", (seq_b,)
+    )[0].payload_path)
+    owner_a.blobs.mkdir(parents=True, exist_ok=True)
+    orphan_a = owner_a.blobs / "orphan.txt"
+    orphan_a.write_text("orphan")
+    assert owner_a.gc_blobs() == (1, 6)
+    assert not orphan_a.exists() and payload_a.exists() and payload_b.exists(), (
+        "gc removed a live or foreign payload"
+    )
+    assert owner_a.gc_blobs() == (0, 0), "gc must be idempotent"
+    payload_a.unlink()
+    owner_a.blobs.rmdir()
+    payload_b.unlink()
+    owner_b.blobs.rmdir()
+    owner_a.close()
+    owner_b.close()
 
     s1 = ms.append(
         "user",
@@ -999,15 +1064,16 @@ def demo():
     assert ms.decide(rival, False) == 0, "retiring twice must report 0"
     assert ms.decide(c1, True) == 0, "promoting an already-promoted claim reports 0"
 
-    # a wholly-dropped key leaves a breadcrumb; a key still promoted does not
+    # dropped keys and bodies stay searchable without entering every prompt
     gone = ms.append("agent", "Retry budget was 5.", kind="claim", topic_key="retry.budget")
     ms.decide(gone, False)
     gone_skill = ms.append("agent", "Old procedure.", kind="skill", topic_key="retry.budget")
     ms.decide(gone_skill, False)
     d3 = ms.doc()
-    assert "## Archive" in d3 and "retry.budget" in d3 and "skill:retry.budget" in d3, d3
-    assert "Retry budget" not in d3, "the archive must list keys, not bodies"
-    assert "store.engine" not in d3.split("## Archive")[1], "a live key must not be archived"
+    assert "## Archive" not in d3, d3
+    assert "retry.budget" not in d3 and "Retry budget" not in d3, d3
+    assert ms.search("Retry budget")[0].seq == gone
+    assert ms.search("Old procedure")[0].seq == gone_skill
 
     # doc_version tracks the DOC, not the log: an unrelated append must not
     # read as "the doc moved under you"
@@ -1101,7 +1167,7 @@ def demo():
         r["name"]
         for r in ms.db.execute("SELECT name FROM sqlite_master WHERE type='index'")
     }
-    assert {"ix_promoted", "ix_topic_key", "ix_promoted_sources"} <= idx, idx
+    assert {"ix_promoted", "ix_topic_key", "ix_promoted_sources", "ix_session_id"} <= idx, idx
     plan = " ".join(r["detail"] for r in ms.db.execute(
         "EXPLAIN QUERY PLAN SELECT 1 FROM conversation_history AS curated "
         "WHERE curated.kind IN ('claim','skill') AND curated.promoted=1 "
@@ -1136,7 +1202,14 @@ def demo():
     assert m3.expand(1)[0].content == "legacy row here", "migration lost a row"
     assert m3.search("legacy"), "migration lost the FTS index"
     assert m3.expand(1)[0].promoted == 0, "migrated rows must default to pending"
+    outline_plan = " ".join(r["detail"] for r in m3.db.execute(
+        "EXPLAIN QUERY PLAN SELECT content FROM conversation_history"
+        " WHERE session_id IS ? AND (kind IS NULL OR kind NOT GLOB 'agent_*')"
+        " ORDER BY (role != 'user'), seq LIMIT 1", (None,)
+    ))
+    assert "ix_session_id" in outline_plan, outline_plan
     m4 = MemorySurface(str(legacy))
+    assert m4.store_id == m3.store_id, "migration changed the store identity"
     m4.close()
 
     # section 2.2: the Event Log is READ-ONLY from the kernel

@@ -27,7 +27,7 @@ pointing it at a CLAUDE.md you maintain by hand is safe.
     naru outline
     naru show 12 18 [--run ID]
     naru prune [days] [--dry-run]   # default 30; deletes older rows + index
-    naru gc                          # remove orphaned blob dirs
+    naru gc                          # remove this store's orphaned blobs
     naru stats [days]                # spill/recovery observability
 
 Harness-agnostic by construction: anything that can run a shell command can
@@ -106,17 +106,6 @@ def _splice(path, text):
         new = (old.rstrip() + "\n\n" if old.strip() else "") + block
     p.write_text(new)
     return len(block), len(old)
-
-
-def _opened(lo, hi):
-    """True when both cited endpoints fall inside a range someone opened.
-
-    ADR 0010. `ms.append` already proves a cited seq exists; this proves a
-    reader saw it. The endpoints are enough: `show LO HI` covers everything
-    between them, and a claim cites the span it read, not two loose rows.
-    """
-    spans = metrics.opened()
-    return all(any(a <= s <= b for a, b in spans) for s in (lo, hi))
 
 
 def _j_dumps(events):
@@ -289,8 +278,8 @@ def main(argv):
                 return 2
         else:
             lo = hi = None
-        if source and not _opened(lo, hi):
-            cited = f"seq {lo}" if lo == hi else f"seq {lo} or {hi}"
+        if source and not metrics.opened(ms.store_id, run, lo, hi):
+            cited = f"seq {lo}" if lo == hi else f"seq {lo}-{hi}"
             print(
                 f"refused: nothing opened {cited}. A claim may cite only evidence"
                 f' its author read: `naru show {lo} {hi} --run "{run}"` first.',
@@ -436,10 +425,12 @@ def main(argv):
         except ValueError:
             print("show sequence values must be integers", file=sys.stderr)
             return 2
-        metrics.record("show", seq=lo, hi=hi if hi is not None else lo)
-        for r in ms.expand(lo, hi, session_id=run) if run else ms.expand(lo, hi):
+        rows = ms.expand(lo, hi, session_id=run) if run else ms.expand(lo, hi)
+        for r in rows:
             print(f"--- [{r.seq}] {r.created_at} | {r.session_id}")
             print(r.content)
+        if rows:
+            metrics.record_show(ms.store_id, run, rows[0].seq, rows[-1].seq)
 
     elif cmd == "prune":
         days = int(args[0]) if args and args[0].isdigit() else 30
@@ -477,27 +468,8 @@ def main(argv):
         print("\n".join(metrics.report(days=days, threshold=THRESHOLD)))
 
     elif cmd == "gc":
-        # Orphaned blob directories from before the hook stopped writing them.
-        import shutil
-        import tempfile
-
-        live = {
-            r.payload_path
-            for r in ms.sql_query(
-                "SELECT payload_path FROM conversation_history"
-                " WHERE payload_path IS NOT NULL"
-            )
-        }
-        freed = n = 0
-        for d in pathlib.Path(tempfile.gettempdir()).glob("naru-blobs-*"):
-            if not d.is_dir():
-                continue
-            if any(str(f) in live for f in d.iterdir()):
-                continue  # still referenced by a row
-            freed += sum(f.stat().st_size for f in d.iterdir() if f.is_file())
-            shutil.rmtree(d, ignore_errors=True)
-            n += 1
-        print(f"removed {n} orphaned blob dir(s), freed {freed / 1024:.0f} KB")
+        n, freed = ms.gc_blobs()
+        print(f"removed {n} orphaned blob item(s), freed {freed / 1024:.0f} KB")
 
     else:
         print(f"unknown command {cmd!r}\n{__doc__}", file=sys.stderr)
@@ -526,7 +498,6 @@ def demo():
 
 
 def _demo(real_stdin):
-
     assert (
         main(
             [
@@ -805,8 +776,40 @@ def _demo(real_stdin):
     assert not [c for c in store().pending() if c.content == "unread"]
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
+        assert main(["show", str(reply), str(observation), "--run", "wrong"]) == 0
+    assert not buf.getvalue(), "a wrong-run show printed rows"
+    assert not metrics.opened(ms.store_id, "wrong", reply, observation)
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert main(["show", str(reply), "--run", trace_run]) == 0
+        assert main(["show", str(observation), "--run", trace_run]) == 0
+    assert main([
+        "claim", "split", "--key", "split.fact", "--run", trace_run,
+        "--source", f"{reply}:{observation}",
+    ]) == 2, "two endpoint receipts authorized an unopened middle"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
         assert main(["show", str(reply), str(observation), "--run", trace_run]) == 0
     assert "evidence" in buf.getvalue()
+    other_db = DB.parent / "other.db"
+    other = MemorySurface(str(other_db))
+    assert not metrics.opened(other.store_id, trace_run, reply, observation), (
+        "a receipt crossed Event Log stores"
+    )
+    other_seq = other.append("tool", "preview", payload="B" * 5000)
+    other_payload = pathlib.Path(other.sql_query(
+        "SELECT payload_path FROM conversation_history WHERE seq=?", (other_seq,)
+    )[0].payload_path)
+    other.close()
+    primary = store()
+    primary.blobs.mkdir(parents=True, exist_ok=True)
+    orphan = primary.blobs / "orphan.txt"
+    orphan.write_text("orphan")
+    primary.close()
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert main(["gc"]) == 0
+    assert not orphan.exists() and other_payload.exists(), "gc crossed Event Log stores"
+    other_payload.unlink()
+    other_payload.parent.rmdir()
     assert main([
         "claim", "trace fact", "--key", "trace.fact", "--run", trace_run,
         "--source", f"{reply}:{observation}",

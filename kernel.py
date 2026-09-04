@@ -14,6 +14,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 
@@ -250,6 +251,15 @@ def _exit_reason(rc):
     return f"{name}{hint}"
 
 
+def _kill_process_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        if proc.poll() is None:
+            with contextlib.suppress(OSError):
+                proc.kill()
+
+
 class SandboxedKernel:
     """Kernel.run/digest, executed in a child process.
 
@@ -295,10 +305,12 @@ class SandboxedKernel:
         self.callbacks = dict(callbacks or {})
         self.timeout = timeout
         self._proc = None
+        self._stderr = None
         self._why = "not started"
 
     # -- child lifecycle ----------------------------------------------------
     def _spawn(self):
+        self._stop()
         env = dict(os.environ)
         env["NARU_KERNEL_PATH"] = str(pathlib.Path(__file__).resolve().parent)
         env["NARU_KERNEL_CALLBACKS"] = json.dumps(sorted(self.callbacks))
@@ -319,33 +331,55 @@ class SandboxedKernel:
             "-c",
             _CHILD,
         ]
-        self._proc = subprocess.Popen(
-            argv,
-            # Its own process group. Under NARU_KERNEL_JAIL self._proc is the
-            # jail command, and killing it leaves the python child it wrapped
-            # running. The group kills both.
-            start_new_session=True,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            # Kept, not discarded: it is the only diagnostic for a child that
-            # dies before it can frame a reply, and a typo in the bootstrap
-            # otherwise reads as "your cell crashed the kernel".
-            stderr=subprocess.PIPE,
-            env=env,
-            text=True,
-        )
+        self._stderr = tempfile.TemporaryFile(mode="w+t")
+        try:
+            self._proc = subprocess.Popen(
+                argv,
+                # Its own process group. Under NARU_KERNEL_JAIL self._proc is the
+                # jail command, and killing it leaves the python child it wrapped
+                # running. The group kills both.
+                start_new_session=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                # A file keeps crash diagnostics without waiting for a
+                # descendant that inherited stderr to close a pipe.
+                stderr=self._stderr,
+                env=env,
+                text=True,
+            )
+        except Exception:
+            self._stderr.close()
+            self._stderr = None
+            raise
+
+    def _stderr_tail(self):
+        if not self._stderr:
+            return ""
+        try:
+            self._stderr.flush()
+            self._stderr.seek(0)
+            return (self._stderr.read() or "").strip()[-300:]
+        except (OSError, ValueError):
+            return ""
+
+    def _stop(self):
+        proc = self._proc
+        if proc is None:
+            return None, ""
+        _kill_process_group(proc)
+        try:
+            rc = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            rc = proc.poll()
+        cause = self._stderr_tail()
+        if self._stderr:
+            self._stderr.close()
+        self._stderr = None
+        self._proc = None
+        return rc, cause
 
     def close(self):
-        if self._proc and self._proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                self._proc.kill()  # no group, or already gone
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-        self._proc = None
+        self._stop()
 
     def _ask(self, msg):
         """One request, one reply. Returns None if the child died or hung."""
@@ -394,21 +428,7 @@ class SandboxedKernel:
         # on readline, so the child is hung; finished with no reply means
         # stdout hit EOF and the child is on its way out.
         hung = t.is_alive()
-        cause, rc = "", None
-        if not hung and self._proc:
-            # Drain stderr BEFORE wait(): an unread PIPE blocks wait(), which
-            # turned every crash back into a reported timeout. Safe here only
-            # because stdout already reached EOF, so stderr will too.
-            if self._proc.stderr:
-                try:
-                    cause = (self._proc.stderr.read() or "").strip()[-300:]
-                except (OSError, ValueError):
-                    cause = ""
-            try:
-                rc = self._proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                hung = True
-        self.close()
+        rc, cause = self._stop()
         self._why = (
             f"exceeded {self.timeout}s wall clock"
             if hung
@@ -592,6 +612,28 @@ def demo():
         assert lim["cpu_s"] == 30, lim
     finally:
         sk.close()
+
+    from time import monotonic
+
+    descendant = SandboxedKernel(timeout=1)
+    try:
+        descendant._spawn()
+        assert descendant._proc.stderr is None and descendant._stderr.seekable(), (
+            "sandbox stderr must use a regular temporary file"
+        )
+        descendant.close()
+        started = monotonic()
+        _, err = descendant.run(
+            "import os, subprocess, sys\n"
+            "subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(3)'], stdout=subprocess.DEVNULL)\n"
+            "os._exit(0)"
+        )
+        elapsed = monotonic() - started
+        assert err and "died" in err, err
+        assert elapsed < 2.5, f"descendant stderr held the parent for {elapsed:.2f}s"
+    finally:
+        descendant.close()
 
     # Whether the report is TRUE, not merely well-formed. "isinstance(x, int)
     # or 'NOT APPLIED' in str(x)" accepts both branches and is a tautology, so

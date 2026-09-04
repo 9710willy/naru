@@ -2,14 +2,14 @@
 
 import argparse
 import json
+import os
 import pathlib
-import shutil
 import tempfile
 from datetime import datetime
 
 from backend import HAIKU
 from agent import run_naru
-from bench import ingest, one
+from bench import backend_label, discard_log, ingest, one
 
 
 BEAM_CHATS = pathlib.Path("/private/tmp/beam/chats/100K")
@@ -108,6 +108,7 @@ def summary(rows):
 def run(args):
     rows = []
     for q in load(args.beam_dir, args.n, args.qtype):
+        trace = [] if args.trace else None
         row = one(
             q,
             "naru",
@@ -116,6 +117,7 @@ def run(args):
             args.max_turns,
             args.budget,
             args.verbose,
+            trace=trace,
         )
         rows.append(row)
         print(f"{'+' if row['correct'] else '-'} {row['qid']}")
@@ -128,6 +130,8 @@ def run(args):
             "judge_model": args.judge_model,
             "max_turns": args.max_turns,
             "budget": args.budget,
+            "backend": backend_label(os.environ.get("NARU_BACKEND")),
+            "trace": args.trace,
         },
         "summary": summary(rows),
         "rows": rows,
@@ -172,10 +176,7 @@ def replay(args):
             rows.append(row)
             print(f"{row['qid']}: " + ", ".join(map(str, prompts)))
         finally:
-            path = ms.path
-            ms.close()
-            if path != ":memory:":
-                shutil.rmtree(pathlib.Path(path).parent, ignore_errors=True)
+            discard_log(ms)
     n = len(rows)
     result = {
         "config": {"beam_dir": str(args.beam_dir), "n": args.n, "qtype": args.qtype,
@@ -252,6 +253,7 @@ def main():
     ap.add_argument("--budget", type=int, default=6000)
     ap.add_argument("--out")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--trace", action="store_true")
     ap.add_argument("--selfcheck", action="store_true")
     ap.add_argument("--replay", action="store_true")
     args = ap.parse_args()

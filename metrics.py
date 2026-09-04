@@ -62,22 +62,23 @@ def read(days=None):
     return out
 
 
-def opened(days=None):
-    """Closed seq intervals a reader actually opened.
+def record_show(store_id, run_id, lo, hi):
+    """Record one printed span with the store and run that own it."""
+    record("show", v=2, store=store_id, run=run_id, lo=lo, hi=hi)
 
-    `naru show LO HI` prints every row in the range, so one event covers the
-    whole closed interval. Only `show` counts. `search` prints a 300-char
-    preview, and a preview is not an open — that distinction is the whole
-    point of the citation lock (ADR 0010).
-    """
-    spans = []
-    for e in read(days):
-        if e.get("e") != "show" or type(e.get("seq")) is not int:
-            continue
-        lo = e["seq"]
-        hi = e.get("hi")
-        spans.append((lo, hi if type(hi) is int and hi >= lo else lo))
-    return spans
+
+def opened(store_id, run_id, lo, hi, days=None):
+    """True when one receipt covers the whole cited span."""
+    return any(
+        e.get("e") == "show"
+        and e.get("v") == 2
+        and e.get("store") == store_id
+        and e.get("run") == run_id
+        and type(e.get("lo")) is int
+        and type(e.get("hi")) is int
+        and e["lo"] <= lo <= hi <= e["hi"]
+        for e in read(days)
+    )
 
 
 def _pct(vals, p):
@@ -171,17 +172,25 @@ def demo():
     record("hook", tool="Bash", chars=500, spilled=False)
     record("hook", tool="Bash", chars=30000, kept=1300, spilled=True, seq=1)
     record("hook", tool="Bash", chars=7000, spilled=False)
-    record("show", seq=1)
+    record_show("store-a", "run-a", 1, 3)
+    record_show("store-a", "run-a", 10, 10)
+    record_show("store-a", "run-a", 12, 12)
+    record("show", store="store-a", run="run-a", lo=20, hi=22)
     record("error", msg="disk full")
 
     ev = read()
-    assert len(ev) == 5, ev
+    assert len(ev) == 8, ev
+    assert opened("store-a", "run-a", 1, 3)
+    assert not opened("store-b", "run-a", 1, 3)
+    assert not opened("store-a", "run-b", 1, 3)
+    assert not opened("store-a", "run-a", 10, 12), "split receipts covered a span"
+    assert not opened("store-a", "run-a", 20, 22), "legacy receipt authorized a span"
     out = "\n".join(report(threshold=10000))
     assert "hook invocations         3" in out, out
     assert "spilled                1  (33% of calls)" in out, out
     assert "tokens kept out of context" in out
     assert "7,175" in out, out  # (30000-1300)/4 tokens saved
-    assert "recoveries used          1" in out or "recoveries used        1" in out, out
+    assert "recoveries used          4" in out or "recoveries used        4" in out, out
     assert "ERRORS" in out and "disk full" in out
     # a 7,000-char skip is >60% of a 10,000 threshold -> should advise lowering
     assert "consider lowering" in out, out

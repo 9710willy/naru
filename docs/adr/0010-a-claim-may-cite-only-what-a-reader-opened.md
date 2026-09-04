@@ -19,14 +19,20 @@ material.
 
 ## Decision
 
-`naru claim` and `naru skill` refuse a `--run ID --source LO:HI` unless both
-endpoints fall inside a range that a `naru show` recorded. `show` now records
-the far endpoint as well, since it prints every row in the range.
+`naru claim` and `naru skill` refuse a `--run ID --source LO:HI` unless one
+versioned `naru show` receipt covers the full closed span. The receipt must
+name the same Event Log incarnation and run. Two receipts that cover only the
+endpoints do not prove that a reader opened the rows between them.
+
+`show` records the first and last row only after it prints at least one row. A
+wrong run or an empty range leaves no receipt. Old receipts lack store and run
+identity, so they remain metrics but cannot authorize a claim.
 
 Only `show` counts as an open. `search` prints 300 characters per hit, and a
 preview is the thing that created the problem.
 
-The check lives in `naru.py`, not in `ms.append`.
+The check lives in `naru.py`, not in `ms.append`. ADR 0011 defines the store
+identity shared by receipts and blob ownership.
 
 ## Why
 
@@ -36,9 +42,12 @@ row, but its reader reaches history through `ms.expand`, which never touches
 `metrics`. A check inside `append` would refuse every state the benchmark
 writes.
 
+One covering receipt also proves the middle of a span. Checking each endpoint
+against any receipt lets two separate one-row opens authorize unread rows.
+
 ## Limits
 
-Two, both real.
+These limits are real.
 
 `naru prune` trims `metrics.jsonl` to the same window it prunes rows with, 30
 days by default. An open older than that no longer proves anything, so a claim
@@ -50,3 +59,7 @@ This is an integrity check, not a security boundary. Anything that can run
 `naru claim` can also run `naru show`, or append a line to `metrics.jsonl`. It
 catches an agent that cites what it skimmed. It does not stop one that decides
 to lie, and the promote gate remains the thing that does.
+
+Receipts written before version 2 do not authorize new claims. Moving a
+database also changes its store identity, so receipts from its old path no
+longer apply.

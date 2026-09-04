@@ -22,25 +22,36 @@ from itertools import combinations
 def load(path):
     d = json.loads(pathlib.Path(path).read_text())
     by_arm = {}
+    excluded = {"rows": 0, "backend": 0, "judge": 0}
     for r in d["rows"]:
+        backend = bool(r.get("errors"))
+        judge = bool(r.get("judge_errors"))
+        if backend or judge:
+            excluded["rows"] += 1
+            excluded["backend"] += backend
+            excluded["judge"] += judge
+            continue
         by_arm.setdefault(r["arm"], {})[r["qid"]] = bool(r["correct"])
-    return by_arm
+    return by_arm, excluded
 
 
 def main(paths):
     if len(paths) < 2:
         sys.exit("need at least two result files to measure run-to-run movement")
-    runs = [(pathlib.Path(p).stem, load(p)) for p in paths]
+    runs = [(pathlib.Path(p).stem, *load(p)) for p in paths]
     arms = sorted(set().union(*(set(r[1]) for r in runs)))
 
     print(f"replicates: {len(runs)}")
-    for name, _ in runs:
-        print(f"  {name}")
+    for name, _, excluded in runs:
+        print(
+            f"  {name} | excluded {excluded['rows']} error row(s)"
+            f" (backend {excluded['backend']}, judge {excluded['judge']})"
+        )
     print()
 
     floors = {}
     for arm in arms:
-        present = [(n, r[arm]) for n, r in runs if arm in r]
+        present = [(n, r[arm]) for n, r, _ in runs if arm in r]
         if len(present) < 2:
             print(f"{arm}: only one replicate, cannot measure\n")
             continue
@@ -82,7 +93,7 @@ def main(paths):
     if len(arms) == 2:
         print("-" * 68)
         print("paired arm comparison (McNemar exact, on discordant pairs)")
-        for name, r in runs:
+        for name, r, _ in runs:
             if all(x in r for x in arms):
                 a_only, b_only, pv = mcnemar(r[arms[0]], r[arms[1]])
                 sig = "significant" if pv < 0.05 else "NOT significant"
@@ -93,7 +104,7 @@ def main(paths):
     if floors:
         obs = max(f[0] for f in floors.values())
         pot = max(f[1] for f in floors.values())
-        n = max(len(r[arm]) for _, r in runs for arm in r)
+        n = max(len(r[arm]) for _, r, _ in runs for arm in r)
         # Flips are per-question and roughly independent, so run-to-run movement
         # in ACCURACY scales as 1/sqrt(n), not with the flip rate itself. The
         # flip rate is the pathological all-one-direction case and is not a
@@ -149,6 +160,8 @@ def mcnemar(a, b):
 
 def demo():
     """Self-check on synthetic replicates — no API calls."""
+    import contextlib
+    import io
     import tempfile
 
     d = pathlib.Path(tempfile.mkdtemp())
@@ -163,6 +176,27 @@ def demo():
         p.write_text(json.dumps({"rows": rows}))
         return str(p)
 
+    failed = d / "failed.json"
+    failed.write_text(json.dumps({"rows": [
+        {"arm": "naru", "qid": "ok", "correct": False},
+        {"arm": "naru", "qid": "backend", "correct": False, "errors": 1},
+        {"arm": "naru", "qid": "judge", "correct": False, "judge_errors": 1},
+        {
+            "arm": "naru", "qid": "both", "correct": False,
+            "errors": 1, "judge_errors": 1,
+        },
+    ]}))
+    verdicts, excluded = load(failed)
+    assert verdicts == {"naru": {"ok": False}}, verdicts
+    assert excluded == {"rows": 3, "backend": 2, "judge": 2}, excluded
+    assert mcnemar({"a": False, "b": False}, {"a": True, "b": True}) == (
+        0, 2, 0.5
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main([failed, failed]) == 0
+    assert "excluded 3 error row(s) (backend 2, judge 2)" in buf.getvalue()
+
     # identical runs => zero spread, zero flips
     same = {"naru": {"q1": True, "q2": True, "q3": False, "q4": True}}
     a, b = write("runA", same), write("runB", same)
@@ -172,7 +206,7 @@ def demo():
     r1 = {"naru": {"q1": True, "q2": False, "q3": True, "q4": True}}
     r2 = {"naru": {"q1": False, "q2": True, "q3": True, "q4": True}}
     c, e = write("runC", r1), write("runE", r2)
-    runs = [("c", load(c)), ("e", load(e))]
+    runs = [("c", load(c)[0]), ("e", load(e)[0])]
     accs = [100 * sum(v["naru"].values()) / 4 for _, v in runs]
     assert accs[0] == accs[1], "accuracy should be identical here"
     flipped = [q for q in r1["naru"] if r1["naru"][q] != r2["naru"][q]]
