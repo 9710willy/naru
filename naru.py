@@ -108,6 +108,17 @@ def _splice(path, text):
     return len(block), len(old)
 
 
+def _opened(lo, hi):
+    """True when both cited endpoints fall inside a range someone opened.
+
+    ADR 0010. `ms.append` already proves a cited seq exists; this proves a
+    reader saw it. The endpoints are enough: `show LO HI` covers everything
+    between them, and a claim cites the span it read, not two loose rows.
+    """
+    spans = metrics.opened()
+    return all(any(a <= s <= b for a, b in spans) for s in (lo, hi))
+
+
 def _j_dumps(events):
     """Serialize metric events exactly as record() writes them."""
     import json
@@ -278,6 +289,14 @@ def main(argv):
                 return 2
         else:
             lo = hi = None
+        if source and not _opened(lo, hi):
+            cited = f"seq {lo}" if lo == hi else f"seq {lo} or {hi}"
+            print(
+                f"refused: nothing opened {cited}. A claim may cite only evidence"
+                f' its author read: `naru show {lo} {hi} --run "{run}"` first.',
+                file=sys.stderr,
+            )
+            return 2
         if base:
             try:
                 base_seq = int(base)
@@ -417,7 +436,7 @@ def main(argv):
         except ValueError:
             print("show sequence values must be integers", file=sys.stderr)
             return 2
-        metrics.record("show", seq=lo)
+        metrics.record("show", seq=lo, hi=hi if hi is not None else lo)
         for r in ms.expand(lo, hi, session_id=run) if run else ms.expand(lo, hi):
             print(f"--- [{r.seq}] {r.created_at} | {r.session_id}")
             print(r.content)
@@ -778,6 +797,16 @@ def _demo(real_stdin):
         "tool", "evidence", kind="agent_observation", session_id=trace_run,
         created_at="2026-08-27T12:00:01",
     )
+    # ADR 0010: the evidence exists, but nobody has opened it yet.
+    assert main([
+        "claim", "unread", "--key", "unread.fact", "--run", trace_run,
+        "--source", f"{reply}:{observation}",
+    ]) == 2, "a claim cited evidence no reader had opened"
+    assert not [c for c in store().pending() if c.content == "unread"]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["show", str(reply), str(observation), "--run", trace_run]) == 0
+    assert "evidence" in buf.getvalue()
     assert main([
         "claim", "trace fact", "--key", "trace.fact", "--run", trace_run,
         "--source", f"{reply}:{observation}",

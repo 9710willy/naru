@@ -77,6 +77,10 @@ itself.
   the migration self-check's legacy table must _omit_ it — otherwise the test
   passes while every existing store fails `append()`. `agent_id` had neither,
   and the spill hook swallowed the error, so 72 spills were lost in silence.
+- A `claim` that cites `--run`/`--source` is refused unless a `naru show`
+  recorded an open covering both endpoints (ADR 0010). The check is in
+  `naru.py`, not `ms.append`, because `agent.py` writes provenance for states
+  whose reader used `ms.expand` and never touched `metrics`.
 - One owner for `NARU_SPILL_THRESHOLD`: the default in `hook_spill.py`. Setting
   it inline on the hook command makes `naru stats` judge the distribution
   against a threshold the hook never ran at.

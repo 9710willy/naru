@@ -62,6 +62,24 @@ def read(days=None):
     return out
 
 
+def opened(days=None):
+    """Closed seq intervals a reader actually opened.
+
+    `naru show LO HI` prints every row in the range, so one event covers the
+    whole closed interval. Only `show` counts. `search` prints a 300-char
+    preview, and a preview is not an open — that distinction is the whole
+    point of the citation lock (ADR 0010).
+    """
+    spans = []
+    for e in read(days):
+        if e.get("e") != "show" or type(e.get("seq")) is not int:
+            continue
+        lo = e["seq"]
+        hi = e.get("hi")
+        spans.append((lo, hi if type(hi) is int and hi >= lo else lo))
+    return spans
+
+
 def _pct(vals, p):
     if not vals:
         return 0
