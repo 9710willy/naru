@@ -28,7 +28,6 @@ from datetime import datetime
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import metrics
-from ms import DEFAULT_DB
 
 # One owner for the number. It used to be set inline on the hook command in
 # settings.json, so `naru stats` (which imports THRESHOLD) judged the spill
@@ -36,7 +35,24 @@ from ms import DEFAULT_DB
 THRESHOLD = int(os.environ.get("NARU_SPILL_THRESHOLD", "4000"))  # chars
 KEEP = int(os.environ.get("NARU_SPILL_PREVIEW", "600"))
 SIGNPOST_EVERY = 40  # one signpost line per N lines of spilled text
-DB = pathlib.Path(os.environ.get("NARU_SPILL_DB", DEFAULT_DB))
+# Resolved lazily. 94% of calls stay under THRESHOLD and never open a store,
+# and `import ms` costs ~8 ms of the hook's ~34 ms on every tool call. `ms`
+# stays the one owner of the default path (see CLAUDE.md).
+DB = (
+    pathlib.Path(os.environ["NARU_SPILL_DB"])
+    if os.environ.get("NARU_SPILL_DB")
+    else None
+)
+
+
+def db():
+    global DB
+    if DB is None:
+        from ms import DEFAULT_DB
+
+        DB = pathlib.Path(DEFAULT_DB)
+    return DB
+
 
 # Text-bearing fields, in the order tools tend to use them.
 TEXT_FIELDS = ("stdout", "content", "output", "text", "result", "stderr")
@@ -104,8 +120,8 @@ def main():
     try:
         from ms import MemorySurface
 
-        DB.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        ms = MemorySurface(str(DB))
+        db().parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ms = MemorySurface(str(db()))
         seq = ms.append(
             "tool",
             text,
@@ -212,7 +228,7 @@ def demo():
     # the full text really is recoverable, verbatim
     from ms import MemorySurface
 
-    ms = MemorySurface(str(DB))
+    ms = MemorySurface(str(db()))
     assert ms.expand(1)[0].content == big, "spilled text not recovered verbatim"
     assert ms.search("line", k=3), "spilled text not searchable"
 
