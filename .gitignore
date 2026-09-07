@@ -5,3 +5,11 @@ __pycache__/
 .ruff_cache/
 blobs/
 *.db
+
+# Per-question run artifacts: every row holds `gold` and `answer`.
+# Same rule as results/published/ — a public repo must not carry them.
+.audit/beam-quality-*.json
+.audit/beam-replay-*.json
+.audit/beam-terra-*.json
+.audit/beam-trace-*.json
+docs/papers/

@@ -1,0 +1,11 @@
+id	hypothesis	change	before	after	delta	tests	verdict	note
+B0	live Codex backend can drive and judge BEAM	no product change	unmeasured	0/1	baseline	beam.py --selfcheck pass	kept	abstention answer used a request as proof of completed work
+B1	measure the frozen 10-question slice	no product change	unmeasured	3/10	baseline	0 backend errors; 0 judge errors	kept	37 agent turns plus judge votes; a date-question repeat flipped from fail to pass
+C1	missing headline fields abort useful cells	default omitted next_action	median 4/10	3/10	-1	agent, bench, replay pass	reverted	active view fell to 285.8 but answer quality stayed inside noise
+C2	batch merging hides BEAM turn groups	map each turn group as a session	1992.1 replay	4591.2 replay	+130.5%	beam selfcheck pass	reverted	failed context gate before paid quality run; peak rose 395.0 to 1563.7
+C3	broad questions need a compact scan strategy	add a BEAM-only search guide	median 4/10	3/10	-1	beam, bench, replay pass	reverted	quality stayed inside noise; mean peak view rose to 860.5
+C4	retrieval and answer in one cell causes premature guesses	force separate retrieval and answer cells	median 4/10	1/10	-3	agent, bench, replay pass	reverted	mean peak view rose to 1035.7 and the added turn pressure hurt nine categories
+C5	long code blocks crowd concise facts out of BM25 top five	penalize search rows over 1000 chars	median 4/10	1/10	-3	ms, agent, bench, beam, replay pass	reverted	better offline ranks did not improve model use; mean peak view 537.1
+C6	six turns cut off recovery after malformed cells	raise max_turns from 6 to the default 8	median 4/10	1/10	-3	0 backend errors; 0 judge errors	reverted	mean peak view rose to 1121.3; two extra turns did not help
+C7	more reasoning improves evidence use	raise gpt-5.6-luna reasoning from low to medium	fresh control 3/10	0/10	-3	0 backend errors; 0 judge errors	reverted	medium took longer and stopped eight cases after two turns; mean peak view 361.9
+C8	a stronger model improves stable failures	switch agent and judge from gpt-5.6-luna low to gpt-5.6-terra low	0/3 stable-failure canary	0/3	0	0 backend errors; 0 judge errors	reverted	event ordering and multi-session reasoning answered without reading memory; no full run
