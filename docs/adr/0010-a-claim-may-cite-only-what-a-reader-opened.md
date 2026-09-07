@@ -11,11 +11,11 @@ The spill hook makes that gap reachable. It replaces a large tool result with
 line 121 of a 4,635-character file and cite the whole row having read an eighth
 of it. The handle resolves, the endpoints exist, and the claim is false.
 
-Agent Zero Memory (arXiv 2608.29606, Definition 2) names the rule this needs.
-Let `O` be the items a reader actually opened. An answer may cite only `C ⊆ O`,
-and a reader that cannot assemble such a `C` must abstain. The paper enforces it
-by construction: the reader's interface offers no channel for citing unopened
-material.
+Agent Zero Memory ([arXiv 2608.29606](https://arxiv.org/abs/2608.29606),
+Definition 2) names the rule this needs. Let `O` be the items a reader actually
+opened. An answer may cite only `C ⊆ O`, and a reader that cannot assemble such
+a `C` must abstain. The paper enforces it by construction: the reader's
+interface offers no channel for citing unopened material.
 
 ## Decision
 

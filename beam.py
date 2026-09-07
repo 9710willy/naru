@@ -1,4 +1,8 @@
-"""Run Naru against the official BEAM chat benchmark."""
+"""Run Naru against the official BEAM chat benchmark.
+
+Benchmark: https://arxiv.org/abs/2510.27246
+Data and reference harness: https://github.com/mohammadtavakoli78/BEAM
+"""
 
 import argparse
 import json

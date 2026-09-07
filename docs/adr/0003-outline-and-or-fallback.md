@@ -8,11 +8,12 @@ navigation layer never existed to be used.
 
 ## Context
 
-Implemented against Appendix C alone (`search` / `expand` / `sql_query` /
-`days_between`), three of twelve oracle questions failed on a vocabulary gap
-pure BM25 cannot cross: `ms.search("homegrown")` returns 0 hits when the log
-says "fresh basil and mint". `ms.outline()` — one line per session — was added
-as a structural way in and mistakenly recorded as our own idea.
+Implemented against Appendix C of [_Context as an
+Environment_](https://arxiv.org/abs/2608.21690) alone (`search` / `expand` /
+`sql_query` / `days_between`), three of twelve oracle questions failed on a
+vocabulary gap pure BM25 cannot cross: `ms.search("homegrown")` returns 0 hits
+when the log says "fresh basil and mint". `ms.outline()` — one line per session
+— was added as a structural way in and mistakenly recorded as our own idea.
 
 ## Decision
 

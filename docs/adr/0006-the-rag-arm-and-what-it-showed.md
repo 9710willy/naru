@@ -15,11 +15,11 @@ It was not evidence for that, because two things changed at once: the prompt
 got small, **and** the model got a kernel. Nothing in the harness separated
 them.
 
-MemDelta (arXiv 2606.29914) makes that gap concrete rather than theoretical:
-on LongMemEval-S it measured verbatim RAG statistically level with full
-context (47.2 vs 49.8, p = 0.34), and agent self-memory at 42% *losing* to
-basic retrieval at 47%. Any claim we make about the kernel has to clear that
-bar.
+MemDelta ([arXiv 2606.29914](https://arxiv.org/abs/2606.29914)) makes that gap
+concrete rather than theoretical: on LongMemEval-S it measured verbatim RAG
+statistically level with full context (47.2 vs 49.8, p = 0.34), and agent
+self-memory at 42% *losing* to basic retrieval at 47%. Any claim we make about
+the kernel has to clear that bar.
 
 ## Decision
 
@@ -45,15 +45,16 @@ live in the [README's Benchmark section](../../README.md#benchmark), the one
 place they get updated. Read there, not here — do not copy tables back into
 this ADR.
 
-The one-line summary: no arm separates from any other on accuracy at any n
-this harness has run, and where `naru` comes closest to `rag` is exactly the
-two categories (temporal-reasoning, preference-following) where an answer must
-be computed over the log rather than quoted from a turn — the shape the
-paper's own ablations predict, per ADR 0003. A retrieval agent loses badly on
-the paper's other two benchmarks (LOCA-256K, BEAM-10M against ten named
-baselines), so the hypothesis is tested, not untested. **LongMemEval is the
-wrong benchmark for the question this repo asks** — testing the kernel needs
-one where `full` cannot run at all, such as BEAM (arXiv 2510.27246).
+The one-line summary: no arm separates from any other on accuracy at any n this
+harness has run, and where `naru` comes closest to `rag` is exactly the two
+categories (temporal-reasoning, preference-following) where an answer must be
+computed over the log rather than quoted from a turn — the shape the paper's
+own ablations predict, per ADR 0003. A retrieval agent loses badly on the
+paper's other two benchmarks (LOCA-256K, BEAM-10M against ten named baselines),
+so the hypothesis is tested, not untested. **LongMemEval is the wrong benchmark
+for the question this repo asks** — testing the kernel needs one where `full`
+cannot run at all, such as BEAM ([arXiv
+2510.27246](https://arxiv.org/abs/2510.27246)).
 
 ## Consequences
 

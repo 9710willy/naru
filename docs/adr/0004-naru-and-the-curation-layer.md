@@ -6,10 +6,10 @@ reach the doc that enters a model call.
 
 ## Context
 
-The repo was called Scroll because it implements the system in arXiv 2608.21690
-— but the paper's own system is named Scroll. One name meant two things, and
-`bench.py:72` quotes §3.3 verbatim using the paper's meaning. A reader could not
-tell which was which.
+The repo was called Scroll because it implements the system in [arXiv
+2608.21690](https://arxiv.org/abs/2608.21690) — but the paper's own system is
+named Scroll. One name meant two things, and `bench.py:72` quotes §3.3 verbatim
+using the paper's meaning. A reader could not tell which was which.
 
 The paper solves one agent's context inside one trajectory. It does not solve
 what happens when several sessions, several models and a human all need to

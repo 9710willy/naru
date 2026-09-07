@@ -4,7 +4,8 @@ An append-only Event Log (SQLite + FTS5) the model writes code against.
 Full history stays lossless and addressable by `seq`; only what the caller
 prints ever needs to enter a model's context.
 
-Interface follows the Appendix-C spec of arXiv 2608.21690:
+Interface follows the Appendix-C spec of arXiv 2608.21690
+(https://arxiv.org/abs/2608.21690):
     ms.search(query, k=..., kind=...)                   # BM25 locate
     ms.outline()                                        # navigation anchors
     ms.expand(lo, hi=None)                              # materialize a seq span

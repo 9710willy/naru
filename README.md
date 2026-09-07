@@ -174,10 +174,10 @@ python3 test_judge.py   # live: judge regression cases
 
 ## Benchmark
 
-`bench.py` runs LongMemEval (ICLR 2025) over three arms on identical history.
-`full` puts the whole history in one prompt. `rag` pastes the top 8 BM25 hits
-and answers in one call. `naru` leaves the history in the log for the model to
-reach by writing code.
+`bench.py` runs [LongMemEval](https://arxiv.org/abs/2410.10813) (ICLR 2025)
+over three arms on identical history. `full` puts the whole history in one
+prompt. `rag` pastes the top 8 BM25 hits and answers in one call. `naru` leaves
+the history in the log for the model to reach by writing code.
 
 **What this is for.** It checks whether this implementation behaves like the
 one in the paper. It is not a contribution to the field and the numbers are not

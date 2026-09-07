@@ -1,5 +1,7 @@
 """LongMemEval harness: ingest → answer → judge → score.
 
+Benchmark: https://arxiv.org/abs/2410.10813
+
 Runs three arms over the same data so the comparison is controlled:
   full     — the whole history stuffed into one prompt (the usual approach)
   rag      — top-k BM25 hits pasted in, one call, no kernel (the control)
