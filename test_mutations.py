@@ -19,6 +19,7 @@ intended — a missing anchor fails loudly and asks you to confirm the check
 still catches the bug, rather than silently testing nothing.
 """
 
+import ast
 import pathlib
 import shutil
 import subprocess
@@ -26,6 +27,7 @@ import sys
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent
+SELF_CHECK_TIMEOUT = 30
 COPY = (
     "ms.py",
     "kernel.py",
@@ -34,6 +36,8 @@ COPY = (
     "backend.py",
     "noise.py",
     "metrics.py",
+    "regrade.py",
+    "beam.py",
 )
 
 # (name, file, find, replace) or (name, file, find, replace, only_if)
@@ -45,6 +49,15 @@ MUTATIONS = [
         "bench.py",
         'if arm == "rag":\n        ms, _ = ingest(q, build_index=False, db=":memory:")',
         'if False:\n        ms, _ = ingest(q, build_index=False, db=":memory:")',
+    ),
+    (
+        "benchmark jobs share process stdout",
+        "bench.py",
+        "from concurrent.futures import ProcessPoolExecutor, as_completed",
+        (
+            "from concurrent.futures import ThreadPoolExecutor as "
+            "ProcessPoolExecutor, as_completed"
+        ),
     ),
     (
         "rag creates a sandbox file log",
@@ -59,6 +72,30 @@ MUTATIONS = [
         "if True",
     ),
     (
+        "judge accepts a verdict prefix",
+        "bench.py",
+        'if v == "CORRECT":',
+        'if v.startswith("CORRECT"):',
+    ),
+    (
+        "saved answers truncate before the judge boundary",
+        "bench.py",
+        "                else candidate",
+        "                else candidate[:400]",
+    ),
+    (
+        "regrade keeps stale judge errors",
+        "regrade.py",
+        'r["judge_errors"] = usage.errors',
+        'r["judge_errors"] = r.get("judge_errors", 0)',
+    ),
+    (
+        "regrade accepts legacy truncated answers",
+        "regrade.py",
+        "if old_format < RESULT_FORMAT and any(",
+        "if False and any(",
+    ),
+    (
         "unmeasured judge errors print as zero",
         "bench.py",
         'if all("judge_errors" in r for r in rows)',
@@ -69,6 +106,18 @@ MUTATIONS = [
         "bench.py",
         "alpha = 0.05 / pairs",
         "alpha = 0.05",
+    ),
+    (
+        "failed arms relax the planned threshold",
+        "bench.py",
+        "alpha = 0.05 / pairs",
+        "alpha = 0.05 / len(list(combinations(verdicts, 2)))",
+    ),
+    (
+        "duplicate result rows overwrite each other",
+        "bench.py",
+        'if len(qids) != len(set(qids)):',
+        "if False:",
     ),
     (
         "separability verdict inverted",
@@ -89,6 +138,12 @@ MUTATIONS = [
         "unknown = []",
     ),
     (
+        "main() accepts duplicate arms",
+        "bench.py",
+        'if len(set(arms)) != len(arms):\n        sys.exit("--arms must not contain duplicates")',
+        "if False:\n        sys.exit(\"--arms must not contain duplicates\")",
+    ),
+    (
         "--rag-k accepts SQLite's 'no limit'",
         "bench.py",
         "if a.rag_k < 1:",
@@ -101,10 +156,52 @@ MUTATIONS = [
         'return cmd if cmd else "claude-cli"',
     ),
     (
+        "prompt estimates omit the system text",
+        "backend.py",
+        'supplied = f"{system}\\n\\n{p}" if system else p',
+        "supplied = p",
+    ),
+    (
+        "failed floor calls report a measured value",
+        "backend.py",
+        "if not result or b.usage.errors or not b.usage.calls:",
+        "if not b.usage.calls:",
+    ),
+    (
+        "later failures discard known answer usage",
+        "bench.py",
+        '"billed_input": be.usage.billed_input,',
+        '"billed_input": 0,',
+    ),
+    (
+        "BEAM drops estimated prompt totals",
+        "beam.py",
+        'row.get("prompt_tokens_estimated", 0)',
+        'row.get("peak_view_tokens", 0)',
+    ),
+    (
         "rag hits keep BM25 rank order",
         "bench.py",
         'sorted(hits, key=lambda h: h["seq"])',
         "hits",
+    ),
+    (
+        "rsm packer exceeds its token budget",
+        "bench.py",
+        'if est("\\n\\n".join((*groups, group))) > budget:',
+        "if False:",
+    ),
+    (
+        "rsm runs without an embedder",
+        "bench.py",
+        'if "rsm" in arms:',
+        "if False:",
+    ),
+    (
+        "zero centroid reaches division",
+        "bench.py",
+        "    if not norm:\n        return None",
+        "    if False:\n        return None",
     ),
     (
         "FTS5 operators reach the query from question text",
@@ -141,6 +238,12 @@ MUTATIONS = [
         'sys.platform == "darwin"',
     ),
     (
+        "kernel digest copies the full resident list",
+        "kernel.py",
+        "items = v[:200] if isinstance(v, (list, tuple)) else []",
+        "items = list(v)[:200] if isinstance(v, (list, tuple)) else []",
+    ),
+    (
         "a crashed child is reported as a timeout",
         "kernel.py",
         'f"exceeded {self.timeout}s wall clock"\n            if hung',
@@ -157,6 +260,12 @@ MUTATIONS = [
         "agent.py",
         "if turn == 0 and turn < max_turns - 1:",
         "if False:",
+    ),
+    (
+        "agent trace omits the system prompt",
+        "agent.py",
+        '"prompt_tokens": est(f"{system}\\n\\n{prompt}"),',
+        '"prompt_tokens": est(prompt),',
     ),
     (
         "agent.py never takes the sandbox branch",
@@ -213,16 +322,25 @@ MUTATIONS = [
         'f"-> ms.expand({seq})]"',
     ),
     (
-        "folded payload loses its trace session",
-        "eviction.py",
-        "fold_payloads(older, recovery_session)",
-        "fold_payloads(older)",
+        "trace index pointer loses its session",
+        "agent.py",
+        '                "session_id": run_id,',
+        '                "session_id": None,',
     ),
     (
         "callback dispatch is unguarded in the parent",
         "kernel.py",
-        "            try:\n                fn(*args, **kwargs)\n            except Exception as e:",
-        "            if True:\n                fn(*args, **kwargs)\n            except Exception as e:",
+        (
+            "            try:\n"
+            "                fn(*args, **kwargs)\n"
+            "            except Exception as e:\n"
+            "                # The arguments come from model-authored code. Dispatching them\n"
+            "                # unguarded let `headline(1,2,3,4,5)` raise a live TypeError out\n"
+            "                # of run() and into the harness — the one thing a child process\n"
+            "                # is here to prevent.\n"
+            "                err = err or f\"{name}(): {type(e).__name__}: {e}\""
+        ),
+        "            fn(*args, **kwargs)",
     ),
     (
         "the log path stays in the child's environment",
@@ -265,6 +383,18 @@ MUTATIONS = [
             '" WHERE created_at IS NOT NULL AND created_at < ?",\n'
             "            (before_iso,),\n        ).fetchone()"
         ),
+    ),
+    (
+        "prune does not reserve the writer",
+        "ms.py",
+        '        self.db.execute("BEGIN IMMEDIATE")\n        try:\n            doomed =',
+        "        try:\n            doomed =",
+    ),
+    (
+        "blob gc does not reserve the writer",
+        "ms.py",
+        '        self.db.execute("BEGIN IMMEDIATE")\n        try:\n            if not self.blobs.is_dir():',
+        "        try:\n            if not self.blobs.is_dir():",
     ),
     (
         "prune deletes promoted provenance",
@@ -352,6 +482,12 @@ MUTATIONS = [
         ),
     ),
     (
+        "inject treats an unreadable file as empty",
+        "naru.py",
+        "except FileNotFoundError:",
+        "except (OSError, UnicodeDecodeError):",
+    ),
+    (
         "Codex repeats unchanged Naru context",
         "naru.py",
         'if event_name == "UserPromptSubmit" and _codex_seen(ms, session_id) == doc_hash:',
@@ -382,38 +518,80 @@ def selfcheck_command(target):
         "naru.py": ["naru.py", "--selfcheck"],
         "noise.py": ["noise.py", "--selfcheck"],
         "metrics.py": ["metrics.py", "--selfcheck"],
+        "backend.py": ["backend.py", "--selfcheck"],
+        "regrade.py": ["regrade.py", "--selfcheck"],
+        "beam.py": ["beam.py", "--selfcheck"],
     }.get(target, ["bench.py", "--selfcheck"])
 
 
+def run_selfcheck(target, cwd):
+    """Run one self-check with an outer deadline."""
+    try:
+        return subprocess.run(
+            [sys.executable, *selfcheck_command(target)],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=SELF_CHECK_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as error:
+        return subprocess.CompletedProcess(
+            error.cmd,
+            124,
+            stdout="",
+            stderr=f"timed out after {SELF_CHECK_TIMEOUT}s\n",
+        )
+
+
 def run_mutated(target, find, replace):
-    """Apply one edit in a throwaway copy and return the self-check's exit code."""
+    """Apply one edit in a throwaway copy and return the self-check result."""
     body = (REPO / target).read_text()
     if find not in body:
         raise AssertionError(
             f"anchor not found in {target} — the code moved. Re-confirm this "
             f"mutation still describes a real bug, then update the anchor:\n{find}"
         )
-    work = pathlib.Path(tempfile.mkdtemp())
-    for name in (*COPY, "bench.py"):
-        shutil.copy(REPO / name, work / name)
-    published = REPO / "results" / "published"
-    if published.is_dir():
-        (work / "results" / "published").mkdir(parents=True)
-        for f in published.glob("*.json"):
-            shutil.copy(f, work / "results" / "published" / f.name)
-    (work / target).write_text(body.replace(find, replace))
-    return subprocess.run(
-        [sys.executable, *selfcheck_command(target)],
-        cwd=work, capture_output=True, text=True, check=False,
-    ).returncode
+    with tempfile.TemporaryDirectory() as work_dir:
+        work = pathlib.Path(work_dir)
+        for name in (*COPY, "bench.py"):
+            shutil.copy(REPO / name, work / name)
+        published = REPO / "results" / "published"
+        if published.is_dir():
+            (work / "results" / "published").mkdir(parents=True)
+            for f in published.glob("*.json"):
+                shutil.copy(f, work / "results" / "published" / f.name)
+        mutated = body.replace(find, replace)
+        try:
+            ast.parse(mutated, filename=target)
+        except SyntaxError as error:
+            raise AssertionError(
+                f"mutation creates invalid Python in {target}: {error}"
+            ) from error
+        (work / target).write_text(mutated)
+        return run_selfcheck(target, work)
+
+
+def mutation_caught(result):
+    """Return whether a valid self-check rejected the mutation."""
+    if result.returncode == 124 or result.returncode < 0:
+        raise RuntimeError(
+            f"self-check infrastructure failed with exit {result.returncode}: "
+            f"{result.stderr.strip()}"
+        )
+    return result.returncode != 0
 
 
 def main():
+    try:
+        mutation_caught(subprocess.CompletedProcess([], 124, "", "outer timeout"))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("an outer timeout counted as a caught mutation")
+
     for target in dict.fromkeys(m[1] for m in MUTATIONS):
-        result = subprocess.run(
-            [sys.executable, *selfcheck_command(target)],
-            cwd=REPO, capture_output=True, text=True, check=False,
-        )
+        result = run_selfcheck(target, REPO)
         if result.returncode:
             print(
                 f"baseline failed for {target}, exit {result.returncode}",
@@ -423,7 +601,7 @@ def main():
             print(result.stderr, end="", file=sys.stderr)
             return 1
 
-    survivors, skipped = [], []
+    survivors, skipped, failures = [], [], []
     for mutation in MUTATIONS:
         name, target, find, replace = mutation[:4]
         only_if = mutation[4] if len(mutation) > 4 else None
@@ -431,11 +609,22 @@ def main():
             print(f"  {'n/a':9} {name}  ({only_if})")
             skipped.append(name)
             continue
-        caught = run_mutated(target, find, replace) != 0
+        result = run_mutated(target, find, replace)
+        try:
+            caught = mutation_caught(result)
+        except RuntimeError as error:
+            print(f"  {'FAILED':9} {name}  ({error})")
+            failures.append(name)
+            continue
         print(f"  {'caught' if caught else 'SURVIVED':9} {name}")
         if not caught:
             survivors.append(name)
     n = len(MUTATIONS) - len(skipped)
+    if failures:
+        print(f"\n{len(failures)} mutation run(s) had infrastructure failures:")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
     if survivors:
         print(
             f"\n{len(survivors)} of {n} mutations survived — those checks are decorative:"

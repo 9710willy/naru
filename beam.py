@@ -102,6 +102,13 @@ def summary(rows):
         "correct": sum(row["correct"] for row in rows),
         "accuracy": sum(row["correct"] for row in rows) / n if n else 0.0,
         "mean_peak_view_tokens": sum(row["peak_view_tokens"] for row in rows) / n if n else 0.0,
+        "mean_prompt_tokens_estimated": sum(
+            row.get("prompt_tokens_estimated", 0) for row in rows
+        ) / n if n else 0.0,
+        "mean_peak_prompt_tokens_estimated": sum(
+            row.get("peak_prompt_tokens_estimated", 0) for row in rows
+        ) / n if n else 0.0,
+        "mean_backend_calls": sum(row.get("backend_calls", 0) for row in rows) / n if n else 0.0,
         "billed_input": sum(row["billed_input"] for row in rows),
         "fresh_input": sum(row["fresh_input"] for row in rows),
         "cost": round(sum(row["cost"] + row["judge_cost"] for row in rows), 4),
@@ -241,7 +248,20 @@ def selfcheck():
         "mean_total_prompt_tokens", "mean_peak_prompt_tokens",
         "mean_view_tokens", "mean_turns",
     ))
-    assert summary([])["accuracy"] == 0.0
+    empty_summary = summary([])
+    assert all(empty_summary[key] == 0.0 for key in (
+        "accuracy", "mean_prompt_tokens_estimated",
+        "mean_peak_prompt_tokens_estimated", "mean_backend_calls",
+    ))
+    measured = summary([{
+        "correct": True, "peak_view_tokens": 11,
+        "prompt_tokens_estimated": 22, "peak_prompt_tokens_estimated": 13,
+        "backend_calls": 4, "billed_input": 5, "fresh_input": 3,
+        "cost": 0.1, "judge_cost": 0.2, "errors": 0, "judge_errors": 0,
+    }])
+    assert measured["mean_prompt_tokens_estimated"] == 22
+    assert measured["mean_peak_prompt_tokens_estimated"] == 13
+    assert measured["mean_backend_calls"] == 4
     assert len(REPLAY) == 6 and all("verified=" in step for step in REPLAY)
     print("ok — BEAM adapter self-check passed")
 

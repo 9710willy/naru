@@ -42,7 +42,7 @@ def _provenance(v):
     a container of rows reports its seq range and the model can go straight
     back to the source without re-searching.
     """
-    items = list(v)[:200] if isinstance(v, (list, tuple)) else []
+    items = v[:200] if isinstance(v, (list, tuple)) else []
     seqs = [i["seq"] for i in items
             if isinstance(i, dict) and isinstance(i.get("seq"), int)]
     if not seqs:
@@ -489,6 +489,13 @@ def demo():
     d = k.digest()
     assert "xs: list[4]" in d and "big: str[100000]" in d, d
     assert "helper" not in d, d
+
+    class SliceOnly(list):
+        def __iter__(self):
+            raise AssertionError("digest copied the full resident list")
+
+    rows = SliceOnly([{"seq": 7}] * 1000)
+    assert _provenance(rows) == " from seq 7"
 
     # SystemExit subclasses BaseException, so `except Exception` let a cell
     # calling sys.exit() unwind out of the harness mid-run.

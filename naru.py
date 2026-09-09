@@ -97,7 +97,7 @@ def _splice(path, text):
     p = pathlib.Path(path)
     try:
         old = p.read_text()
-    except (OSError, UnicodeDecodeError):
+    except FileNotFoundError:
         old = ""
     if BEGIN in old and END in old:
         head, rest = old.split(BEGIN, 1)
@@ -673,6 +673,17 @@ def _demo(real_stdin):
     body2 = hand.read_text()
     assert body2.count(BEGIN) == 1, "re-inject appended a second block"
     assert "Always run the tests" in body2, "re-inject lost the user's content"
+
+    unreadable = DB.parent / "invalid-utf8.md"
+    original = b"\xff\xfehand-written"
+    unreadable.write_bytes(original)
+    try:
+        main(["inject", str(unreadable)])
+    except UnicodeDecodeError:
+        pass
+    else:
+        raise AssertionError("inject overwrote a file it could not read")
+    assert unreadable.read_bytes() == original
 
     # Codex gets the approved doc at startup, then only after the doc changes.
     codex_id = "session-" + "x" * 80

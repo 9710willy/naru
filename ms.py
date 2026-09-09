@@ -22,6 +22,7 @@ import pathlib
 import re
 import sqlite3
 import tempfile
+import threading
 from datetime import date
 
 from eviction import est  # one owner for chars-per-token
@@ -552,63 +553,77 @@ class MemorySurface:
 
         Blob files for the deleted rows are removed too.
         """
-        doomed = self.db.execute(
-            "SELECT seq, payload_path FROM conversation_history"
-            " WHERE created_at IS NOT NULL AND created_at < ?" + PRUNE_KEEP,
-            (before_iso,),
-        ).fetchall()
-        if not doomed:
-            return 0
-        seqs = [r["seq"] for r in doomed]
-        for r in doomed:
-            if r["payload_path"]:
-                try:
-                    f = pathlib.Path(r["payload_path"])
-                    f.unlink(missing_ok=True)
-                    if f.parent.name.startswith("naru-blobs-") and not any(
-                        f.parent.iterdir()
-                    ):
-                        f.parent.rmdir()
-                except OSError:
-                    pass
-        marks = ",".join("?" * len(seqs))
-        self.db.execute(
-            f"DELETE FROM conversation_history WHERE seq IN ({marks})", seqs
-        )
-        # Rebuild rather than delete row-by-row: the index is derived from the
-        # base table, so one rebuild is simpler and self-heals any drift.
-        self.db.execute("INSERT INTO fts(fts) VALUES('rebuild')")
-        self.db.commit()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            doomed = self.db.execute(
+                "SELECT payload_path FROM conversation_history"
+                " WHERE created_at IS NOT NULL AND created_at < ?" + PRUNE_KEEP,
+                (before_iso,),
+            ).fetchall()
+            if not doomed:
+                self.db.commit()
+                return 0
+            removed = self.db.execute(
+                "DELETE FROM conversation_history"
+                " WHERE created_at IS NOT NULL AND created_at < ?" + PRUNE_KEEP,
+                (before_iso,),
+            ).rowcount
+            # Rebuild rather than delete row-by-row: the index is derived from the
+            # base table, so one rebuild is simpler and self-heals any drift.
+            self.db.execute("INSERT INTO fts(fts) VALUES('rebuild')")
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        for row in doomed:
+            if not row["payload_path"]:
+                continue
+            try:
+                path = pathlib.Path(row["payload_path"])
+                path.unlink(missing_ok=True)
+                if path.parent.name.startswith("naru-blobs-") and not any(
+                    path.parent.iterdir()
+                ):
+                    path.parent.rmdir()
+            except OSError:
+                pass
         self.db.execute("VACUUM")
-        return len(seqs)
+        return removed
 
     def gc_blobs(self):
         """Delete unreferenced payload files owned by this Event Log."""
-        if not self.blobs.is_dir():
-            return 0, 0
-        live = {
-            r["payload_path"]
-            for r in self.db.execute(
-                "SELECT payload_path FROM conversation_history"
-                " WHERE payload_path IS NOT NULL"
-            )
-        }
-        removed = freed = 0
-        for path in self.blobs.iterdir():
-            if not path.is_file() or str(path) in live:
-                continue
-            try:
-                size = path.stat().st_size
-                path.unlink()
-            except OSError:
-                continue
-            removed += 1
-            freed += size
+        self.db.execute("BEGIN IMMEDIATE")
         try:
-            self.blobs.rmdir()
-        except OSError:
-            pass
-        return removed, freed
+            if not self.blobs.is_dir():
+                self.db.commit()
+                return 0, 0
+            live = {
+                r["payload_path"]
+                for r in self.db.execute(
+                    "SELECT payload_path FROM conversation_history"
+                    " WHERE payload_path IS NOT NULL"
+                )
+            }
+            removed = freed = 0
+            for path in self.blobs.iterdir():
+                if not path.is_file() or str(path) in live:
+                    continue
+                try:
+                    size = path.stat().st_size
+                    path.unlink()
+                except OSError:
+                    continue
+                removed += 1
+                freed += size
+            try:
+                self.blobs.rmdir()
+            except OSError:
+                pass
+            self.db.commit()
+            return removed, freed
+        except Exception:
+            self.db.rollback()
+            raise
 
     def pending(self, k=50):
         """Claims and skills still awaiting a human decision, oldest first."""
@@ -812,6 +827,143 @@ def demo():
     owner_b.blobs.rmdir()
     owner_a.close()
     owner_b.close()
+
+    class Gate:
+        def __init__(self, db, started):
+            self._db = db
+            self._started = started
+
+        def execute(self, sql, params=()):
+            if sql == "BEGIN IMMEDIATE" or sql.startswith("SELECT payload_path"):
+                self._started.set()
+            return self._db.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._db, name)
+
+    race_path = identity_dir / "maintenance.db"
+    setup = MemorySurface(str(race_path))
+    promoted_seq = setup.append(
+        "agent", "promote while prune waits", kind="claim",
+        created_at="2000-01-01T00:00:00",
+        payload="promoted" * 1000,
+    )
+    promoted_blob = pathlib.Path(setup.sql_query(
+        "SELECT payload_path FROM conversation_history WHERE seq=?", (promoted_seq,)
+    )[0].payload_path)
+    blob_path = setup.blobs / "pending.txt"
+    setup.close()
+
+    promotion_ready = threading.Event()
+    allow_promotion = threading.Event()
+    prune_started = threading.Event()
+    outcomes = {}
+
+    def promote_during_prune():
+        writer = MemorySurface(str(race_path))
+        writer.db.execute("BEGIN IMMEDIATE")
+        writer.db.execute(
+            "UPDATE conversation_history SET promoted=1 WHERE seq=?",
+            (promoted_seq,),
+        )
+        promotion_ready.set()
+        assert allow_promotion.wait(5), "prune did not start"
+        writer.db.commit()
+        writer.close()
+
+    def prune_after_promotion():
+        maintainer = MemorySurface(str(race_path))
+        maintainer.db = Gate(maintainer.db, prune_started)
+        try:
+            outcomes["pruned"] = maintainer.prune("2001-01-01T00:00:00")
+        except Exception as error:
+            outcomes["prune_error"] = error
+        finally:
+            maintainer.close()
+
+    writer = threading.Thread(target=promote_during_prune)
+    pruner = threading.Thread(target=prune_after_promotion)
+    writer.start()
+    assert promotion_ready.wait(5), "promotion did not reserve the writer"
+    pruner.start()
+    assert prune_started.wait(5), "prune did not request the writer"
+    allow_promotion.set()
+    writer.join(5)
+    pruner.join(5)
+    assert not writer.is_alive() and not pruner.is_alive(), "maintenance race hung"
+    assert "prune_error" not in outcomes, outcomes
+    assert outcomes["pruned"] == 0, outcomes
+    checked = MemorySurface(str(race_path))
+    assert checked.expand(promoted_seq)[0].promoted == 1
+    assert promoted_blob.exists(), "prune deleted a promoted payload"
+    checked.close()
+
+    blob_ready = threading.Event()
+    allow_blob_commit = threading.Event()
+    gc_started = threading.Event()
+
+    def append_blob_during_gc():
+        writer = MemorySurface(str(race_path))
+        writer.db.execute("BEGIN IMMEDIATE")
+        writer.blobs.mkdir(parents=True, exist_ok=True)
+        blob_path.write_text("pending")
+        writer.db.execute(
+            "INSERT INTO conversation_history(role, content, payload_path)"
+            " VALUES('tool', 'preview', ?)",
+            (str(blob_path),),
+        )
+        blob_ready.set()
+        assert allow_blob_commit.wait(5), "gc did not start"
+        writer.db.commit()
+        writer.close()
+
+    def gc_after_append():
+        maintainer = MemorySurface(str(race_path))
+        maintainer.db = Gate(maintainer.db, gc_started)
+        try:
+            outcomes["gc"] = maintainer.gc_blobs()
+        except Exception as error:
+            outcomes["gc_error"] = error
+        finally:
+            maintainer.close()
+
+    writer = threading.Thread(target=append_blob_during_gc)
+    collector = threading.Thread(target=gc_after_append)
+    writer.start()
+    assert blob_ready.wait(5), "blob writer did not reserve the database"
+    collector.start()
+    assert gc_started.wait(5), "gc did not request the writer"
+    allow_blob_commit.set()
+    writer.join(5)
+    collector.join(5)
+    assert not writer.is_alive() and not collector.is_alive(), "blob gc race hung"
+    assert "gc_error" not in outcomes, outcomes
+    assert outcomes["gc"] == (0, 0), outcomes
+    assert blob_path.exists(), "gc deleted a payload before its row committed"
+
+    rollback_path = identity_dir / "rollback.db"
+    rollback = MemorySurface(str(rollback_path))
+    rollback_seq = rollback.append(
+        "tool", "preview", payload="rollback" * 1000,
+        created_at="2000-01-01T00:00:00",
+    )
+    rollback_blob = pathlib.Path(rollback.sql_query(
+        "SELECT payload_path FROM conversation_history WHERE seq=?", (rollback_seq,)
+    )[0].payload_path)
+    rollback.db.execute(
+        "CREATE TRIGGER refuse_prune BEFORE DELETE ON conversation_history"
+        " BEGIN SELECT RAISE(ABORT, 'refuse prune'); END"
+    )
+    rollback.db.commit()
+    try:
+        rollback.prune("2001-01-01T00:00:00")
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("prune ignored a database failure")
+    assert rollback.expand(rollback_seq), "failed prune deleted the row"
+    assert rollback_blob.exists(), "failed prune deleted the payload"
+    rollback.close()
 
     s1 = ms.append(
         "user",

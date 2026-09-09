@@ -2,9 +2,8 @@
 
 History lives in the Session Environment (Event Log + kernel), never in the
 prompt. Each turn the model writes a Python cell; the cell searches and
-computes over the log; only what it prints enters the next working view. When
-the view exceeds budget, Algorithm 1 evicts spans to a tiered index that keeps
-them addressable.
+computes over the log; only what it prints enters the next working view. A
+tiered index keeps earlier trace spans addressable.
 """
 
 import json
@@ -13,7 +12,7 @@ import re
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from eviction import Block, est, evict, format_headline, render_index
+from eviction import est, format_headline, render_index, rollup
 from kernel import Kernel, SandboxedKernel
 
 CODE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
@@ -243,11 +242,18 @@ def _run(
         assert est("\n\n".join(parts)) <= budget
         return parts
 
-    def record_trace(blocks):
-        nonlocal trace_index
-        _, trace_index = evict(
-            blocks, trace_index, budget=0, protect_tail=0, recovery_session=run_id
+    def record_trace(spans):
+        if not trace_index:
+            trace_index.append([])
+        trace_index[0].append(
+            {
+                "lo": min(seq for seq, _ in spans),
+                "hi": max(seq for seq, _ in spans),
+                "headline": "; ".join(headline for _, headline in spans[:2])[:90],
+                "session_id": run_id,
+            }
         )
+        rollup(trace_index, 4)
 
     try:
         for turn in range(max_turns):
@@ -283,7 +289,7 @@ def _run(
                 trace.append(
                     {
                         "turn": turns_used,
-                        "prompt_tokens": est(prompt),
+                        "prompt_tokens": est(f"{system}\n\n{prompt}"),
                         "code": code,
                         "reply_if_no_code": None if code else reply,
                     }
@@ -304,29 +310,19 @@ def _run(
                             obs=NO_CELL, reply_seq=reply_seq,
                             obs_seq=correction_seq, state_seq=None,
                         )
-                    record_trace(
-                        [
-                            Block(reply_seq, "exec", reply, headline="no code"),
-                            Block(correction_seq, "obs", NO_CELL, headline="no code", is_payload=True),
-                        ]
-                    )
+                    record_trace([(reply_seq, "no code"), (correction_seq, "no code")])
                     continue
                 if reply.strip():
                     answer["text"] = reply.strip()
                 break
 
-            blocks = [Block(
-                reply_seq,
-                "exec",
-                f"[exec {reply_seq}]\n{code.strip()}",
-                headline=f"exec {reply_seq}",
-            )]
+            spans = [(reply_seq, f"exec {reply_seq}")]
 
             landmark["text"] = None
             pending_states.clear()
             out, err = kernel.run(code)
             if landmark["text"]:
-                blocks[0].headline = f"[{reply_seq}] {landmark['text']}"
+                spans[0] = (reply_seq, f"[{reply_seq}] {landmark['text']}")
             if answer["text"] is not None:
                 obs = out.strip() or "(submitted)"
             else:
@@ -345,15 +341,7 @@ def _run(
                 "SELECT content FROM conversation_history WHERE seq=?", (obs_seq,)
             )[0].content
             latest_observation = (obs_seq, stored)
-            blocks.append(
-                Block(
-                    obs_seq,
-                    "obs",
-                    f"[obs {obs_seq}]\n{stored}",
-                    headline=f"obs {obs_seq}: {stored[:50]}",
-                    is_payload=True,
-                )
-            )
+            spans.append((obs_seq, f"obs {obs_seq}: {stored[:50]}"))
             state_seq = None
             for content in pending_states:
                 state_seq = ms.append(
@@ -367,13 +355,13 @@ def _run(
                     source_seq_hi=obs_seq,
                 )
                 current_state = content
-                blocks.append(Block(state_seq, "state", content, headline="state"))
+                spans.append((state_seq, "state"))
             if trace is not None:
                 trace[-1]["obs"] = obs
                 trace[-1]["state_seq"] = state_seq
                 trace[-1]["reply_seq"] = reply_seq
                 trace[-1]["obs_seq"] = obs_seq
-            record_trace(blocks)
+            record_trace(spans)
             if answer["text"] is not None:
                 break
 
@@ -513,6 +501,9 @@ def demo():
     assert "no code block" in r["prompts"][1], r["prompts"][1][:300]
     assert refusal_trace[0]["obs"] == NO_CELL and refusal_trace[0]["reply_seq"]
     assert refusal_trace[0]["obs_seq"] and refusal_trace[0]["state_seq"] is None
+    assert refusal_trace[0]["prompt_tokens"] == est(
+        f"{SYSTEM}\n\n{r['prompts'][0]}"
+    )
     assert ms.sql_query(
         "SELECT content FROM conversation_history WHERE kind='agent_observation' "
         "AND content=?",

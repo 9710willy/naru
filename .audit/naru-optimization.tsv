@@ -1,0 +1,21 @@
+ts	phase	decision	why	evidence	result
+2026-09-09T00:00:00Z	frame	use the Astra plan as the implementation boundary	it ranks reproduced defects before optional performance work	docs/notes/naru-optimization.md	open
+2026-09-09T00:00:01Z	delegation	run implementation in the parent session	the approval system rejected private repository export to external design agents	active task transcript	external lane blocked
+2026-09-09T00:00:02Z	verification	make mutation infrastructure failures fail the suite	a timeout or signal does not prove that a self-check caught a defect	test_mutations.py; python3 test_mutations.py	tests green, exit 0
+2026-09-09T00:00:03Z	injection	stop injection when an existing file cannot be decoded	only a missing file is safe to treat as empty	naru.py:_splice; python3 naru.py --selfcheck	open
+2026-09-09T00:00:04Z	injection	verify failed reads preserve the target	the CLI test writes invalid UTF-8 and checks the original bytes	naru.py:_demo	tests green, exit 0
+2026-09-09T00:00:05Z	maintenance	reserve one SQLite writer for prune and blob collection	selection and deletion must use one current database state	ms.py:prune; ms.py:gc_blobs	tests green, exit 0
+2026-09-09T00:00:06Z	maintenance	add deterministic writer races and rollback proof	promotion and payload ownership must survive maintenance overlap	ms.py:demo; python3 test_mutations.py	59 of 59 mutations caught, exit 0
+2026-09-09T00:00:07Z	kernel	slice resident sequences before digest inspection	the digest reads at most 200 rows and must not copy the full list	kernel.py:_provenance	open
+2026-09-09T00:00:08Z	kernel	verify bounded provenance allocation	a million-row list must not be copied to inspect 200 rows	python3 kernel.py; tracemalloc probe	tests green, peak 3459 bytes
+2026-09-09T00:00:09Z	benchmark	remove naru+atoms and isolate workers by process	the hybrid path has no measured benefit and worker stdout is process-global	bench.py; python3 bench.py --selfcheck	tests green, exit 0
+2026-09-09T00:00:10Z	grading	require exact verdicts and preserve full saved candidates	prefix matches and 400-character rows cannot support reliable regrading	bench.py:judge; regrade.py; self-checks	tests green, exit 0
+2026-09-09T00:00:11Z	statistics	correct across planned pairs and reject duplicate rows	failed arms and duplicate keys must not relax or corrupt the comparison	bench.py:separability; python3 bench.py --selfcheck	tests green, exit 0
+2026-09-09T00:00:12Z	metrics	measure full supplied prompts and actual attempts	system text and retries are part of model exposure	backend.py; agent.py; beam.py; self-checks	tests green, exit 0
+2026-09-09T00:00:13Z	eviction	remove the unused general eviction policy	the agent only needs scoped trace spans and tier rollup	agent.py; eviction.py; BEAM replay	byte-identical replay, checks green
+2026-09-09T00:00:14Z	docs	align checks and benchmark docs with supported behavior	CI and user commands must cover every offline self-check	README.md; CLAUDE.md; CONTRIBUTING.md; checks.yml; ADRs	updated
+2026-09-09T00:00:15Z	verification	run the full offline and mutation suites	each changed boundary needs executable proof	module self-checks; python3 test_mutations.py	12 checks green; 71 of 71 mutations caught
+2026-09-09T00:00:16Z	verification	drive inject and maintenance through the real CLI	unit checks do not prove argument parsing and file behavior	verify-naru evidence UQ9wd9 and Bh2Ilq	both drives exit 0
+2026-09-09T00:00:17Z	review	keep intentional test growth and reject test-only API changes	large demos carry deterministic race and mutation proof; production APIs should stay stable	ripwire quality-delta and edit-check	optional test parameters removed; no incompatible callers
+2026-09-09T00:00:18Z	merge-safety	run the mapped tests and isolated CLI drives	static maps name test_judge.py but it makes paid external calls	ripwire pr-context and test-gate; verify-naru evidence	all offline obligations pass; paid live judge deferred
+2026-09-09T00:00:19Z	staged-proof	verify the exact Git index outside the working tree	preserved unstaged edits must not affect the commit's tests	/private/tmp/naru-staged.uvX51c	12 checks green; 72 of 72 mutations caught

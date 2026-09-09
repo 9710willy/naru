@@ -2,16 +2,18 @@
 
 Benchmark: https://arxiv.org/abs/2410.10813
 
-Runs three arms over the same data so the comparison is controlled:
+Runs four arms over the same data so the comparison is controlled:
   full     — the whole history stuffed into one prompt (the usual approach)
   rag      — top-k BM25 hits pasted in, one call, no kernel (the control)
   naru     — history in the Session Environment, model writes code to reach it
+  rsm      — grouped dense retrieval over derived Event Log chunks
 
 Reports accuracy, tokens billed, and cost for each.
 """
 
 import argparse
 import contextlib
+import dataclasses
 import io
 import json
 import math
@@ -24,11 +26,11 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import combinations
 
 from agent import LONGMEMEVAL_RUBRIC, run_naru
-from backend import HAIKU, get_backend, measure_floor
+from backend import HAIKU, Usage, get_backend, measure_floor
 from eviction import est, rollup
 from ms import MemorySurface
 
@@ -39,7 +41,8 @@ from noise import mcnemar
 DATA = pathlib.Path(__file__).parent / "data"
 DATE_RE = re.compile(r"(\d{4})/(\d{2})/(\d{2})")
 # One owner for the arm names: main() validates against it, demo() asserts on it.
-ARMS = ("full", "rag", "naru")
+ARMS = ("full", "rag", "naru", "rsm")
+RESULT_FORMAT = 2
 
 
 def backend_label(cmd):
@@ -52,6 +55,72 @@ def backend_label(cmd):
     field is for — telling a `cat` run apart from a real one.
     """
     return (shlex.split(cmd) or ["claude-cli"])[0] if cmd else "claude-cli"
+
+
+def _worker_pid(_):
+    """Return the worker process ID for the offline executor check."""
+    return os.getpid()
+
+
+def embedder_argv():
+    """Validate the optional embedding command before paid work starts."""
+    cmd = os.environ.get("NARU_EMBED")
+    if not cmd:
+        raise ValueError(
+            "rsm needs NARU_EMBED: a command that reads JSON on stdin"
+        )
+    try:
+        argv = shlex.split(cmd)
+    except ValueError as e:
+        raise ValueError(f"invalid NARU_EMBED command: {e}") from e
+    if not argv:
+        raise ValueError("NARU_EMBED is empty; expected a command to run")
+    if shutil.which(argv[0]) is None:
+        raise FileNotFoundError(f"NARU_EMBED command not found: {argv[0]!r}")
+    return argv
+
+
+def _normalized(vector, where):
+    if not isinstance(vector, list) or not vector:
+        raise ValueError(f"NARU_EMBED {where} must be a non-empty array")
+    if any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in vector):
+        raise ValueError(f"NARU_EMBED {where} has a nonnumeric value")
+    if any(not math.isfinite(x) for x in vector):
+        raise ValueError(f"NARU_EMBED {where} has a non-finite value")
+    norm = math.sqrt(sum(x * x for x in vector))
+    if not norm:
+        raise ValueError(f"NARU_EMBED {where} is a zero vector")
+    return tuple(x / norm for x in vector)
+
+
+def embed_vectors(argv, texts):
+    """Run the embedding boundary once and return normalized vectors."""
+    try:
+        p = subprocess.run(
+            argv,
+            input=json.dumps({"texts": texts}),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as e:
+        raise RuntimeError(f"NARU_EMBED could not start: {e}") from e
+    if p.returncode:
+        raise RuntimeError(f"NARU_EMBED exit {p.returncode}: {p.stderr.strip()[:300]}")
+    try:
+        response = json.loads(p.stdout)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"NARU_EMBED returned invalid JSON: {e.msg}") from e
+    if not isinstance(response, dict) or set(response) != {"vectors"}:
+        raise ValueError("NARU_EMBED response must contain only a vectors array")
+    vectors = response["vectors"]
+    if not isinstance(vectors, list) or len(vectors) != len(texts):
+        got = len(vectors) if isinstance(vectors, list) else "non-array"
+        raise ValueError(f"NARU_EMBED returned {got} vectors for {len(texts)} texts")
+    out = [_normalized(v, f"vector {i}") for i, v in enumerate(vectors)]
+    if len({len(v) for v in out}) != 1:
+        raise ValueError("NARU_EMBED vectors have mismatched dimensions")
+    return out
 
 
 def unknown_arms(arms):
@@ -240,20 +309,26 @@ def judge(q, response, backend, votes=3):
     """
     if not response or not response.strip():
         return False
+    candidate = response.strip()[:2000]
     p = (
         f"Question: {q['question']}\n\nGold answer: {q['answer']}\n\n"
-        f"Candidate answer: {response.strip()[:2000]}\n\nVerdict:"
+        f"Candidate answer: {candidate}\n\nVerdict:"
     )
-    yes = 0
+    yes = no = 0
     for i in range(votes):
         v = (
             backend(p, system=JUDGE_SYSTEM, nudge="(Reply with exactly one word.)")
             .strip()
             .upper()
         )
-        yes += v.startswith("CORRECT")
+        if v == "CORRECT":
+            yes += 1
+        elif v == "WRONG":
+            no += 1
+        else:
+            backend.usage.errors += 1
         # early exit once the outcome cannot change
-        if yes > votes // 2 or (i + 1 - yes) > votes // 2:
+        if yes > votes // 2 or no > votes // 2:
             break
     return yes > (votes // 2)
 
@@ -283,7 +358,148 @@ def rag_context(ms, question, k):
     return "\n".join(h["content"] for h in sorted(hits, key=lambda h: h["seq"]))
 
 
-def build_prompt(q, arm, rag_k=8):
+@dataclasses.dataclass
+class RsmAtom:
+    members: list
+    centroid: tuple
+
+
+@dataclasses.dataclass
+class RsmPack:
+    context: str
+    stats: dict
+
+
+def _cosine(left, right):
+    return sum(a * b for a, b in zip(left, right))
+
+
+def _centroid(members):
+    values = [sum(v) / len(members) for v in zip(*(m["vector"] for m in members))]
+    norm = math.sqrt(sum(v * v for v in values))
+    if not norm:
+        return None
+    return tuple(v / norm for v in values)
+
+
+def rsm_pack(ms, question, k, tau, chunk_turns, budget, argv=None, vectorize=None):
+    """Select bounded atom members and address them in the Event Log."""
+    rows = ms.expand(1, sys.maxsize)
+    members = [
+        {
+            "seqs": tuple(row["seq"] for row in rows[i : i + chunk_turns]),
+            "text": "\n".join(row["content"] for row in rows[i : i + chunk_turns]),
+        }
+        for i in range(0, len(rows), chunk_turns)
+    ]
+    texts = [m["text"] for m in members] + [question]
+    started = time.monotonic()
+    vectors = vectorize(texts) if vectorize is not None else embed_vectors(argv, texts)
+    embedding_seconds = time.monotonic() - started
+    if len(vectors) != len(texts):
+        raise ValueError("RSM embedder returned the wrong number of vectors")
+    for member, vector in zip(members, vectors[:-1]):
+        member["vector"] = vector
+    question_vector = vectors[-1]
+
+    started = time.monotonic()
+    atoms = []
+    for member in members:
+        if not atoms:
+            atoms.append(RsmAtom([member], member["vector"]))
+            continue
+        atom = max(atoms, key=lambda a: _cosine(member["vector"], a.centroid))
+        centroid_score = _cosine(member["vector"], atom.centroid)
+        member_score = max(_cosine(member["vector"], m["vector"]) for m in atom.members)
+        if max(centroid_score, member_score) >= tau:
+            merged = _centroid([*atom.members, member])
+            if merged is None:
+                atoms.append(RsmAtom([member], member["vector"]))
+                continue
+            atom.members.append(member)
+            atom.centroid = merged
+        else:
+            atoms.append(RsmAtom([member], member["vector"]))
+    indexing_seconds = time.monotonic() - started
+
+    groups = []
+    selected_members = 0
+
+    def add_group(rank, chosen):
+        nonlocal selected_members
+        groups.append(
+            f"=== Atom {rank} ===\n" + "\n".join(member["text"] for member in chosen)
+        )
+        selected_members += len(chosen)
+
+    def finish():
+        context = "\n\n".join(groups)
+        return RsmPack(
+            context,
+            {
+                "rsm_embedding_input_tokens": sum(est(text) for text in texts),
+                "rsm_atoms": len(atoms),
+                "rsm_members": len(members),
+                "rsm_selected_members": selected_members,
+                "rsm_embedding_seconds": round(embedding_seconds, 3),
+                "rsm_indexing_seconds": round(indexing_seconds, 3),
+                "rsm_context_tokens": est(context) if context else 0,
+            },
+        )
+
+    for rank, atom in enumerate(
+        sorted(atoms, key=lambda a: _cosine(question_vector, a.centroid), reverse=True)[:k],
+        1,
+    ):
+        chosen = []
+        for member in sorted(
+            atom.members,
+            key=lambda m: _cosine(question_vector, m["vector"]),
+            reverse=True,
+        ):
+            selected = sorted((*chosen, member), key=lambda m: m["seqs"])
+            group = f"=== Atom {rank} ===\n" + "\n".join(m["text"] for m in selected)
+            if est("\n\n".join((*groups, group))) > budget:
+                if chosen:
+                    add_group(rank, chosen)
+                return finish()
+            chosen = selected
+        if chosen:
+            add_group(rank, chosen)
+    return finish()
+
+
+def rsm_context(q, question, k, tau, chunk_turns, budget, argv=None, vectorize=None):
+    """Build one bounded RSM context from derived Event Log chunks."""
+    ms, _ = ingest(q, build_index=False, db=":memory:")
+    try:
+        pack = rsm_pack(
+            ms,
+            question,
+            k,
+            tau,
+            chunk_turns,
+            budget,
+            argv=argv,
+            vectorize=vectorize,
+        )
+        return pack.context, pack.stats
+    finally:
+        ms.close()
+
+
+def _question_prompt(q, body):
+    return (
+        f"{body}\n\n=== Question (asked {q.get('question_date', '')}) ===\n"
+        f"{q['question']}"
+    )
+
+
+def build_prompt(
+    q,
+    arm,
+    rag_k=8,
+):
     """The prompt for a single-call arm. Pure: no backend, no judge, no clock.
 
     Split out of one() so the arm dispatch is reachable from the self-check.
@@ -301,12 +517,11 @@ def build_prompt(q, arm, rag_k=8):
             body = rag_context(ms, q["question"], rag_k)
         finally:
             ms.close()
-    else:
+    elif arm == "full":
         body = history_text(q)
-    return (
-        f"{body}\n\n=== Question (asked {q.get('question_date', '')}) ===\n"
-        f"{q['question']}"
-    )
+    else:
+        raise ValueError(f"not a direct prompt arm: {arm}")
+    return _question_prompt(q, body)
 
 
 def one(
@@ -320,70 +535,106 @@ def one(
     rubric=True,
     no_index=False,
     rag_k=8,
+    rsm_k=6,
+    rsm_tau=0.85,
+    rsm_chunk_turns=5,
+    rsm_budget=4000,
+    rsm_argv=None,
     trace=None,
 ):
     """Run a single question through one arm. Returns a result record."""
     be = get_backend(model)
     t0 = time.time()
 
-    if arm == "naru":
-        ms, index = ingest(q, build_index=not no_index)
-        try:
-            ans, turns, peak = run_naru(
-                ms,
+    def result(
+        answer, turns, peak, correct=False, judge_backend=None, error=None,
+        judge_failure=False,
+    ):
+        candidate = (answer or "").strip()[:2000]
+        judge_usage = judge_backend.usage if judge_backend is not None else None
+        row = {
+            "qid": q["question_id"],
+            "type": q["question_type"],
+            "arm": arm,
+            "correct": correct,
+            "gold": q["answer"],
+            "answer": (
+                f"HARNESS: {error}" if error is not None and not judge_failure
+                else candidate
+            ),
+            "turns": turns,
+            "peak_view_tokens": peak,
+            "prompt_tokens_estimated": be.usage.prompt_tokens_estimated,
+            "peak_prompt_tokens_estimated": be.usage.peak_prompt_tokens_estimated,
+            "backend_calls": be.usage.attempts,
+            "seconds": round(time.time() - t0, 1),
+            "billed_input": be.usage.billed_input,
+            "fresh_input": be.usage.input_tokens,
+            "cache_creation": be.usage.cache_creation,
+            "cache_read": be.usage.cache_read,
+            "output": be.usage.output_tokens,
+            "cost": round(be.usage.cost_usd, 4),
+            "judge_cost": round(judge_usage.cost_usd, 4) if judge_usage else 0,
+            "errors": be.usage.errors + int(error is not None and not judge_failure),
+            "judge_errors": (judge_usage.errors if judge_usage else 0)
+            + int(error is not None and judge_failure),
+            "call_retries": be.usage.call_retries,
+            "empty_retries": be.usage.empty_retries,
+        }
+        if trace is not None:
+            row["trace"] = trace
+        if error is not None and judge_failure:
+            row["judge_error"] = f"HARNESS: {error}"
+        row.update(rsm)
+        return row
+
+    rsm = {}
+    try:
+        if arm == "naru":
+            ms, index = ingest(q, build_index=not no_index)
+            try:
+                ans, turns, peak = run_naru(
+                    ms,
+                    q["question"],
+                    be,
+                    question_date=q.get("question_date"),
+                    max_turns=max_turns,
+                    budget=budget,
+                    verbose=verbose,
+                    trace=trace,
+                    rubric=LONGMEMEVAL_RUBRIC if rubric else None,
+                    index=index,
+                )
+            finally:
+                discard_log(ms)
+        elif arm == "rsm":
+            body, rsm = rsm_context(
+                q,
                 q["question"],
-                be,
-                question_date=q.get("question_date"),
-                max_turns=max_turns,
-                budget=budget,
-                verbose=verbose,
-                trace=trace,
-                rubric=LONGMEMEVAL_RUBRIC if rubric else None,
-                index=index,
+                rsm_k,
+                rsm_tau,
+                rsm_chunk_turns,
+                rsm_budget,
+                argv=rsm_argv,
             )
-        finally:
-            discard_log(ms)
-    else:
-        prompt = build_prompt(q, arm, rag_k)
-        ans, turns, peak = be(prompt, system=FULL_SYSTEM), 1, est(prompt)
+            prompt = _question_prompt(q, body)
+            ans, turns, peak = be(prompt, system=FULL_SYSTEM), 1, 0
+        else:
+            prompt = build_prompt(q, arm, rag_k)
+            ans, turns, peak = be(prompt, system=FULL_SYSTEM), 1, 0
+    except Exception as error:
+        return result("", 0, 0, error=error)
 
-    elapsed = time.time() - t0
-    jb = get_backend(judge_model)
-    ok = judge(q, ans, jb)
-
-    row = {
-        "qid": q["question_id"],
-        "type": q["question_type"],
-        "arm": arm,
-        "correct": ok,
-        "gold": q["answer"],
-        "answer": (ans or "")[:400],
-        "turns": turns,
-        "peak_view_tokens": peak,
-        "seconds": round(elapsed, 1),
-        "billed_input": be.usage.billed_input,
-        "fresh_input": be.usage.input_tokens,
-        # cache creation bills ~1.25x base, cache reads ~0.1x — the full-context
-        # arm writes a fresh 124k history per question and never reuses it,
-        # which is where its cost actually goes.
-        "cache_creation": be.usage.cache_creation,
-        "cache_read": be.usage.cache_read,
-        "output": be.usage.output_tokens,
-        "cost": round(be.usage.cost_usd, 4),
-        "judge_cost": round(jb.usage.cost_usd, 4),
-        "errors": be.usage.errors,
-        # A judge that times out returns "" for every vote, which reads as
-        # WRONG. Counted separately, it is the only call whose failure is
-        # indistinguishable from a real negative result.
-        "judge_errors": jb.usage.errors,
-        # hard failures a retry recovered from: invisible in `errors` by
-        # design, but the flakiness tax an arm paid is worth seeing.
-        "call_retries": be.usage.call_retries,
-        "empty_retries": be.usage.empty_retries,
-    }
-    if trace is not None:
-        row["trace"] = trace
-    return row
+    candidate = (ans or "").strip()[:2000]
+    try:
+        jb = get_backend(judge_model)
+        ok = judge(q, candidate, jb)
+    except Exception as error:
+        return result(
+            candidate, turns, peak, judge_backend=locals().get("jb"),
+            error=error, judge_failure=True,
+        )
+    return result(candidate, turns, peak, correct=ok, judge_backend=jb)
 
 
 def wilson(k, n, z=1.96):
@@ -451,12 +702,27 @@ def report(rows, label, floor, measured=True):
         )
     else:
         print("           billed-in  not measurable   net-of-harness not measurable")
+    calls = sum(r.get("backend_calls", r["turns"]) for r in rows) / n
+    prompt_total = sum(
+        r.get("prompt_tokens_estimated", r["peak_view_tokens"]) for r in rows
+    ) / n
+    prompt_peak = sum(
+        r.get("peak_prompt_tokens_estimated", r["peak_view_tokens"]) for r in rows
+    ) / n
     print(
         f"           out {sum(r['output'] for r in rows) / n:>7,.0f}/q   "
-        f"turns {sum(r['turns'] for r in rows) / n:>4.1f}   "
-        f"view {sum(r['peak_view_tokens'] for r in rows) / n:>6,.0f}t   "
+        f"turns {sum(r['turns'] for r in rows) / n:>4.1f}   calls {calls:>4.1f}   "
         + (f"${cost:.2f} total" if measured else "cost not measurable")
     )
+    print(
+        f"           prompt-est total {prompt_total:>8,.0f}t/q   "
+        f"peak {prompt_peak:>8,.0f}t/q"
+    )
+    if label == "naru":
+        print(
+            f"           dynamic-view peak "
+            f"{sum(r['peak_view_tokens'] for r in rows) / n:>6,.0f}t/q"
+        )
     if measured:
         # The arm's own dollars, and the cache share that makes a token ratio
         # and a money ratio disagree. Both are published columns; printing
@@ -467,6 +733,19 @@ def report(rows, label, floor, measured=True):
             f"judge ${judge_cost / n:.4f}/q   "
             f"cache-read {100 * cr / max(1, bi):.0f}% of billed input"
         )
+    if label == "rsm":
+        selected = sum(r.get("rsm_selected_members", 0) for r in rows) / n
+        source = sum(r.get("rsm_context_tokens", 0) for r in rows) / n
+        print(
+            f"           atoms embed-in {sum(r.get('rsm_embedding_input_tokens', 0) for r in rows) / n:.0f}t/q  "
+            f"atoms {sum(r.get('rsm_atoms', 0) for r in rows) / n:.1f}  "
+            f"members {sum(r.get('rsm_members', 0) for r in rows) / n:.1f}  "
+            f"selected {selected:.1f}  "
+            f"embed {sum(r.get('rsm_embedding_seconds', 0) for r in rows) / n:.3f}s/q  "
+            f"index {sum(r.get('rsm_indexing_seconds', 0) for r in rows) / n:.3f}s/q  "
+            f"source {source:.0f}t/q"
+        )
+        print("           model cost excludes embedding-provider cost")
     errs = sum(r["errors"] for r in rows)
     cretries = sum(r.get("call_retries", 0) for r in rows)
     # Rows written before judge_errors existed have no such key. Summing them
@@ -514,26 +793,33 @@ def separability(rows, arms):
     # claim manufactured by a hung subprocess. Drop them from the pairing —
     # the shared-key intersection then removes each dropped question from
     # both arms, which is what a paired test requires.
+    if len(set(arms)) != len(arms):
+        raise ValueError("comparison arms must be unique")
+    pairs = len(list(combinations(arms, 2)))
+    if not pairs:
+        return
     verdicts, dropped = {}, {}
     for arm in arms:
         rs = [r for r in rows if r["arm"] == arm]
+        qids = [r["qid"] for r in rs]
+        if len(qids) != len(set(qids)):
+            raise ValueError(f"duplicate result rows for arm {arm}")
         v = {
             r["qid"]: bool(r["correct"])
             for r in rs
             if not r.get("errors") and not r.get("judge_errors")
         }
+        dropped[arm] = len(rs) - len(v)
         if v:
             verdicts[arm] = v
-            dropped[arm] = len(rs) - len(v)
     if len(verdicts) < 2:
         return
-    pairs = len(list(combinations(verdicts, 2)))
     # Three arms means three tests. At an uncorrected 0.05 each, at least one
     # pair reads REAL in ~6% of runs where nothing separates, against ~2% for
     # a single pair. The verdict is the harness's published claim, so it is
     # the number that has to be honest.
     alpha = 0.05 / pairs
-    note = f", Bonferroni for {pairs} pairs" if pairs > 1 else ""
+    note = f", Bonferroni for {pairs} planned pairs" if pairs > 1 else ""
     print(
         f"\n  separability — paired McNemar on the questions the arms"
         f" disagree on{note}"
@@ -582,6 +868,22 @@ def main():
         default=8,
         help="hits the rag arm pastes into the prompt (~2.5k tokens at 8)",
     )
+    ap.add_argument("--rsm-k", type=int, default=6, help="atoms the rsm arm retrieves")
+    ap.add_argument(
+        "--rsm-tau",
+        type=float,
+        default=0.85,
+        help="RSM merge threshold; paper BGE value, calibrate other embedding spaces",
+    )
+    ap.add_argument(
+        "--rsm-chunk-turns",
+        type=int,
+        default=5,
+        help="Event Log turns per RSM member",
+    )
+    ap.add_argument(
+        "--rsm-budget", type=int, default=4000, help="RSM packed-context token budget"
+    )
     ap.add_argument("--model", default=HAIKU)
     ap.add_argument("--judge-model", default=HAIKU)
     ap.add_argument("--max-turns", type=int, default=8)
@@ -613,12 +915,28 @@ def main():
     unknown = unknown_arms(arms)
     if unknown:
         sys.exit(f"unknown arm(s): {unknown} — pick from {', '.join(ARMS)}")
+    if len(set(arms)) != len(arms):
+        sys.exit("--arms must not contain duplicates")
     # SQLite reads a negative LIMIT as NO limit, so --rag-k -1 pastes the whole
     # history and the rag arm silently becomes a second full arm at ~50x the
     # cost, still labelled rag. 0 is the mirror: empty context, every answer
     # wrong, nothing in the output naming why.
     if a.rag_k < 1:
         sys.exit(f"--rag-k must be >= 1, got {a.rag_k}")
+    if a.rsm_k < 1:
+        sys.exit(f"--rsm-k must be >= 1, got {a.rsm_k}")
+    if not -1 <= a.rsm_tau <= 1:
+        sys.exit(f"--rsm-tau must be between -1 and 1, got {a.rsm_tau}")
+    if a.rsm_chunk_turns < 1:
+        sys.exit(f"--rsm-chunk-turns must be >= 1, got {a.rsm_chunk_turns}")
+    if a.rsm_budget < 1:
+        sys.exit(f"--rsm-budget must be >= 1, got {a.rsm_budget}")
+    rsm_argv = None
+    if "rsm" in arms:
+        try:
+            rsm_argv = embedder_argv()
+        except (ValueError, FileNotFoundError) as e:
+            sys.exit(str(e))
 
     measured = get_backend(a.model).reports_tokens
     if a.harness_floor is None:
@@ -641,7 +959,7 @@ def main():
 
     jobs = [(q, arm) for arm in arms for q in qs]
     rows = []
-    with ThreadPoolExecutor(max_workers=a.workers) as ex:
+    with ProcessPoolExecutor(max_workers=a.workers) as ex:
         futs = {
             ex.submit(
                 one,
@@ -657,6 +975,11 @@ def main():
                 rubric=not a.no_rubric,
                 no_index=a.no_index,
                 rag_k=a.rag_k,
+                rsm_k=a.rsm_k,
+                rsm_tau=a.rsm_tau,
+                rsm_chunk_turns=a.rsm_chunk_turns,
+                rsm_budget=a.rsm_budget,
+                rsm_argv=rsm_argv,
             ): (q, arm)
             for q, arm in jobs
         }
@@ -674,6 +997,9 @@ def main():
                     "answer": f"HARNESS: {e}",
                     "turns": 0,
                     "peak_view_tokens": 0,
+                    "prompt_tokens_estimated": 0,
+                    "peak_prompt_tokens_estimated": 0,
+                    "backend_calls": 0,
                     "seconds": 0,
                     "billed_input": 0,
                     "fresh_input": 0,
@@ -681,7 +1007,18 @@ def main():
                     "cost": 0,
                     "judge_cost": 0,
                     "errors": 1,
+                    "judge_errors": 0,
                 }
+                if arm == "rsm":
+                    r.update(
+                        rsm_embedding_input_tokens=0,
+                        rsm_atoms=0,
+                        rsm_members=0,
+                        rsm_selected_members=0,
+                        rsm_embedding_seconds=0,
+                        rsm_indexing_seconds=0,
+                        rsm_context_tokens=0,
+                    )
             rows.append(r)
             mark = "+" if r["correct"] else "-"
             print(
@@ -701,8 +1038,11 @@ def main():
     # `NARU_BACKEND=cat` run byte-identical to a real Haiku run that cost
     # nothing. Stamp what actually answered, and whether the numbers are real.
     cfg = dict(vars(a))
+    cfg["result_format"] = RESULT_FORMAT
     cfg["backend"] = backend_label(os.environ.get("NARU_BACKEND"))
+    cfg["rsm_embedder"] = rsm_argv[0] if rsm_argv else None
     cfg["tokens_measured"] = measured
+    cfg["prompt_tokens_estimated"] = True
     json.dump({"config": cfg, "rows": rows}, open(out, "w"), indent=1)
     print(f"\nwrote {out}")
 
@@ -728,6 +1068,21 @@ def demo():
 
     assert iso("2023/04/10 (Mon) 17:50") == "2023-04-10T17:50"
     assert iso(None) == "1970-01-01T00:00", "a missing date must not crash ingest"
+
+    class VerdictBackend:
+        def __init__(self, verdict):
+            self.verdict = verdict
+            self.usage = type("Usage", (), {"errors": 0})()
+
+        def __call__(self, prompt, system=None, nudge=None):
+            return self.verdict
+
+    judge_q = {"question": "q", "answer": "a"}
+    malformed = VerdictBackend("CORRECTED")
+    assert not judge(judge_q, "a", malformed, votes=1)
+    assert malformed.usage.errors == 1
+    exact = VerdictBackend(" correct \n")
+    assert judge(judge_q, "a", exact, votes=1)
 
     # rag_context returns hits in LOG order, not BM25 rank order. The last row
     # repeats the term most, so BM25 ranks it first and the sort must move it
@@ -822,9 +1177,34 @@ def demo():
         rows_for("full", 18, 24) + rows_for("rag", 18, 24) + rows_for("naru", 24, 24)
     )
     out3 = sep_out(three, ["full", "rag", "naru"])
-    assert "Bonferroni for 3 pairs" in out3, out3
+    assert "Bonferroni for 3 planned pairs" in out3, out3
     assert "REAL" not in out3, out3
     assert "p=0.031" in out3, out3
+    failed_arm = rows_for("full", 18, 24) + rows_for("naru", 24, 24)
+    failed_arm += [
+        {
+            "arm": "rag", "qid": f"q{i}", "correct": False,
+            "type": "t", "errors": 1,
+        }
+        for i in range(24)
+    ]
+    failed_out = sep_out(failed_arm, ["full", "rag", "naru"])
+    assert "Bonferroni for 3 planned pairs" in failed_out, failed_out
+    assert "REAL" not in failed_out and "p=0.031" in failed_out, failed_out
+    try:
+        separability(rows_for("full", 1, 2), ["full", "full"])
+    except ValueError as error:
+        assert "unique" in str(error), error
+    else:
+        raise AssertionError("duplicate comparison arms were accepted")
+    duplicate_rows = rows_for("full", 1, 2) + rows_for("naru", 1, 2)
+    duplicate_rows.append(dict(duplicate_rows[0]))
+    try:
+        separability(duplicate_rows, both)
+    except ValueError as error:
+        assert "duplicate result rows" in str(error), error
+    else:
+        raise AssertionError("duplicate result rows were accepted")
     # A judge failure returns "" for every vote, which reads as WRONG. It must
     # leave the pairing too, not just a hard backend error.
     jrows = rows_for("full", 16, 24) + rows_for("naru", 19, 24)
@@ -852,6 +1232,44 @@ def demo():
         ],
     }
     full_p = build_prompt(synth, "full")
+    old_backend = os.environ.get("NARU_BACKEND")
+    os.environ["NARU_BACKEND"] = "cat"
+    try:
+        saved = one(synth, "full", HAIKU, HAIKU, 1, 6000, False)
+    finally:
+        if old_backend is None:
+            os.environ.pop("NARU_BACKEND", None)
+        else:
+            os.environ["NARU_BACKEND"] = old_backend
+    expected_answer = (FULL_SYSTEM + "\n\n" + full_p).strip()[:2000]
+    assert len(expected_answer) > 400 and saved["answer"] == expected_answer
+    expected_prompt = est(FULL_SYSTEM + "\n\n" + full_p)
+    assert saved["prompt_tokens_estimated"] == expected_prompt
+    assert saved["peak_prompt_tokens_estimated"] == expected_prompt
+    assert saved["backend_calls"] == 1 and saved["peak_view_tokens"] == 0
+
+    class KnownUsageBackend:
+        def __init__(self):
+            self.usage = Usage(
+                attempts=1, calls=1, input_tokens=7,
+                prompt_tokens_estimated=9, peak_prompt_tokens_estimated=9,
+            )
+
+        def __call__(self, prompt, system=None, nudge=None):
+            return "saved answer"
+
+    from unittest.mock import patch
+
+    known = KnownUsageBackend()
+    with patch.object(
+        sys.modules[__name__], "get_backend",
+        side_effect=[known, RuntimeError("judge unavailable")],
+    ):
+        failed_judge = one(synth, "full", HAIKU, HAIKU, 1, 6000, False)
+    assert failed_judge["answer"] == "saved answer"
+    assert failed_judge["billed_input"] == 7
+    assert failed_judge["backend_calls"] == 1
+    assert failed_judge["errors"] == 0 and failed_judge["judge_errors"] == 1
     old_kernel = os.environ.get("NARU_KERNEL")
     old_tempdir = tempfile.tempdir
     with tempfile.TemporaryDirectory() as temp_root:
@@ -871,6 +1289,98 @@ def demo():
     assert "tarragon" in full_p, "the full arm must carry the whole history"
     assert "tarragon" not in rag_p, "the rag arm must carry retrieved hits only"
     assert len(rag_p) < len(full_p)
+
+    with ProcessPoolExecutor(max_workers=2) as ex:
+        worker_pids = list(ex.map(_worker_pid, range(4)))
+    assert all(pid != os.getpid() for pid in worker_pids), worker_pids
+
+    # RSM groups chronological Event Log chunks by atom. The query ranks the
+    # later alpha chunk first, but the packer must restore seq order inside
+    # the selected atom and omit the unrelated atom.
+    rsm_synth = {
+        **synth,
+        "question": "which alpha detail matters",
+        "haystack_dates": [
+            "2023/01/01 (Sun) 10:00",
+            "2023/02/01 (Wed) 10:00",
+            "2023/03/01 (Wed) 10:00",
+        ],
+        "haystack_session_ids": ["s1", "s2", "s3"],
+        "haystack_sessions": [
+            [{"role": "user", "content": "first alpha detail"}],
+            [{"role": "user", "content": "unrelated boats detail"}],
+            [{"role": "user", "content": "later alpha detail"}],
+        ],
+    }
+
+    def fake_embed(texts):
+        vectors = []
+        for text in texts:
+            if text == rsm_synth["question"] or "later alpha" in text:
+                vectors.append((1.0, 0.0))
+            elif "first alpha" in text:
+                vectors.append((0.8, 0.6))
+            else:
+                vectors.append((0.0, 1.0))
+        return vectors
+
+    rsm_ctx, rsm_stats = rsm_context(
+        rsm_synth,
+        rsm_synth["question"],
+        k=1,
+        tau=0.7,
+        chunk_turns=1,
+        budget=200,
+        vectorize=fake_embed,
+    )
+    assert "unrelated boats" not in rsm_ctx, rsm_ctx
+    assert rsm_ctx.count("=== Atom") == 1, rsm_ctx
+    assert rsm_ctx.index("first alpha") < rsm_ctx.index("later alpha"), rsm_ctx
+    assert rsm_stats["rsm_atoms"] == 2 and rsm_stats["rsm_members"] == 3
+
+    limited, _ = rsm_context(
+        rsm_synth,
+        rsm_synth["question"],
+        k=2,
+        tau=0.7,
+        chunk_turns=1,
+        budget=35,
+        vectorize=fake_embed,
+    )
+    assert est(limited) <= 35, (est(limited), limited)
+    # Opposite normalized vectors cancel to zero. Leave the current atom
+    # unchanged and start a new atom instead of dividing by zero.
+    opposite = {
+        **rsm_synth,
+        "haystack_dates": rsm_synth["haystack_dates"][:2],
+        "haystack_session_ids": rsm_synth["haystack_session_ids"][:2],
+        "haystack_sessions": rsm_synth["haystack_sessions"][:2],
+    }
+    _, zero_stats = rsm_context(
+        opposite,
+        opposite["question"],
+        k=2,
+        tau=-1,
+        chunk_turns=1,
+        budget=200,
+        vectorize=lambda _: [(1.0, 0.0), (-1.0, 0.0), (1.0, 0.0)],
+    )
+    assert zero_stats["rsm_atoms"] == 2, zero_stats
+    try:
+        build_prompt(rsm_synth, "rsm")
+    except ValueError as error:
+        assert "direct prompt arm" in str(error), error
+    else:
+        raise AssertionError("the unused RSM prompt path survived")
+
+    # The external boundary rejects bad JSON without a network request.
+    bad_embed = [sys.executable, "-c", "print('{bad json')"]
+    try:
+        embed_vectors(bad_embed, ["one"])
+    except ValueError as e:
+        assert "invalid JSON" in str(e), e
+    else:
+        raise AssertionError("malformed NARU_EMBED response was accepted")
 
     # a run predating judge_errors must say so, not report zero of them
     def rep_out(rows):
@@ -977,6 +1487,14 @@ def demo():
         env={**os.environ, "NARU_BACKEND": "cat"},
     )
     assert r.returncode != 0 and "nauru" in r.stderr, (r.returncode, r.stderr)
+    r = subprocess.run(
+        [sys.executable, __file__, "--arms", "full,full"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "NARU_BACKEND": "definitely-not-a-real-backend"},
+    )
+    assert r.returncode != 0 and "duplicates" in r.stderr, (r.returncode, r.stderr)
     # same guard shape, same place: a negative k is SQLite's "no limit"
     r = subprocess.run(
         [sys.executable, __file__, "--rag-k", "-1"],
@@ -986,6 +1504,24 @@ def demo():
         env={**os.environ, "NARU_BACKEND": "cat"},
     )
     assert r.returncode != 0 and "rag-k" in r.stderr, (r.returncode, r.stderr)
+    embed_env = {**os.environ, "NARU_BACKEND": "cat"}
+    embed_env.pop("NARU_EMBED", None)
+    r = subprocess.run(
+        [sys.executable, __file__, "--arms", "rsm"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=embed_env,
+    )
+    assert r.returncode != 0 and "NARU_EMBED" in r.stderr, (r.returncode, r.stderr)
+    r = subprocess.run(
+        [sys.executable, __file__, "--arms", "naru+atoms"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**embed_env, "NARU_BACKEND": "definitely-not-a-real-backend"},
+    )
+    assert r.returncode != 0 and "unknown arm" in r.stderr, (r.returncode, r.stderr)
 
     print(
         "ok — bench checks passed "

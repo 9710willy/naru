@@ -19,6 +19,10 @@ from dataclasses import dataclass, field
 
 HAIKU = "claude-haiku-4-5-20251001"
 
+
+def _estimate(text):
+    return max(1, len(text) // 4)
+
 # Flags that strip the Claude Code persona/tooling so the model behaves as a
 # plain completion endpoint rather than a coding agent.
 _BARE = [
@@ -40,12 +44,15 @@ _BARE = [
 
 @dataclass
 class Usage:
+    attempts: int = 0
     calls: int = 0
     input_tokens: int = 0
     cache_read: int = 0
     cache_creation: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+    prompt_tokens_estimated: int = 0
+    peak_prompt_tokens_estimated: int = 0
     errors: int = 0
     empty_retries: int = 0
     call_retries: int = 0
@@ -65,7 +72,7 @@ class Usage:
 
     def __str__(self):
         return (
-            f"{self.calls} calls | in {self.billed_input:,} "
+            f"{self.attempts} calls | in {self.billed_input:,} "
             f"(fresh {self.input_tokens:,}) | out {self.output_tokens:,} "
             f"| ${self.cost_usd:.3f}"
             + (f" | {self.errors} err" if self.errors else "")
@@ -112,6 +119,13 @@ class _Retrying:
         """
         for attempt in range(self.retries):
             p = prompt if attempt == 0 or not nudge else f"{prompt}\n\n{nudge}"
+            supplied = f"{system}\n\n{p}" if system else p
+            estimated = _estimate(supplied)
+            self.usage.attempts += 1
+            self.usage.prompt_tokens_estimated += estimated
+            self.usage.peak_prompt_tokens_estimated = max(
+                self.usage.peak_prompt_tokens_estimated, estimated
+            )
             out = self._once(p, system)
             if out is None:
                 self.usage.call_retries += 1
@@ -282,11 +296,13 @@ def measure_floor(model=HAIKU):
     b = get_backend(model)
     if not b.reports_tokens:
         return None
-    b("Reply with one word: ok", system="You reply in one word.")
+    result = b("Reply with one word: ok", system="You reply in one word.")
     # `calls` only advances when usage was actually recorded. A nonzero exit,
     # unparseable JSON, a timeout, expired auth or a rate limit all leave it at
     # zero — and `// max(1, 0)` used to turn that into a confident 0.
-    return b.usage.billed_input // b.usage.calls if b.usage.calls else None
+    if not result or b.usage.errors or not b.usage.calls:
+        return None
+    return b.usage.billed_input // b.usage.calls
 
 
 def demo(live=True):
@@ -305,6 +321,9 @@ def demo(live=True):
     echo = CommandBackend(cmd="cat")
     assert echo("PING", system="SYS") == "SYS\n\nPING", "system prompt not prepended"
     assert not echo.reports_tokens, "a generic pipe must not claim token counts"
+    assert echo.usage.attempts == 1
+    assert echo.usage.prompt_tokens_estimated == _estimate("SYS\n\nPING")
+    assert echo.usage.peak_prompt_tokens_estimated == _estimate("SYS\n\nPING")
     # A bad NARU_BACKEND must fail at construction, not yield a silent run of
     # empty answers that reads as "the model had nothing to say".
     for bad in ("definitely-not-a-real-binary", "", 'sh -c "unbalanced'):
@@ -345,6 +364,19 @@ def demo(live=True):
     # on errors, so counting per attempt would be the same verdict either way,
     # but report()'s error line would read six times too high.
     assert _db.usage.errors == 1, _db.usage.errors
+
+    class FailedFloor(_Retrying):
+        def _once(self, prompt, system=None):
+            self.usage.add({"input_tokens": 100}, 0)
+            return None
+
+    failed_floor = FailedFloor(retries=1)
+    real_get_backend = globals()["get_backend"]
+    globals()["get_backend"] = lambda _: failed_floor
+    try:
+        assert measure_floor() is None
+    finally:
+        globals()["get_backend"] = real_get_backend
 
     # The "no usage" warning is per command, not per construction. bench.py
     # builds one backend per question per arm, so this is the difference

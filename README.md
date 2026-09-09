@@ -165,8 +165,9 @@ rather than printing a zero that looks measured.
 ```bash
 python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
 python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
-python3 noise.py --selfcheck && python3 bench.py --selfcheck
-python3 backend.py --selfcheck
+python3 noise.py --selfcheck && python3 metrics.py --selfcheck
+python3 backend.py --selfcheck && python3 bench.py --selfcheck
+python3 beam.py --selfcheck && python3 regrade.py --selfcheck
 python3 test_mutations.py   # do those self-checks catch anything?
 python3 backend.py      # live: two cheap calls, prints the harness token floor
 python3 test_judge.py   # live: judge regression cases
@@ -175,9 +176,30 @@ python3 test_judge.py   # live: judge regression cases
 ## Benchmark
 
 `bench.py` runs [LongMemEval](https://arxiv.org/abs/2410.10813) (ICLR 2025)
-over three arms on identical history. `full` puts the whole history in one
-prompt. `rag` pastes the top 8 BM25 hits and answers in one call. `naru` leaves
-the history in the log for the model to reach by writing code.
+over four supported arms on identical history. `full` puts the whole history in
+one prompt. `rag` pastes the top 8 BM25 hits and answers in one call. `naru`
+leaves the history in the log for the model to reach by writing code. Optional
+`rsm` groups dense-retrieval chunks and answers in one call.
+
+The default arms are `full,rag,naru`. The `rsm` arm needs `NARU_EMBED`, so it
+stays out of the default command. The command reads one JSON object on stdin
+with a `texts` array and writes one JSON object with a same-length `vectors`
+array. Naru validates and normalizes every vector. It records the command's
+program name only, not its arguments.
+
+```bash
+NARU_EMBED='./embed-bge-large' python3 bench.py --arms rag,rsm --split oracle -n 12
+```
+
+The `rsm` arm defaults to six atoms, five turns per chunk, a 0.85 merge
+threshold, and a 4,000-token source budget. The 0.85 value is the paper's BGE
+setting. You must calibrate it for another embedding space. The report records
+embedding input tokens, atoms, selected members, timing, source tokens, and
+estimated prompt tokens. Model cost does not include embedding-provider cost
+because the harness cannot know it.
+
+All arms report estimated total and peak prompt tokens, including the system
+text and retries. Naru also reports its bounded dynamic-view peak separately.
 
 **What this is for.** It checks whether this implementation behaves like the
 one in the paper. It is not a contribution to the field and the numbers are not
@@ -279,7 +301,9 @@ filed under different keys both appear as approved.
 
 One database, one machine. Two databases would break `seq` as a total order.
 
-Search is BM25 only, as in the paper. No embeddings.
+Naru's runtime search is BM25 only, as in the paper. The optional `rsm`
+benchmark arm uses an external embedding command and does not change runtime
+search or stored memory.
 
 The benchmark judge is not LongMemEval's official prompt. Numbers are for
 tracking this repo and are not comparable to published scores.

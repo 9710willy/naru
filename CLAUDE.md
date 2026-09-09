@@ -16,8 +16,9 @@ Every module has a runnable self-check. The first four need no network:
 ```bash
 python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
 python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
-python3 noise.py --selfcheck && python3 bench.py --selfcheck
-python3 backend.py --selfcheck
+python3 noise.py --selfcheck && python3 metrics.py --selfcheck
+python3 backend.py --selfcheck && python3 bench.py --selfcheck
+python3 beam.py --selfcheck && python3 regrade.py --selfcheck
 python3 test_mutations.py   # breaks the code on purpose; checks must fail
 python3 backend.py    # live: 2 cheap calls, prints the harness token floor
 python3 test_judge.py # live: judge regression cases
@@ -27,14 +28,24 @@ Stdlib only. No dependencies — do not add one for something a few lines cover.
 
 ## Benchmark rules
 
-`bench.py` is the only source of numbers. Three arms (`full`, `rag`, `naru`)
-over the same questions.
+`bench.py` is the only source of numbers. It supports four arms (`full`, `rag`,
+`naru`, `rsm`) over the same questions. The default is the first three. The
+optional `rsm` arm reads normalized vectors from one `NARU_EMBED` JSON command
+call per question and makes one `FULL_SYSTEM` answer call. The command reads
+`{"texts": [...]}` on stdin and returns a same-length `{"vectors": [...]}`
+object. The report excludes unknown embedding-provider cost. Run `rsm`
+explicitly:
+
+```bash
+NARU_EMBED='./embed-bge-large' python3 bench.py --arms rag,rsm --split oracle -n 12
+```
 
 **`rag` is the control and must never be quietly dropped.** It holds the kernel
 fixed and varies only what fills the prompt, which is the one thing that
 separates "programmatic access wins" from "any retrieval beats stuffing".
 Without it, `naru` beating `full` proves nothing. As of ADR 0006 `rag` beats
-`naru` on this benchmark on every column, so a run that omits it is flattering
+`naru` at n=24, while the n=96 reference run reverses the order. Neither result
+separates at the corrected threshold, so a run that omits `rag` is flattering
 itself.
 
 - **Never hardcode a measured constant.** `--harness-floor` is measured at
@@ -44,7 +55,7 @@ itself.
   is paired. Do not replace it with overlapping confidence intervals: that
   discards the pairing and is far too conservative. At n=24 nothing separates,
   including a 20-point gap.
-- **Three arms means three tests.** The threshold is Bonferroni-corrected;
+- **The default three arms mean three tests.** The threshold is Bonferroni-corrected;
   uncorrected, one pair reads "REAL" in ~6% of runs where nothing separates.
 - **A self-check that passes proves the code runs, not that it checks.** Four
   of these were decorative until `test_mutations.py` broke the code on purpose
