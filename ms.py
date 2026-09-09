@@ -783,7 +783,8 @@ def demo():
     """Runnable self-check. Fails loudly if any core behavior breaks."""
     ms = MemorySurface(":memory:")
 
-    identity_dir = pathlib.Path(tempfile.mkdtemp())
+    identity_tmp = tempfile.TemporaryDirectory()
+    identity_dir = pathlib.Path(identity_tmp.name)
     identity_path = identity_dir / "identity.db"
     first = MemorySurface(str(identity_path))
     first_id, first_blobs = first.store_id, first.blobs
@@ -1353,7 +1354,8 @@ def demo():
     # ---- migration: a store created BEFORE the curation columns existed ----
     # Without this the ALTER TABLE branch never runs in the suite, because a
     # fresh store always gets the columns from CREATE TABLE.
-    legacy_dir = pathlib.Path(tempfile.mkdtemp())
+    legacy_tmp = tempfile.TemporaryDirectory()
+    legacy_dir = pathlib.Path(legacy_tmp.name)
     legacy = legacy_dir / "legacy.db"
     old_db = sqlite3.connect(str(legacy))
     old_db.executescript("""

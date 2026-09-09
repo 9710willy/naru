@@ -187,7 +187,8 @@ def demo():
     import tempfile
 
     global DB
-    DB = pathlib.Path(tempfile.mkdtemp()) / "s.db"
+    tmp = tempfile.TemporaryDirectory()
+    DB = pathlib.Path(tmp.name) / "s.db"
     me = [sys.executable, str(pathlib.Path(__file__).resolve())]
     # Isolate metrics too: a self-check must not write into the user's
     # real observability store.

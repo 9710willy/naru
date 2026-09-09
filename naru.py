@@ -482,7 +482,8 @@ def demo():
     import tempfile
 
     global DB
-    DB = pathlib.Path(tempfile.mkdtemp()) / "t.db"
+    tmp = tempfile.TemporaryDirectory()
+    DB = pathlib.Path(tmp.name) / "t.db"
     metrics.PATH = DB.parent / "m.jsonl"  # never touch the real store
 
     # Close the door rather than hoping it is shut. Several assertions below
@@ -554,9 +555,7 @@ def _demo(real_stdin):
     assert ms.search("eviction"), "prune must not touch recent rows"
 
     # a missing blob must not break recovery — content column is authoritative
-    import tempfile as _tf
-
-    ms2 = MemorySurface(str(pathlib.Path(_tf.mkdtemp()) / "b.db"))
+    ms2 = MemorySurface(str(DB.parent / "b.db"))
     big = "FULLTEXT " + "z" * 5000
     s2 = ms2.append("tool", big, created_at="2026-01-01T00:00", payload=big)
     row = ms2.sql_query(

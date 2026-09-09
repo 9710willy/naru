@@ -341,7 +341,8 @@ def demo(live=True):
     import stat as _stat
     import tempfile as _tempfile
 
-    _d = _pathlib.Path(_tempfile.mkdtemp())
+    _tmp = _tempfile.TemporaryDirectory()
+    _d = _pathlib.Path(_tmp.name)
     _n = _d / "n"
     _flaky = _d / "flaky.sh"
     _flaky.write_text(

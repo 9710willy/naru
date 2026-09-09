@@ -165,7 +165,8 @@ def demo():
     import tempfile
 
     global PATH
-    PATH = pathlib.Path(tempfile.mkdtemp()) / "m.jsonl"
+    tmp = tempfile.TemporaryDirectory()
+    PATH = pathlib.Path(tmp.name) / "m.jsonl"
 
     assert report() == [f"no metrics yet ({PATH})"]
 

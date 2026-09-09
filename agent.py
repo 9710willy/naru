@@ -672,7 +672,8 @@ def demo():
     import pathlib
     import tempfile
 
-    sandbox_dir = pathlib.Path(tempfile.mkdtemp())
+    sandbox_tmp = tempfile.TemporaryDirectory()
+    sandbox_dir = pathlib.Path(sandbox_tmp.name)
     fms = MemorySurface(str(sandbox_dir / "log.db"))
     fms.append(
         "user", "I drive a blue Subaru Outback", kind="context_msg",

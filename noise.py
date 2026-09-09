@@ -164,7 +164,8 @@ def demo():
     import io
     import tempfile
 
-    d = pathlib.Path(tempfile.mkdtemp())
+    tmp = tempfile.TemporaryDirectory()
+    d = pathlib.Path(tmp.name)
 
     def write(name, arm_verdicts):
         rows = [
