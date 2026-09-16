@@ -1,0 +1,36 @@
+Independent audit review
+Run ID: 2163166b-8623-421e-a811-66b362bcfcd6
+Model: gpt-6-astra
+Reasoning effort: low
+Status: completed
+Elapsed: 23628 ms
+Tools: 4 total, 0 failed
+
+High, scope and limit:
+Requested work remains open. agent_comms was not changed or verified. No
+production paired run establishes Naru's benefit. The TSV discloses both gaps.
+
+Medium, verification:
+The first verification row listed only passing checks. It omitted the known
+full-repo Ruff and Ripwire findings.
+
+Medium, evaluation:
+The phrase "isolates the approved document" was too strong. The Naru arm adds
+the document and instructions for Naru use, so it measures that full package.
+
+Medium, research:
+The first research row did not point to direct sources for both papers.
+
+Low, delivery:
+The first proof compared HEAD with the local origin/main tracking ref. It did
+not query the remote.
+
+Low, verification:
+The two audit files were untracked, so commit acea318 did not preserve them.
+
+Corrections made after review:
+- Appended a row that defines the evaluated treatment as the full hook context.
+- Appended direct repository source pointers for both research claims.
+- Added Ruff and Ripwire commands, exits, and findings to the verification file.
+- Queried origin/main with git ls-remote and saved the exact result.
+- Kept the missing production run and agent_comms verification open.

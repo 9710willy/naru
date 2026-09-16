@@ -1,0 +1,189 @@
+Naru curation and observability verification
+Run: 2026-09-16
+Tree: acea3181508aba59f08016f063cefe88459317fb
+
+$ python3 curation_probe.py --selfcheck
+exit 0
+port: plain=fail naru=pass
+color: plain=pass naru=pass
+ok — paired curation checks passed
+
+$ python3 metrics.py --selfcheck
+exit 0
+ok — metrics checks passed
+
+$ python3 naru.py --selfcheck
+exit 0
+stdout:
+saved 2 chunk(s) as seq 1-2 -> temporary test database
+saved 1 chunk(s) as seq 3-3 -> temporary test database
+claim 5 pending — `naru inbox` to decide
+claim 6 pending — `naru inbox` to decide
+seq 5 promoted
+seq 6 dropped
+seq 5 dropped
+claim 7 pending — `naru inbox` to decide
+seq 7 promoted
+seq 9 dropped
+wrote 157 chars into temporary AGENTS.md
+wrote 157 chars into temporary CLAUDE.md (kept the 52 chars already there)
+wrote 157 chars into temporary CLAUDE.md (kept the 210 chars already there)
+claim 10 pending — `naru inbox` to decide
+seq 10 promoted
+claim 11 pending — `naru inbox` to decide
+seq 11 promoted
+seq 10 dropped
+seq 11 dropped
+saved 1 chunk(s) as seq 12-12 -> temporary test database
+claim 15 pending — `naru inbox` to decide
+skill 16 pending — `naru inbox` to decide
+seq 16 promoted
+claim 17 pending — `naru inbox` to decide
+ok — naru checks passed
+stderr:
+unknown command 'bogus'
+naru — one curated doc, shared across sessions, models and harnesses.
+need a topic: naru add "sprint planning" [text]
+need text: naru claim "<text>" [--key k]
+refusing to promote without a terminal; pass --yes if you mean it
+seq 5 is not a pending claim or skill this can promote (already decided, or not a curation item)
+seq 9999 is not a pending claim or skill this can promote (already decided, or not a curation item)
+need a seq: naru promote 12
+seq 5 is not a pending claim or skill this can promote (already decided, or not a curation item)
+refused: nothing opened seq 13-14. A claim may cite only evidence its author read.
+refused: nothing opened seq 13-14. A claim may cite only evidence its author read.
+--run and --source LO:HI must be used together
+--run and --source LO:HI must be used together
+--source must be LO:HI with LO <= HI
+refused: nothing opened seq 13-14. A claim may cite only evidence its author read.
+--base must be an integer
+--key needs a value
+--key needs a value
+--run needs a value
+--run needs a value
+need text: naru claim "<text>" [--key k]
+
+$ python3 test_mutations.py
+exit 0
+  caught    rag falls through to full
+  caught    benchmark jobs share process stdout
+  caught    rag creates a sandbox file log
+  caught    errored runs score as wrong answers
+  caught    judge accepts a verdict prefix
+  caught    saved answers truncate before the judge boundary
+  caught    regrade keeps stale judge errors
+  caught    regrade accepts legacy truncated answers
+  caught    unmeasured judge errors print as zero
+  caught    no Bonferroni across the arm pairs
+  caught    failed arms relax the planned threshold
+  caught    duplicate result rows overwrite each other
+  caught    separability verdict inverted
+  caught    gap names the losing arm
+  caught    main() stops validating --arms
+  caught    main() accepts duplicate arms
+  caught    --rag-k accepts SQLite's 'no limit'
+  caught    run config records the backend's arguments
+  caught    prompt estimates omit the system text
+  caught    failed floor calls report a measured value
+  caught    later failures discard known answer usage
+  caught    BEAM drops estimated prompt totals
+  caught    rag hits keep BM25 rank order
+  caught    rsm packer exceeds its token budget
+  caught    rsm runs without an embedder
+  caught    zero centroid reaches division
+  caught    FTS5 operators reach the query from question text
+  caught    McNemar p-value becomes one-sided
+  caught    noise keeps errored rows
+  caught    noise hides exclusion counts
+  caught    a refused rlimit is reported as applied
+  caught    kernel digest copies the full resident list
+  caught    a crashed child is reported as a timeout
+  caught    sandbox stderr becomes a blocking pipe
+  caught    a first prose reply is banked as the answer
+  caught    agent trace omits the system prompt
+  caught    agent.py never takes the sandbox branch
+  caught    run_naru leaves its kernel open
+  caught    agent trace uses a local sequence
+  caught    invalid headline state reaches the log
+  caught    headline state is never persisted
+  caught    default search exposes agent trace
+  caught    session-scoped recovery includes other rows
+  caught    source range accepts another run
+  caught    externalized trace pointer loses its session
+  caught    trace index pointer loses its session
+  caught    callback dispatch is unguarded in the parent
+  caught    the log path stays in the child's environment
+  caught    submit_answer no longer stops the cell
+  caught    the child opens the log writable
+  caught    the child runs without -I, so CWD is importable
+  caught    an in-memory log is accepted for a child process
+  caught    prune preview forgets PRUNE_KEEP
+  caught    prune does not reserve the writer
+  caught    blob gc does not reserve the writer
+  caught    prune deletes promoted provenance
+  caught    prune keeps dropped provenance
+  caught    promoted provenance has no range index
+  caught    store identity ignores database incarnation
+  caught    legacy store metadata is rejected
+  caught    an existing store gets a no-op metadata write
+  caught    blob gc deletes live payloads
+  caught    outline has no session index
+  caught    show receipt ignores store identity
+  caught    show receipt ignores run identity
+  caught    legacy show receipt authorizes a claim
+  caught    separate endpoint receipts cover a span
+  caught    show receipts never link back to spills
+  caught    spill metrics omit store identity
+  caught    empty show records evidence
+  caught    inject treats an unreadable file as empty
+  caught    Codex repeats unchanged Naru context
+  caught    Codex delivery state bypasses its typed table
+  caught    legacy Codex delivery state is ignored
+  caught    Codex delivery metrics omit the harness
+  caught    Codex refresh watches only the highest promoted seq
+  caught    paired probe omits approved context
+  caught    paired probe ignores forbidden answer text
+  caught    paired probe accepts duplicate case ids
+  caught    paired probe scores failed model calls
+
+ok — 80/80 mutations caught
+
+$ git diff --check HEAD^ HEAD
+exit 0
+
+$ git rev-parse HEAD origin/main
+exit 0
+acea3181508aba59f08016f063cefe88459317fb
+acea3181508aba59f08016f063cefe88459317fb
+
+$ ruff check --no-cache curation_probe.py
+exit 0
+All checks passed!
+
+$ ruff check --no-cache .
+exit 1
+Found 51 errors.
+3 are safe-fix candidates. Ruff reports 12 more only with unsafe fixes.
+The findings span existing test, benchmark, kernel, hook, metrics, and CLI code.
+
+$ ripwire . --quality-delta=acea3181508aba59f08016f063cefe88459317fb --json
+exit 2
+base_ref cc9a727900d50c2bb1019cd221f4a236649860d7
+target_ref acea3181508aba59f08016f063cefe88459317fb
+regressions 9
+minor 3
+preexisting-worse 6
+new-symbol 3
+gating 3
+gating findings:
+  verbosity MUTATIONS at test_mutations.py:49, 463 to 526
+  verbosity _demo at naru.py:533, 365 to 388
+  verbosity demo at ms.py:818, 648 to 661
+new-symbol findings:
+  dead-code Fake.__call__ at curation_probe.py:224
+  dead-code Fake.__init__ at curation_probe.py:221
+  error-masking selfcheck at curation_probe.py:215
+
+$ git ls-remote origin refs/heads/main
+exit 0
+acea3181508aba59f08016f063cefe88459317fb refs/heads/main
