@@ -33,4 +33,5 @@ jobs:
       - run: python bench.py --selfcheck
       - run: python beam.py --selfcheck
       - run: python regrade.py --selfcheck
+      - run: python curation_probe.py --selfcheck
       - run: python test_mutations.py

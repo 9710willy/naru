@@ -92,6 +92,33 @@ class Row(dict):
         return f"<seq {self.get('seq')} {self.get('role')} {self.get('created_at')}: {body}>"
 
 
+def context_delivery(ms, agent_id, session_id):
+    """Return the last approved doc delivered to one agent session."""
+    row = ms.db.execute(
+        "SELECT * FROM context_delivery WHERE agent_id=? AND session_id=?",
+        (agent_id, session_id),
+    ).fetchone()
+    return Row(row) if row else None
+
+
+def remember_context_delivery(ms, agent_id, session_id, state):
+    """Replace one session's delivery fingerprint."""
+    ms.db.execute(
+        "INSERT OR REPLACE INTO context_delivery"
+        "(agent_id, session_id, schema, doc_seq, doc_hash, delivered_at)"
+        " VALUES(?,?,?,?,?,?)",
+        (
+            agent_id,
+            session_id,
+            state["schema"],
+            state["doc_seq"],
+            state["doc_hash"],
+            state["delivered_at"],
+        ),
+    )
+    ms.db.commit()
+
+
 def _to_match(query):
     """Translate a user query into FTS5 MATCH syntax.
 
@@ -181,6 +208,15 @@ class MemorySurface:
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
                 content, content='conversation_history', content_rowid='seq');
+            CREATE TABLE IF NOT EXISTS context_delivery(
+                agent_id     TEXT NOT NULL,
+                session_id   TEXT NOT NULL,
+                schema       TEXT NOT NULL,
+                doc_seq      INTEGER NOT NULL,
+                doc_hash     TEXT NOT NULL,
+                delivered_at TEXT,
+                PRIMARY KEY(agent_id, session_id)
+            );
         """)
         self._migrate_fts()
         self._migrate_cols()
@@ -1392,7 +1428,20 @@ def demo():
     ))
     assert "ix_session_id" in outline_plan, outline_plan
     m4 = MemorySurface(str(legacy))
-    assert m4.store_id == m3.store_id, "migration changed the store identity"
+    assert m4.store_id == expected_id, "migration changed the store identity"
+    remember_context_delivery(
+        m4,
+        "codex",
+        "codex:legacy",
+        {
+            "schema": "naru.codex.context.v1",
+            "doc_seq": 13,
+            "doc_hash": "new-hash",
+            "delivered_at": "2026-09-01T12:01:00",
+        },
+    )
+    assert context_delivery(m4, "codex", "codex:legacy").doc_hash == "new-hash"
+    assert m4.db.execute("SELECT COUNT(*) FROM context_delivery").fetchone()[0] == 1
     m4.close()
 
     # section 2.2: the Event Log is READ-ONLY from the kernel

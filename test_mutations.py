@@ -36,6 +36,9 @@ COPY = (
     "backend.py",
     "noise.py",
     "metrics.py",
+    "naru.py",
+    "hook_spill.py",
+    "curation_probe.py",
     "regrade.py",
     "beam.py",
 )
@@ -469,6 +472,18 @@ MUTATIONS = [
         'and (e["lo"] <= lo <= e["hi"] or e["lo"] <= hi <= e["hi"])',
     ),
     (
+        "show receipts never link back to spills",
+        "metrics.py",
+        'and shown["lo"] <= spill["seq"] <= shown["hi"]',
+        "and False",
+    ),
+    (
+        "spill metrics omit store identity",
+        "hook_spill.py",
+        "        store=ms.store_id,",
+        "        store=None,",
+    ),
+    (
         "empty show records evidence",
         "naru.py",
         (
@@ -494,16 +509,67 @@ MUTATIONS = [
         'if event_name == "UserPromptSubmit" and False:',
     ),
     (
-        "Codex hook state reaches normal search",
+        "Codex delivery state bypasses its typed table",
         "naru.py",
-        'kind="agent_state",\n        session_id=session_id,\n        agent_id="codex",',
-        'kind="tool_result",\n        session_id=session_id,\n        agent_id="codex",',
+        "    remember_context_delivery(\n",
+        "    ms.append(\n",
+    ),
+    (
+        "legacy Codex delivery state is ignored",
+        "naru.py",
+        (
+            "    rows = ms.sql_query(\n"
+            "        \"SELECT content, created_at FROM conversation_history\"\n"
+            "        \" WHERE kind='agent_state' AND agent_id='codex' AND session_id=?\"\n"
+            "        \" ORDER BY seq DESC LIMIT 1\",\n"
+            "        (session_id,),\n"
+            "    )"
+        ),
+        "    rows = []",
+    ),
+    (
+        "Codex delivery metrics omit the harness",
+        "naru.py",
+        '        harness="codex",',
+        '        harness="legacy",',
     ),
     (
         "Codex refresh watches only the highest promoted seq",
         "naru.py",
         "doc_hash = hashlib.sha256(doc.encode()).hexdigest()",
         "doc_hash = str(doc_seq)",
+    ),
+    (
+        "paired probe omits approved context",
+        "curation_probe.py",
+        (
+            "    system = (\n"
+            "        BASE_SYSTEM if arm == \"plain\" else "
+            "f\"{BASE_SYSTEM}\\n\\n{_codex_context(doc)}\"\n"
+            "    )"
+        ),
+        "    system = BASE_SYSTEM",
+    ),
+    (
+        "paired probe ignores forbidden answer text",
+        "curation_probe.py",
+        'return {"passed": not missing and not present, "missing": missing, "present": present}',
+        'return {"passed": not missing, "missing": missing, "present": present}',
+    ),
+    (
+        "paired probe accepts duplicate case ids",
+        "curation_probe.py",
+        "    if len(ids) != len(set(ids)):",
+        "    if False:",
+    ),
+    (
+        "paired probe scores failed model calls",
+        "curation_probe.py",
+        (
+            "            if not row[\"plain\"][\"usage\"][\"errors\"]\n"
+            "            and not row[\"naru\"][\"usage\"][\"errors\"]"
+        ),
+        "            if True",
     ),
 ]
 
@@ -518,6 +584,8 @@ def selfcheck_command(target):
         "naru.py": ["naru.py", "--selfcheck"],
         "noise.py": ["noise.py", "--selfcheck"],
         "metrics.py": ["metrics.py", "--selfcheck"],
+        "hook_spill.py": ["hook_spill.py", "--selfcheck"],
+        "curation_probe.py": ["curation_probe.py", "--selfcheck"],
         "backend.py": ["backend.py", "--selfcheck"],
         "regrade.py": ["regrade.py", "--selfcheck"],
         "beam.py": ["beam.py", "--selfcheck"],

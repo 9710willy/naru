@@ -11,6 +11,7 @@ python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
 python3 noise.py --selfcheck && python3 metrics.py --selfcheck
 python3 backend.py --selfcheck && python3 bench.py --selfcheck
 python3 beam.py --selfcheck && python3 regrade.py --selfcheck
+python3 curation_probe.py --selfcheck
 python3 test_mutations.py
 ```
 

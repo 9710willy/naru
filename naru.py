@@ -56,7 +56,14 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import metrics
-from ms import BEGIN, DEFAULT_DB, END, MemorySurface
+from ms import (
+    BEGIN,
+    DEFAULT_DB,
+    END,
+    MemorySurface,
+    context_delivery,
+    remember_context_delivery,
+)
 
 DB = pathlib.Path(os.environ.get("NARU_NOTES", DEFAULT_DB))
 CODEX_STATE_SCHEMA = "naru.codex.context.v1"
@@ -142,8 +149,15 @@ def _codex_session(event):
 
 
 def _codex_seen(ms, session_id):
+    state = context_delivery(ms, "codex", session_id)
+    if state is not None:
+        return (
+            state.doc_hash
+            if state.schema == CODEX_STATE_SCHEMA and isinstance(state.doc_hash, str)
+            else None
+        )
     rows = ms.sql_query(
-        "SELECT content FROM conversation_history"
+        "SELECT content, created_at FROM conversation_history"
         " WHERE kind='agent_state' AND agent_id='codex' AND session_id=?"
         " ORDER BY seq DESC LIMIT 1",
         (session_id,),
@@ -151,31 +165,42 @@ def _codex_seen(ms, session_id):
     if not rows:
         return None
     try:
-        state = json.loads(rows[0].content)
+        legacy = json.loads(rows[0].content)
     except (TypeError, json.JSONDecodeError):
         return None
-    if state.get("schema") != CODEX_STATE_SCHEMA:
+    if (
+        legacy.get("schema") != CODEX_STATE_SCHEMA
+        or type(legacy.get("doc_seq")) is not int
+        or not isinstance(legacy.get("doc_hash"), str)
+    ):
         return None
-    return state.get("doc_hash") if isinstance(state.get("doc_hash"), str) else None
+    remember_context_delivery(
+        ms,
+        "codex",
+        session_id,
+        {
+            "schema": CODEX_STATE_SCHEMA,
+            "doc_seq": legacy["doc_seq"],
+            "doc_hash": legacy["doc_hash"],
+            "delivered_at": rows[0].created_at,
+        },
+    )
+    return legacy["doc_hash"]
 
 
 def _codex_remember(ms, session_id, doc_seq, doc_hash):
     if _codex_seen(ms, session_id) == doc_hash:
         return
-    ms.append(
-        "agent",
-        json.dumps(
-            {
-                "schema": CODEX_STATE_SCHEMA,
-                "doc_seq": doc_seq,
-                "doc_hash": doc_hash,
-            },
-            separators=(",", ":"),
-        ),
-        kind="agent_state",
-        session_id=session_id,
-        agent_id="codex",
-        created_at=datetime.now().isoformat(timespec="seconds"),
+    remember_context_delivery(
+        ms,
+        "codex",
+        session_id,
+        {
+            "schema": CODEX_STATE_SCHEMA,
+            "doc_seq": doc_seq,
+            "doc_hash": doc_hash,
+            "delivered_at": datetime.now().isoformat(timespec="seconds"),
+        },
     )
 
 
@@ -204,6 +229,13 @@ def _codex_hook(event, ms):
         return None
     if event_name != "SubagentStart":
         _codex_remember(ms, session_id, doc_seq, doc_hash)
+    metrics.record(
+        "context_delivery",
+        harness="codex",
+        hook=event_name,
+        doc_seq=doc_seq,
+        chars=len(doc),
+    )
     return {
         "hookSpecificOutput": {
             "hookEventName": event_name,
@@ -692,18 +724,41 @@ def _demo(real_stdin):
     )
     assert start["hookSpecificOutput"]["hookEventName"] == "SessionStart"
     assert "Store is SQLite" in start["hookSpecificOutput"]["additionalContext"]
-    state = store().sql_query(
-        "SELECT session_id, content FROM conversation_history"
-        " WHERE kind='agent_state' AND agent_id='codex' ORDER BY seq DESC LIMIT 1"
-    )[0]
+    state = context_delivery(store(), "codex", codex_run)
+    assert state is not None
     assert state.session_id == codex_run, "Codex session ID was truncated"
-    state_content = json.loads(state.content)
-    assert state_content["doc_seq"] == store().doc_version()
-    assert state_content["doc_hash"] == hashlib.sha256(store().doc().encode()).hexdigest()
-    assert not any(
-        r.content.startswith('{"schema":"naru.codex.context.v1"')
-        for r in store().search("naru", k=50)
-    ), "Codex hook state leaked into normal search"
+    assert state.schema == CODEX_STATE_SCHEMA
+    assert state.doc_seq == store().doc_version()
+    assert state.doc_hash == hashlib.sha256(store().doc().encode()).hexdigest()
+    assert not store().sql_query(
+        "SELECT seq FROM conversation_history"
+        " WHERE kind='agent_state' AND agent_id='codex'"
+    ), "Codex delivery metadata reached the Event Log"
+    delivery = [e for e in metrics.read() if e.get("e") == "context_delivery"][-1]
+    assert delivery["harness"] == "codex" and delivery["hook"] == "SessionStart"
+
+    legacy_store = MemorySurface(str(DB.parent / "legacy-codex.db"))
+    legacy_seq = legacy_store.append(
+        "agent",
+        json.dumps(
+            {
+                "schema": CODEX_STATE_SCHEMA,
+                "doc_seq": 12,
+                "doc_hash": "legacy-hash",
+            },
+            separators=(",", ":"),
+        ),
+        kind="agent_state",
+        session_id="codex:legacy",
+        agent_id="codex",
+        created_at="2026-09-01T12:00:00",
+    )
+    assert _codex_seen(legacy_store, "codex:legacy") == "legacy-hash"
+    assert context_delivery(legacy_store, "codex", "codex:legacy").doc_seq == 12
+    assert legacy_store.sql_query(
+        "SELECT seq FROM conversation_history WHERE seq=?", (legacy_seq,)
+    ), "legacy delivery migration deleted its audit row"
+    legacy_store.close()
     assert _codex_hook(
         {
             "hook_event_name": "UserPromptSubmit",

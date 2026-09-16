@@ -88,6 +88,71 @@ def _pct(vals, p):
     return s[min(len(s) - 1, int(len(s) * p / 100))]
 
 
+def _reopened_spills(events):
+    """Return distinct attributable spills opened by a later show receipt."""
+    shows = [
+        e
+        for e in events
+        if e.get("e") == "show"
+        and e.get("v") == 2
+        and isinstance(e.get("store"), str)
+        and type(e.get("lo")) is int
+        and type(e.get("hi")) is int
+    ]
+    spills = [e for e in events if e.get("e") == "hook" and e.get("spilled")]
+    attributable = [
+        e
+        for e in spills
+        if isinstance(e.get("store"), str) and type(e.get("seq")) is int
+    ]
+    reopened = {
+        (spill["store"], spill["seq"])
+        for spill in attributable
+        if any(
+            shown["store"] == spill["store"]
+            and shown["lo"] <= spill["seq"] <= shown["hi"]
+            for shown in shows
+        )
+    }
+    return len(reopened), len(attributable), len(spills) - len(attributable)
+
+
+def _recovery_line(reopened, attributable, legacy_spills):
+    line = f"  spilled rows reopened {reopened:>5,}/{attributable:,} attributable"
+    if legacy_spills:
+        return line + f"  ({legacy_spills:,} legacy spill(s) cannot be linked)"
+    if attributable and not reopened:
+        return line + "   <- no recorded spill was reopened"
+    return line
+
+
+def _grouped_lines(calls, deliveries):
+    by_harness = {}
+    for event in calls:
+        harness = event.get("harness", "legacy")
+        by_harness.setdefault(harness, [0, 0])
+        by_harness[harness][0] += 1
+        by_harness[harness][1] += bool(event.get("spilled"))
+    lines = []
+    if by_harness:
+        lines.append(
+            "  spill hooks by harness: "
+            + "  ".join(
+                f"{h}={s}/{n}" for h, (n, s) in sorted(by_harness.items())
+            )
+        )
+    if deliveries:
+        counts = {}
+        for event in deliveries:
+            harness = event.get("harness", "legacy")
+            counts[harness] = counts.get(harness, 0) + 1
+        lines.append(
+            "  context deliveries: "
+            + "  ".join(f"{h}={n}" for h, n in sorted(counts.items()))
+        )
+    return lines
+
+
 def report(days=None, threshold=None):
     """Human summary. Returns the lines so callers can test it."""
     ev = read(days)
@@ -97,8 +162,11 @@ def report(days=None, threshold=None):
     calls = [e for e in ev if e["e"] == "hook"]
     spills = [e for e in calls if e.get("spilled")]
     skips = [e for e in calls if not e.get("spilled")]
-    recalls = [e for e in ev if e["e"] in ("show", "search")]
+    searches = [e for e in ev if e["e"] == "search"]
+    shows = [e for e in ev if e["e"] == "show"]
+    deliveries = [e for e in ev if e["e"] == "context_delivery"]
     fails = [e for e in ev if e["e"] == "error"]
+    reopened, attributable, legacy_spills = _reopened_spills(ev)
 
     saved = sum(e.get("chars", 0) - e.get("kept", 0) for e in spills)
     L = []
@@ -134,14 +202,9 @@ def report(days=None, threshold=None):
                     f"{int(threshold * 0.6):,} chars — consider lowering "
                     f"NARU_SPILL_THRESHOLD"
                 )
-    L.append(
-        f"  recoveries used    {len(recalls):>7,}"
-        + (
-            "   <- nothing has been recalled; the handle may be dead weight"
-            if spills and not recalls
-            else ""
-        )
-    )
+    L.append(f"  searches           {len(searches):>7,}")
+    L.append(f"  show commands       {len(shows):>7,}")
+    L.append(_recovery_line(reopened, attributable, legacy_spills))
     if fails:
         L.append(f"  ERRORS             {len(fails):>7,}")
         for e in fails[-3:]:
@@ -158,6 +221,7 @@ def report(days=None, threshold=None):
             "  by tool: "
             + "  ".join(f"{t}={s}/{n}" for t, (n, s) in sorted(by_tool.items()))
         )
+    L.extend(_grouped_lines(calls, deliveries))
     return L
 
 
@@ -170,32 +234,43 @@ def demo():
 
     assert report() == [f"no metrics yet ({PATH})"]
 
-    record("hook", tool="Bash", chars=500, spilled=False)
-    record("hook", tool="Bash", chars=30000, kept=1300, spilled=True, seq=1)
-    record("hook", tool="Bash", chars=7000, spilled=False)
+    record("hook", harness="claude-code", tool="Bash", chars=500, spilled=False)
+    record(
+        "hook", harness="claude-code", tool="Bash", chars=30000, kept=1300,
+        spilled=True, store="store-a", run="run-a", seq=1,
+    )
+    record("hook", harness="claude-code", tool="Bash", chars=7000, spilled=False)
+    record("hook", tool="X", chars=20000, kept=1000, spilled=True, seq=50)
     record_show("store-a", "run-a", 1, 3)
     record_show("store-a", "run-a", 10, 10)
     record_show("store-a", "run-a", 12, 12)
     record("show", store="store-a", run="run-a", lo=20, hi=22)
+    record("search", q="needle", hits=1)
+    record("context_delivery", harness="codex", hook="SessionStart", doc_seq=4)
     record("error", msg="disk full")
 
     ev = read()
-    assert len(ev) == 8, ev
+    assert len(ev) == 11, ev
     assert opened("store-a", "run-a", 1, 3)
     assert not opened("store-b", "run-a", 1, 3)
     assert not opened("store-a", "run-b", 1, 3)
     assert not opened("store-a", "run-a", 10, 12), "split receipts covered a span"
     assert not opened("store-a", "run-a", 20, 22), "legacy receipt authorized a span"
     out = "\n".join(report(threshold=10000))
-    assert "hook invocations         3" in out, out
-    assert "spilled                1  (33% of calls)" in out, out
+    assert "hook invocations         4" in out, out
+    assert "spilled                2  (50% of calls)" in out, out
     assert "tokens kept out of context" in out
-    assert "7,175" in out, out  # (30000-1300)/4 tokens saved
-    assert "recoveries used          4" in out or "recoveries used        4" in out, out
+    assert "11,925" in out, out
+    assert "searches                 1" in out, out
+    assert "show commands" in out and "             4" in out, out
+    assert "spilled rows reopened     1/1 attributable" in out, out
+    assert "1 legacy spill(s) cannot be linked" in out, out
+    assert "context deliveries: codex=1" in out, out
     assert "ERRORS" in out and "disk full" in out
     # a 7,000-char skip is >60% of a 10,000 threshold -> should advise lowering
     assert "consider lowering" in out, out
-    assert "Bash=1/3" in out, out
+    assert "Bash=1/3" in out and "X=1/1" in out, out
+    assert "claude-code=1/3" in out and "legacy=1/1" in out, out
 
     # never raises, even with an unwritable path
     PATH = pathlib.Path("/nonexistent-dir-xyz/m.jsonl")
@@ -206,7 +281,7 @@ def demo():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--selfcheck":  # noqa: F821
+    if len(sys.argv) > 1 and sys.argv[1] == "--selfcheck":
         demo()
     else:
         print("\n".join(report()))

@@ -84,6 +84,24 @@ def outline(text):
     return "\n".join(marks[:12])
 
 
+def run_id(event):
+    return (
+        str(event.get("session_id", "?"))[:16]
+        + " "
+        + str(event.get("tool_name", "tool"))
+    )
+
+
+def record_hook(event, text, **fields):
+    metrics.record(
+        "hook",
+        harness="claude-code",
+        tool=event.get("tool_name"),
+        chars=len(text),
+        **fields,
+    )
+
+
 def main():
     try:
         raw = sys.stdin.read()
@@ -111,9 +129,7 @@ def main():
     if len(text) <= THRESHOLD:
         # Recorded too: without the skips there is no way to tell later whether
         # the threshold is leaving savings on the table.
-        metrics.record(
-            "hook", tool=event.get("tool_name"), chars=len(text), spilled=False
-        )
+        record_hook(event, text, spilled=False)
         return 0  # small enough to keep inline
 
     # Store verbatim, addressable by seq.
@@ -122,13 +138,12 @@ def main():
 
         db().parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         ms = MemorySurface(str(db()))
+        run = run_id(event)
         seq = ms.append(
             "tool",
             text,
             kind="tool_result",
-            session_id=str(event.get("session_id", "?"))[:16]
-            + " "
-            + str(event.get("tool_name", "tool")),
+            session_id=run,
             created_at=datetime.now().isoformat(timespec="seconds"),
             # No payload=: the content column already holds the full text.
             # Passing it would store the same bytes twice and leave the copy in
@@ -137,6 +152,7 @@ def main():
     except Exception as e:  # never break the user's tool call over a spill
         metrics.record(
             "error",
+            harness="claude-code",
             tool=event.get("tool_name"),
             chars=len(text),
             msg=f"{type(e).__name__}: {e}",
@@ -160,12 +176,13 @@ def main():
         updated = dict(container)
         updated[key] = replacement
 
-    metrics.record(
-        "hook",
-        tool=event.get("tool_name"),
-        chars=len(text),
+    record_hook(
+        event,
+        text,
         kept=len(replacement),
         spilled=True,
+        store=ms.store_id,
+        run=run,
         seq=seq,
     )
 
@@ -232,6 +249,14 @@ def demo():
     ms = MemorySurface(str(db()))
     assert ms.expand(1)[0].content == big, "spilled text not recovered verbatim"
     assert ms.search("line", k=3), "spilled text not searchable"
+    observed = [
+        json.loads(line)
+        for line in pathlib.Path(env["NARU_METRICS"]).read_text().splitlines()
+    ]
+    spill = next(e for e in observed if e.get("spilled"))
+    assert spill["harness"] == "claude-code"
+    assert spill["store"] == ms.store_id and spill["run"] == "abc Bash"
+    assert all(e.get("harness") == "claude-code" for e in observed)
 
     # a bare-string response is handled too
     out2 = run({"tool_name": "X", "tool_response": big})

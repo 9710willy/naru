@@ -69,7 +69,10 @@ codex plugin add naru-codex@naru
 Start a new Codex thread and trust the plugin hooks when Codex asks. The plugin
 loads the current approved Naru doc at session start, refreshes it after a new
 promotion or retirement, and gives the same context to subagents. It stores only
-the last doc sequence and fingerprint seen by each Codex session.
+the last doc sequence and fingerprint seen by each Codex session. That delivery
+metadata lives in `context_delivery`, not in the recallable Event Log. Existing
+legacy rows stay in place and are copied forward when that Codex session next
+uses the hook.
 
 The plugin does not replace Codex tool results. Codex 0.152 reports the only
 working replacement form as a blocked tool after that tool has already run,
@@ -101,6 +104,11 @@ namespace. `eviction.py` is Algorithm 1.
 `hook_spill.py` is a `PostToolUse` hook. It moves oversized tool output into the
 log and leaves a recovery handle in its place, so a large command result costs a
 preview instead of the whole payload.
+
+`naru stats` separates searches from printed spans. It counts a spill as
+reopened only when a later `naru show` receipt covers that spill's exact store
+and sequence. New hook events also name their harness. Old events remain marked
+as legacy because they lack enough data for exact attribution.
 
 ```json
 {
@@ -168,10 +176,38 @@ python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
 python3 noise.py --selfcheck && python3 metrics.py --selfcheck
 python3 backend.py --selfcheck && python3 bench.py --selfcheck
 python3 beam.py --selfcheck && python3 regrade.py --selfcheck
+python3 curation_probe.py --selfcheck
 python3 test_mutations.py   # do those self-checks catch anything?
 python3 backend.py      # live: two cheap calls, prints the harness token floor
 python3 test_judge.py   # live: judge regression cases
 ```
+
+## Paired curation check
+
+`curation_probe.py` runs each ordinary task twice with the same model and
+settings. The `plain` arm gets no Naru doc. The `naru` arm gets the current
+approved doc through the same context wrapper as the Codex hook.
+
+Write JSONL cases with literal checks:
+
+```json
+{"id":"port","kind":"fact","prompt":"Which port do I use?","must_include":["port 7443"],"must_exclude":["port 443"]}
+{"id":"color","kind":"control","prompt":"Reply with blue.","must_include":["blue"]}
+```
+
+Use `fact` when approved context should help. Use `control` when it should not
+matter. Keep prompts as ordinary work requests. The model never sees arm names,
+scores, or comparison text.
+
+```bash
+python3 curation_probe.py cases.jsonl \
+  --out results/curation-live.json
+```
+
+The report shows paired wins, losses, exact McNemar p-values, harmful carryover
+on controls, prompt size, cost, and elapsed time. Failed model calls stay out of
+the paired score and remain visible as errors. The result file contains full
+answers and stays ignored under `results/` unless you publish a redacted copy.
 
 ## Benchmark
 
@@ -285,7 +321,8 @@ descriptive.
 
 ## Limitations
 
-Curation has self-checks and no production use.
+Curation has self-checks and a paired live-check harness. No paired production
+result is published yet.
 
 `kernel.py` executes model-authored code in-process by default.
 `NARU_KERNEL=sandbox` moves it to a child process with CPU, memory and file

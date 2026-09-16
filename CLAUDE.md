@@ -17,6 +17,7 @@ Every module has a runnable self-check. The first four need no network:
 python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
 python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
 python3 noise.py --selfcheck && python3 metrics.py --selfcheck
+python3 curation_probe.py --selfcheck
 python3 backend.py --selfcheck && python3 bench.py --selfcheck
 python3 beam.py --selfcheck && python3 regrade.py --selfcheck
 python3 test_mutations.py   # breaks the code on purpose; checks must fail
@@ -114,12 +115,15 @@ in-memory database — the constructor refuses `":memory:"` loudly.
 ## Observability
 
 `naru stats [days]` reads `~/.naru/metrics.jsonl`, one appended line per hook
-invocation and per recovery. Two signals only exist there, not in the Event Log:
+invocation, context delivery, search and printed span. These signals do not all
+exist in the Event Log:
 
 - **skipped outputs** — the spilled/skipped size distribution is the only
   evidence for whether `NARU_SPILL_THRESHOLD` is set right.
-- **recoveries** — if spills accumulate and `recoveries used` stays 0, the
-  retrieval handle is dead weight and the preview should carry more.
+- **reopened spills** — only a versioned `show` receipt from the same store and
+  covering the spilled `seq` counts. A search is navigation, not recovery.
+- **harness** — new Claude Code spill hooks and Codex context deliveries name
+  their harness. Old rows stay `legacy`; do not infer their source.
 
 Recording is fire-and-forget: every failure in `metrics.py` is swallowed, because
 a metrics problem must never break a tool call. Self-checks must point
@@ -154,6 +158,12 @@ Invariants that cost real time to rediscover:
 
 **The doc is a promoted subset, never a render of the log.** If `naru inject`
 ever grows with the log, the `full` arm has been rebuilt by accident.
+
+`curation_probe.py` is the proof boundary for this layer. It runs the same
+organic prompt in a plain arm and a Naru arm. Only the approved doc changes.
+Fact cases measure useful carryover. Control cases measure harmful carryover.
+Validate every case before the first model call, keep arm labels out of model
+input, and retain the full answers in the ignored result artifact.
 
 `naru inject <path>` is the whole harness integration. Do not add a per-harness
 plugin API — anything that runs a shell command is already supported (ADR 0004).
