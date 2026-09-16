@@ -26,13 +26,16 @@ def _estimate(text):
 # Flags that strip the Claude Code persona/tooling so the model behaves as a
 # plain completion endpoint rather than a coding agent.
 _BARE = [
+    # Keep OAuth auth but disable CLAUDE.md, memory, plugins, hooks and other
+    # ambient customizations. Otherwise the curation probe's plain arm can see
+    # the same Naru facts it is meant to exclude.
+    "--safe-mode",
     "--output-format",
     "json",
     "--exclude-dynamic-system-prompt-sections",
-    # Empty allowlist removes every tool. Without this the model tries to CALL
-    # a tool instead of emitting a code block, and the run errors on stop_reason
-    # 'tool_use'. We want a plain text completion.
-    "--allowed-tools",
+    # The current CLI treats an empty allowed-tools list as no restriction.
+    # An empty tools list is the documented disable-all form.
+    "--tools",
     "",
     # Every call here is a full Claude Code session, so it fires the USER's
     # hooks. With a Stop hook wired to a notifier, one n=48 run means 600+
@@ -417,5 +420,21 @@ def demo(live=True):
     )
 
 
+def _check_claude_isolation():
+    """Check that the Claude subprocess gets the isolation flags."""
+    backend = Backend(model=HAIKU)
+    seen = {}
+    backend._run = lambda argv, prompt: (
+        seen.update(argv=argv, prompt=prompt)
+        or json.dumps({"result": "isolated", "usage": {}, "total_cost_usd": 0})
+    )
+    assert backend("QUESTION", system="SYSTEM") == "isolated"
+    assert "--safe-mode" in seen["argv"], seen["argv"]
+    assert "--tools" in seen["argv"], seen["argv"]
+    assert "--allowed-tools" not in seen["argv"], seen["argv"]
+    assert seen["prompt"] == "QUESTION"
+
+
 if __name__ == "__main__":
+    _check_claude_isolation()
     demo(live="--selfcheck" not in sys.argv)

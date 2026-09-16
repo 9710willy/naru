@@ -77,10 +77,12 @@ itself.
 
 ## Gotchas that cost real time
 
-- `claude -p` needs `--allowed-tools ""`; without it the model tries to call a
-  tool and every naru question errors on `stop_reason: tool_use` (ADR 0001).
-- The CLI leaks its own identity and CLAUDE.md into the agent. The system
-  prompt overrides this explicitly — do not remove that paragraph (ADR 0001).
+- `claude -p` needs `--tools ""`; the current CLI treats
+  `--allowed-tools ""` as no restriction and can spawn an Explore agent that
+  reads the repository, contaminating a plain control arm (ADR 0001).
+- The CLI leaks CLAUDE.md, memory, plugins, and hooks into a nominally plain
+  model call unless `--safe-mode` is set. Keep it on every Claude backend call
+  so benchmark controls do not receive the treatment (ADR 0001).
 - A `PostToolUse` `updatedToolOutput` that does not match the tool's own output
   schema is discarded **silently**. Mutate the text field in place inside the
   response object; never return a bare string.

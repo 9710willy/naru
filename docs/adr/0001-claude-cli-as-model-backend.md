@@ -15,10 +15,12 @@ cell back. We had no API key and did not want to add one, or add the
 `backend.py` runs `claude -p --output-format json` as a subprocess. Two flags
 are load-bearing and non-obvious:
 
-- `--allowed-tools ""` — an **empty allowlist removes every tool**. Without it
-  the model tries to _call_ a real tool instead of emitting a code block, the
-  run ends on `stop_reason: "tool_use"`, and every naru question fails with
-  `is_error: true`. This cost a whole benchmark round to diagnose.
+- `--tools ""` — disables every tool. The current CLI treats
+  `--allowed-tools ""` as no restriction. That form let a plain curation arm
+  spawn an Explore agent and read Naru facts from the repository.
+- `--safe-mode` — disables ambient CLAUDE.md, memory, plugins, and hooks while
+  keeping the CLI's existing authentication. Without it, a control arm can see
+  the same user context as the treatment arm.
 - `--exclude-dynamic-system-prompt-sections` plus `--system-prompt` — replaces
   the Claude Code persona so the model is not acting as a coding agent.
 

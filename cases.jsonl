@@ -1,0 +1,14 @@
+{"id":"bash_numeric_fd","kind":"fact","prompt":"My macOS status-line script uses /bin/bash and must open a process substitution for reading. Which file-descriptor form should I use? Reply with only the shell fragment.","must_include":["exec 3<"]}
+{"id":"zsh_loop_path","kind":"fact","prompt":"Which variable name should I use instead of path in my zsh worktree loop? Reply with the variable name only.","must_include":["wt_path"]}
+{"id":"zero_carryover","kind":"fact","prompt":"What must launch the next Codex session to get a true zero-carryover rollover? Reply with the mechanism only.","must_include":["external supervisor"]}
+{"id":"imoten_runner","kind":"fact","prompt":"Which exact runner path should I use for Copilot-backed Imoten delegation? Reply with the path only.","must_include":["~/.codex/bin/imoten-agent"]}
+{"id":"codename_family","kind":"fact","prompt":"Which character family should I use when I choose a non-semantic codename for Will's work? Reply with the family name only.","must_include":["Umamusume"]}
+{"id":"runner_receipt_fields","kind":"fact","prompt":"List the six fields that an Imoten runner exit receipt must bind. Reply with a comma-separated list only.","must_include":["run_id","turn","attempt_id","thread_id","prompt_sha256","events_sha256"]}
+{"id":"plugin_refresh_recovery","kind":"fact","prompt":"A Codex plugin was refreshed while its thread stayed open. The next lifecycle hook fails with MODULE_NOT_FOUND. What action restores normal operation? Reply with the action only.","must_include":["restart","Codex"]}
+{"id":"direct_deepseek_owner","kind":"fact","prompt":"On a Direct DeepSeek workstation, which setup owns the Imoten agent profiles? Reply with its name only.","must_include":["setup-pstack"]}
+{"id":"control_math","kind":"control","prompt":"What is 17 multiplied by 23? Reply with the number only.","must_include":["391"],"must_exclude":["naru","codex"]}
+{"id":"control_sort","kind":"control","prompt":"Sort these words alphabetically and reply as one comma-separated line: gamma, alpha, beta.","must_include":["alpha, beta, gamma"],"must_exclude":["naru","codex"]}
+{"id":"control_http","kind":"control","prompt":"Which HTTP status code means Not Found? Reply with the code only.","must_include":["404"],"must_exclude":["naru","codex"]}
+{"id":"control_minutes","kind":"control","prompt":"Convert 2 hours and 15 minutes to minutes. Reply with the number only.","must_include":["135"],"must_exclude":["naru","codex"]}
+{"id":"control_color","kind":"control","prompt":"Reply with the lowercase word cobalt.","must_include":["cobalt"],"must_exclude":["naru","codex"]}
+{"id":"control_leap_year","kind":"control","prompt":"How many days are in a leap year? Reply with the number only.","must_include":["366"],"must_exclude":["naru","codex"]}

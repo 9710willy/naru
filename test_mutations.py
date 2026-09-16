@@ -43,10 +43,25 @@ COPY = (
     "beam.py",
 )
 
+ISOLATION_MUTATIONS = [
+    (
+        "Claude backend loads ambient project context",
+        "backend.py",
+        '    "--safe-mode",',
+        '    "--verbose",',
+    ),
+    (
+        "Claude backend leaves repository tools enabled",
+        "backend.py",
+        '    "--tools",',
+        '    "--allowed-tools",',
+    ),
+]
+
 # (name, file, find, replace) or (name, file, find, replace, only_if)
 # only_if is a Python expression: when it is false the mutation cannot
 # change behaviour here and is reported n/a rather than counted a survivor.
-MUTATIONS = [
+MUTATIONS = ISOLATION_MUTATIONS + [
     (
         "rag falls through to full",
         "bench.py",

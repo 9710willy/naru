@@ -187,3 +187,47 @@ new-symbol findings:
 $ git ls-remote origin refs/heads/main
 exit 0
 acea3181508aba59f08016f063cefe88459317fb refs/heads/main
+
+Live curation follow-up
+Run: 2026-09-16
+Base tree: 353c65110
+
+$ python3 curation_probe.py cases.jsonl --out results/curation-live.json
+exit 0
+fact: plain 0/8  naru 8/8  plain-only 0  naru-only 8  p=0.008
+control: plain 6/6  naru 6/6  plain-only 0  naru-only 0  p=1.000
+all: plain 6/14  naru 14/14  plain-only 0  naru-only 8  p=0.008
+harmful carryover: 0
+resources: plain 719 estimated prompt tokens, $0.0394, 57.7s
+           naru 16,828 estimated prompt tokens, $0.0456, 44.5s
+wrote results/curation-live.json
+
+$ python3 backend.py --selfcheck
+exit 0
+ok — generic command backend (offline)
+
+$ python3 curation_probe.py --selfcheck
+exit 0
+port: plain=fail naru=pass
+color: plain=pass naru=pass
+ok — paired curation checks passed
+
+$ python3 test_mutations.py
+exit 0
+ok — 82/82 mutations caught
+
+$ ruff check --no-cache backend.py test_mutations.py curation_probe.py
+exit 1
+Three pre-existing backend.py findings remain: PLW1510, RET501, PLR1711.
+
+$ ripwire . --quality-delta --json
+exit 0
+gating 0
+
+$ git diff --check
+exit 0
+
+$ python3 test_judge.py
+not run
+The external-model approval was denied because the test file contains
+real-user-derived examples. The command did not start.

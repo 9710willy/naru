@@ -187,6 +187,9 @@ python3 test_judge.py   # live: judge regression cases
 `curation_probe.py` runs each ordinary task twice with the same model and
 settings. The `plain` arm gets no Naru doc. The `naru` arm gets the current
 approved doc through the same context wrapper as the Codex hook.
+The default Claude backend uses safe mode with all tools disabled so the plain
+arm cannot read Naru facts from project files. A custom `NARU_BACKEND` must
+provide the same isolation.
 
 Write JSONL cases with literal checks:
 
