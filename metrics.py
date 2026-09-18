@@ -8,7 +8,8 @@ It structurally cannot answer the two questions worth revisiting:
   - whether recoveries get used     -> does the handle earn its place?
 
 Neither leaves a row behind. So one compact JSONL line per hook invocation and
-per recovery, appended, never read on the hot path.
+per recovery is appended, never read on the hot path. Agent context decisions
+may opt in to the same redacted stream.
 
 Recording must never break a tool call: every failure here is swallowed.
 """
@@ -65,6 +66,38 @@ def read(days=None):
 def record_show(store_id, run_id, lo, hi):
     """Record one printed span with the store and run that own it."""
     record("show", v=2, store=store_id, run=run_id, lo=lo, hi=hi)
+
+
+def record_agent_context(run_id, turn, decision, model="custom"):
+    """Record a redacted context decision for an optional trace exporter.
+
+    This is not written to the Event Log.  Only block IDs, counts, and Jev
+    usage are retained; prompts, state bodies, and tool results never cross
+    this boundary.  An OpenTelemetry or dashboard adapter can consume the
+    resulting JSONL without coupling the stdlib core to a vendor SDK.
+    """
+    allowed = (
+        "policy",
+        "checkpoint",
+        "considered_tokens",
+        "selected_tokens",
+        "dropped_tokens",
+        "selected_blocks",
+        "omitted_blocks",
+        "jev_invoked",
+        "jev_applied",
+        "jev_confident_choices",
+        "jev_input_tokens",
+        "jev_cache_read_tokens",
+        "jev_cache_write_tokens",
+        "jev_output_tokens",
+        "jev_latency_ms",
+        "jev_errors",
+        "fallback_reason",
+    )
+    fields = {key: decision.get(key) for key in allowed if key in decision}
+    fields["model"] = model if isinstance(model, str) else "custom"
+    record("agent_context", harness="naru", run=run_id, turn=turn, **fields)
 
 
 def opened(store_id, run_id, lo, hi, days=None):
@@ -165,6 +198,7 @@ def report(days=None, threshold=None):
     searches = [e for e in ev if e["e"] == "search"]
     shows = [e for e in ev if e["e"] == "show"]
     deliveries = [e for e in ev if e["e"] == "context_delivery"]
+    agent_context = [e for e in ev if e["e"] == "agent_context"]
     fails = [e for e in ev if e["e"] == "error"]
     reopened, attributable, legacy_spills = _reopened_spills(ev)
 
@@ -204,6 +238,8 @@ def report(days=None, threshold=None):
                 )
     L.append(f"  searches           {len(searches):>7,}")
     L.append(f"  show commands       {len(shows):>7,}")
+    if agent_context:
+        L.append(f"  agent context decisions {len(agent_context):>4,}")
     L.append(_recovery_line(reopened, attributable, legacy_spills))
     if fails:
         L.append(f"  ERRORS             {len(fails):>7,}")
@@ -247,10 +283,22 @@ def demo():
     record("show", store="store-a", run="run-a", lo=20, hi=22)
     record("search", q="needle", hits=1)
     record("context_delivery", harness="codex", hook="SessionStart", doc_seq=4)
+    record_agent_context(
+        "run-agent", 1,
+        {
+            "policy": "shadow",
+            "prompt": "SECRET-MUST-NOT-BE-RECORDED",
+            "selected_blocks": ["current-state"],
+            "selected_tokens": 12,
+        },
+    )
     record("error", msg="disk full")
 
     ev = read()
-    assert len(ev) == 11, ev
+    assert len(ev) == 12, ev
+    agent_events = [e for e in ev if e["e"] == "agent_context"]
+    assert len(agent_events) == 1 and "prompt" not in agent_events[0]
+    assert "SECRET-MUST-NOT-BE-RECORDED" not in json.dumps(agent_events[0])
     assert opened("store-a", "run-a", 1, 3)
     assert not opened("store-b", "run-a", 1, 3)
     assert not opened("store-a", "run-b", 1, 3)
@@ -263,6 +311,7 @@ def demo():
     assert "11,925" in out, out
     assert "searches                 1" in out, out
     assert "show commands" in out and "             4" in out, out
+    assert "agent context decisions" in out, out
     assert "spilled rows reopened     1/1 attributable" in out, out
     assert "1 legacy spill(s) cannot be linked" in out, out
     assert "context deliveries: codex=1" in out, out

@@ -158,15 +158,135 @@ It prints nothing when the inbox is clear or the store does not exist yet.
 
 ## Other models
 
-`backend.py` defaults to the local `claude` CLI. `NARU_BACKEND` replaces it with
-any command that reads a prompt on stdin.
+The benchmark uses one provider-neutral stdin-in, text-out contract for the
+answerer and judge. By default, `--backend auto` selects an installed Codex CLI
+first, then the legacy Claude CLI. The resolved provider is recorded in the
+run config and every row, so the benchmark cannot silently mix runtimes.
 
 ```bash
-NARU_BACKEND='codex exec -' python3 bench.py --split oracle -n 12
+python3 bench.py --backend auto \
+  --model gpt-5.6-luna --judge-model gpt-5.6-luna \
+  --split oracle -n 12
 ```
 
-Such a backend reports no token counts, so naru omits the net-of-harness column
-rather than printing a zero that looks measured.
+Use an explicit provider when reproducing a run:
+
+```bash
+python3 bench.py --backend codex --model gpt-5.6-luna --judge-model gpt-5.6-luna
+python3 bench.py --backend claude --model claude-haiku-4-5-20251001
+python3 bench.py --backend command --backend-command 'ollama run llama3.2'
+```
+
+The Codex backend parses its JSON event stream, keeps only the final agent
+message, and records provider token counts. Each call starts in an empty
+temporary workspace with user and project rules ignored, so the coding-agent
+CLI cannot read the benchmark checkout as part of an answer. Codex CLI usage
+does not provide a provider dollar total here, so cost per successful task
+remains unknown unless a caller supplies a verified pricing layer.
+`NARU_BACKEND` still accepts any command that reads a prompt on stdin for other
+providers. Generic commands do not claim token or dollar measurements unless
+their adapter reports them.
+
+### Context policy and Jev
+
+Naru remains the memory layer. The agent loop keeps its Event Log, kernel, and
+recovery index; a separate context policy bounds the mutable state and latest
+tool observation shown to the model. Deterministic selection is the default.
+
+Jev is the low-overhead typed evaluator for Jev-specific context decisions at
+a pressure checkpoint. It receives the
+question, next action, and metadata for named context blocks, but not their
+bodies. It can recommend `needed`, `useful`, `omit`, or `no_match`. Naru still
+enforces the token budget and retains required state, Jev-needed blocks, and
+recovery handles.
+Missing or malformed Jev output falls back to deterministic selection.
+
+The benchmark exposes both modes. `shadow` invokes Jev and records what it
+would have selected. `jev` applies only high-confidence retention and omission
+decisions.
+When the host can provide the MCP call directly, pass a `DirectJev` evaluator
+to `run_naru`; this avoids a transport process entirely and does not require a
+Jev key in Naru. For a keyword-shaped host binding, use
+`host_mcp_evaluator(host_evaluate)` where `host_evaluate` is supplied by the
+MCP-aware parent process. The standalone
+`CommandJev` adapter is persistent by default. It reads one JSON request per
+line and returns one typed JSON response per line, so startup is paid once per
+task. One-shot adapters remain available with `CommandJev(...,
+persistent=False)` for compatibility.
+
+Jev receives only the goal, next action, and compact block metadata. The
+request estimate is capped at 800 tokens. If the metadata or question map is
+larger, Naru skips Jev and uses the deterministic fitter, preserving the main
+agent's required context instead of overflowing Jev's smaller window.
+
+```bash
+NARU_JEV='jev mcp' python3 bench.py \
+  --arms rag,naru --context-policy shadow --split oracle -n 12
+```
+
+For a parent process with the native MCP binding:
+
+```bash
+python3 bench.py --backend codex \
+  --model gpt-5.6-luna --judge-model gpt-5.6-luna \
+  --arms naru --context-policy jev --jev-host-stdio --split oracle -n 12
+```
+
+`CommandJev` auto-detects `jev mcp` and speaks MCP JSON-RPC over stdio. A
+custom JSON-lines adapter is still accepted for local test doubles and other
+hosts. The local Jev command must have provider authentication in its own
+environment. That requirement applies only to the standalone child-process
+path, not to the host MCP path. For a host that already exposes
+`mcp__jev__evaluate`, use `--jev-host-stdio`. The benchmark runs model jobs in
+a parent-owned thread pool, emits `NARU_JEV_REQUEST` records, and waits for one
+JSON MCP result per record. Only the shared host Jev exchange is serialized.
+The host owns the MCP key and returns the result over stdin; an unresponsive
+host times out and Naru falls back to deterministic selection.
+
+Use `NARU_AGENT_METRICS=1` with a direct `run_naru` caller to append redacted
+context decisions to `NARU_METRICS`. No prompt, state body, credential, or
+tool-result payload is recorded. Benchmark rows additionally retain
+provider-native usage beside normalized input, cache, output, retry, latency,
+task-success, and cost fields. Jev wall latency, provider latency, transport
+overhead, and one-time adapter startup are reported separately from the main
+model. Jev-specific decisions do not route through a text-generating LLM. Jev
+cache reads and writes are retained when the adapter reports them. The built-in
+`typesafe-jev-input-0.042-free-output` profile records the supplied Jev price of
+$0.042 per million input tokens and free output. Cache prices remain unknown;
+the comparator defers if nonzero cache usage appears without rates.
+
+For general execution observability, keep those events outside the recallable
+Event Log. The dependency-free JSONL can be adapted to the
+[OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) and
+visualized with a self-hosted [Phoenix](https://github.com/Arize-ai/phoenix),
+[Langfuse](https://langfuse.com/docs), or
+[OpenLIT](https://github.com/openlit/openlit) deployment. Naru does not add a
+vendor SDK or replace its memory engine with an observability product.
+
+### Paired context proof
+
+Run the same split, question count, model, judge, budget, and turn limit once
+with each policy. The comparator pairs rows by question ID, excludes errored
+pairs from McNemar's test, and applies explicit task-success, failure, latency,
+and cost guardrails. It never prints answers, gold text, prompts, or raw task
+IDs.
+
+```bash
+python3 bench.py --tag naru-deterministic --arms naru \
+  --context-policy deterministic --split oracle -n 12
+NARU_JEV='jev mcp' python3 bench.py --tag naru-jev --arms naru \
+  --context-policy jev --split oracle -n 12
+python3 experiment.py \
+  --baseline results/naru-deterministic_oracle_n12.json \
+  --candidate results/naru-jev_oracle_n12.json \
+  --jev-pricing-profile typesafe-jev-input-0.042-free-output
+```
+
+The default decision is `defer` when provider costs or Jev pricing are not
+measured. The built-in profile covers Jev's input and output rates. Supply
+cache rates too when Jev reports nonzero cache categories. Rates are recorded
+with a version and never used as hidden assumptions. Use `experiment.py
+--json` for a machine-readable, privacy-safe report.
 
 ## Checks
 
@@ -175,6 +295,8 @@ python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
 python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
 python3 noise.py --selfcheck && python3 metrics.py --selfcheck
 python3 backend.py --selfcheck && python3 bench.py --selfcheck
+python3 context_policy.py && python3 jev.py
+python3 experiment.py --selfcheck
 python3 beam.py --selfcheck && python3 regrade.py --selfcheck
 python3 curation_probe.py --selfcheck
 python3 test_mutations.py   # do those self-checks catch anything?
@@ -187,9 +309,9 @@ python3 test_judge.py   # live: judge regression cases
 `curation_probe.py` runs each ordinary task twice with the same model and
 settings. The `plain` arm gets no Naru doc. The `naru` arm gets the current
 approved doc through the same context wrapper as the Codex hook.
-The default Claude backend uses safe mode with all tools disabled so the plain
-arm cannot read Naru facts from project files. A custom `NARU_BACKEND` must
-provide the same isolation.
+The Claude adapter uses safe mode with all tools disabled so the plain arm
+cannot read Naru facts from project files. A custom provider must provide the
+same isolation.
 
 Write JSONL cases with literal checks:
 
@@ -217,8 +339,8 @@ answers and stays ignored under `results/` unless you publish a redacted copy.
 `bench.py` runs [LongMemEval](https://arxiv.org/abs/2410.10813) (ICLR 2025)
 over four supported arms on identical history. `full` puts the whole history in
 one prompt. `rag` pastes the top 8 BM25 hits and answers in one call. `naru`
-leaves the history in the log for the model to reach by writing code. Optional
-`rsm` groups dense-retrieval chunks and answers in one call.
+leaves the history in the log for the model to reach by writing code. `rsm`
+groups dense-retrieval chunks and answers in one call.
 
 The default arms are `full,rag,naru`. The `rsm` arm needs `NARU_EMBED`, so it
 stays out of the default command. The command reads one JSON object on stdin

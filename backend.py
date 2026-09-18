@@ -1,8 +1,10 @@
-"""Model backends. Defaults to the local `claude` CLI — no API key needed,
-reuses the CLI's own auth — and falls back to any command that reads a prompt
-on stdin, so the benchmark runs against a model this repo has never heard of.
+"""Provider-neutral model backends.
 
-    NARU_BACKEND='codex exec -' python3 bench.py --split oracle -n 12
+The benchmark can use an automatically selected local provider, the
+authenticated Codex CLI, the legacy Claude CLI, or any command that reads a
+prompt on stdin. No backend credential is copied into benchmark rows.
+
+    python3 bench.py --backend auto --split oracle -n 12
 
 Each call is stateless: we pass the full working view as one prompt, exactly as
 an API call would. That is the honest setup for measuring Naru, whose whole
@@ -10,18 +12,43 @@ claim is that the view stays small.
 """
 
 import json
+import hashlib
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 
 HAIKU = "claude-haiku-4-5-20251001"
+BACKEND_CHOICES = ("auto", "codex", "claude", "command")
+_NAMED_BACKENDS = frozenset(BACKEND_CHOICES)
+
+
+def default_model_for_backend(kind):
+    """Return a truthful display/default model for a resolved provider."""
+    if kind == "claude":
+        return HAIKU
+    if kind == "codex":
+        return os.environ.get("NARU_CODEX_MODEL") or "codex-configured"
+    return "provider-default"
 
 
 def _estimate(text):
     return max(1, len(text) // 4)
+
+
+def _numeric(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return value
+
+
+def backend_fingerprint(kind, command=None):
+    """Return a safe identifier for the resolved provider configuration."""
+    raw = f"{kind}\0{command or ''}".encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
 
 # Flags that strip the Claude Code persona/tooling so the model behaves as a
 # plain completion endpoint rather than a coding agent.
@@ -59,25 +86,60 @@ class Usage:
     errors: int = 0
     empty_retries: int = 0
     call_retries: int = 0
+    cost_measured: bool = True
+    native_usage: dict = field(default_factory=dict)
 
     def add(self, u, cost):
+        u = u if isinstance(u, dict) else {}
         self.calls += 1
-        self.input_tokens += u.get("input_tokens", 0)
-        self.cache_read += u.get("cache_read_input_tokens", 0)
-        self.cache_creation += u.get("cache_creation_input_tokens", 0)
-        self.output_tokens += u.get("output_tokens", 0)
-        self.cost_usd += cost or 0.0
+        self.input_tokens += int(_numeric(u.get("input_tokens", 0)))
+        self.cache_read += int(
+            _numeric(
+                u.get("cache_read_input_tokens", u.get("cached_input_tokens", 0))
+            )
+        )
+        self.cache_creation += int(
+            _numeric(u.get("cache_creation_input_tokens", 0))
+        )
+        self.output_tokens += int(_numeric(u.get("output_tokens", 0)))
+        if cost is None:
+            self.cost_measured = False
+        else:
+            self.cost_usd += float(_numeric(cost))
+        for key, value in u.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            self.native_usage[key] = self.native_usage.get(key, 0) + value
 
     @property
     def billed_input(self):
         """Every input token the model was charged for, cache included."""
         return self.input_tokens + self.cache_read + self.cache_creation
 
+    def normalized(self):
+        """Return provider-neutral usage fields without inventing prices.
+
+        ``context_input_tokens`` is our character-based prompt estimate. The
+        provider-native counters remain beside it because cache accounting is
+        not consistent across generic backends or CLI versions.
+        """
+        return {
+            "context_input_tokens": self.prompt_tokens_estimated,
+            "context_input_tokens_source": "estimated_prompt_chars_per_4",
+            "uncached_input_tokens": self.input_tokens,
+            "cache_read_tokens": self.cache_read,
+            "cache_write_tokens": self.cache_creation,
+            "billed_input_tokens": self.billed_input,
+            "output_tokens": self.output_tokens,
+            "retry_count": self.call_retries + self.empty_retries,
+            "cost_measured": self.cost_measured,
+        }
+
     def __str__(self):
         return (
             f"{self.attempts} calls | in {self.billed_input:,} "
             f"(fresh {self.input_tokens:,}) | out {self.output_tokens:,} "
-            f"| ${self.cost_usd:.3f}"
+            + (f"| ${self.cost_usd:.3f}" if self.cost_measured else "| cost unknown")
             + (f" | {self.errors} err" if self.errors else "")
             + (f" | {self.empty_retries} empty-retry" if self.empty_retries else "")
         )
@@ -131,6 +193,7 @@ class _Retrying:
             )
             out = self._once(p, system)
             if out is None:
+                self.usage.cost_measured = False
                 self.usage.call_retries += 1
                 continue
             if out.strip():
@@ -147,10 +210,15 @@ class _Retrying:
     def _once(self, prompt, system=None):
         raise NotImplementedError
 
-    def _run(self, argv, prompt, catch=(subprocess.TimeoutExpired,)):
+    def close(self):
+        """Release backend-owned resources. Stateless backends have none."""
+
+    def _run(
+        self, argv, prompt, catch=(subprocess.TimeoutExpired,), cwd=None, env=None
+    ):
         """Run argv with `prompt` on stdin. Returns stdout, or None on failure.
 
-        One implementation of run-and-classify for both backends. On failure it
+        One implementation of run-and-classify for all CLI backends. On failure it
         surfaces the command's own stderr ONCE per backend: `__post_init__`
         exists so a bad NARU_BACKEND cannot become a silent run of empty
         answers, and swallowing every runtime failure would put that back.
@@ -162,6 +230,8 @@ class _Retrying:
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
+                cwd=cwd,
+                env=env,
             )
         except catch as e:
             # Not counted as an error here: __call__ owns that, and only once
@@ -217,11 +287,123 @@ class Backend(_Retrying):
         return d.get("result") or ""
 
 
+def _decode_codex_output(output):
+    """Extract the final agent message and usage from Codex JSONL events."""
+    final = None
+    usage = {}
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "item.completed":
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str):
+                    final = text
+        elif event.get("type") == "turn.completed":
+            reported = event.get("usage")
+            if isinstance(reported, dict):
+                usage = reported
+        elif event.get("type") == "error":
+            message = event.get("message")
+            if isinstance(message, str):
+                raise ValueError(message[:300])
+    if final is None:
+        raise ValueError("Codex returned no final agent message")
+    return final, usage
+
+
+@dataclass
+class CodexBackend(_Retrying):
+    """Run the authenticated Codex CLI and keep only its final answer."""
+
+    model: str = ""
+    reports_tokens = True
+
+    def __post_init__(self):
+        # Codex is an agent CLI, not a no-tools completion endpoint. Give it an
+        # empty workspace so a benchmark prompt cannot lead it to the Naru
+        # checkout or the LongMemEval data. The flags below also keep ambient
+        # user/project instructions out of the benchmark contract.
+        self._workspace = tempfile.TemporaryDirectory(prefix="naru-codex-")
+        self._cwd = self._workspace.name
+
+    def _isolated_env(self):
+        """Remove Naru's benchmark controls from the agent's shell view."""
+        return {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("NARU_")
+        }
+
+    def close(self):
+        workspace = getattr(self, "_workspace", None)
+        self._workspace = None
+        if workspace is not None:
+            workspace.cleanup()
+
+    @property
+    def label(self):
+        return self.model or "codex-configured"
+
+    def _once(self, prompt, system=None):
+        cmd = [
+            "codex",
+            "exec",
+            "--json",
+            "--ephemeral",
+            "--sandbox",
+            "read-only",
+            "--cd",
+            self._cwd,
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--skip-git-repo-check",
+            "-",
+        ]
+        if system:
+            # `codex exec` accepts dynamic developer instructions through the
+            # config override. Keep the Naru contract out of the user message
+            # so it has the same authority boundary as Claude's system flag.
+            cmd[2:2] = [
+                "--config",
+                f"developer_instructions={json.dumps(system)}",
+            ]
+        if self.model:
+            cmd[2:2] = ["--model", self.model]
+        out = self._run(
+            cmd,
+            prompt,
+            cwd=self._cwd,
+            env=self._isolated_env(),
+        )
+        if out is None:
+            return None
+        try:
+            answer, usage = _decode_codex_output(out)
+        except ValueError as error:
+            self._complain(str(error))
+            return None
+        self.usage.add(
+            {
+                "input_tokens": usage.get("input_tokens", 0),
+                "cached_input_tokens": usage.get("cached_input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "reasoning_output_tokens": usage.get("reasoning_output_tokens", 0),
+            },
+            None,
+        )
+        return answer
+
+
 @dataclass
 class CommandBackend(_Retrying):
     """Any CLI that reads a prompt on stdin and writes the reply on stdout.
 
-        NARU_BACKEND='codex exec -'        NARU_BACKEND='ollama run llama3'
+    Examples: ``NARU_BACKEND='codex'`` or
+    ``NARU_BACKEND='ollama run llama3'``.
 
     The system prompt is prepended to the user prompt rather than passed as a
     flag: every model understands that, and no two CLIs spell the flag alike.
@@ -242,10 +424,13 @@ class CommandBackend(_Retrying):
             raise ValueError("NARU_BACKEND is empty; expected a command to run")
         if shutil.which(self.argv[0]) is None:
             raise FileNotFoundError(f"NARU_BACKEND command not found: {self.argv[0]!r}")
+        self.usage.cost_measured = False
 
     @property
     def label(self):
-        return self.cmd
+        # Labels are written to result files and curation output. Keep command
+        # arguments, which may contain credentials, out of those artifacts.
+        return (self.argv or ["command"])[0]
 
     def _once(self, prompt, system=None):
         if system:
@@ -260,31 +445,95 @@ class CommandBackend(_Retrying):
 _WARNED = set()
 
 
-def get_backend(model=HAIKU):
-    """The backend for this machine.
+def _command_label(command):
+    """Return argv[0] without copying command arguments into diagnostics."""
+    try:
+        return (shlex.split(command) or ["command"])[0]
+    except ValueError:
+        return "command"
 
-    Defaults to the `claude` CLI. NARU_BACKEND replaces it with any command
-    that reads a prompt on stdin, which is what makes the benchmark runnable
-    against a model this repo has never heard of.
+
+def resolve_backend(requested=None, command=None, model=None):
+    """Resolve a provider choice to ``(kind, command)``.
+
+    ``NARU_BACKEND`` remains a compatibility override. Its named values select
+    an adapter; any other value is treated as a generic stdin command. With no
+    override, an explicit Claude model selects Claude, then ``auto`` prefers
+    an installed Codex CLI and then Claude. The choice is resolved once by the
+    parent benchmark process and inherited by workers, so a run cannot silently
+    mix providers.
     """
-    cmd = os.environ.get("NARU_BACKEND")
-    if not cmd:
-        return Backend(model=model)
+    configured = (os.environ.get("NARU_BACKEND") or "").strip()
+    choice = requested.strip() if isinstance(requested, str) else requested
+
+    if choice in (None, "", "auto"):
+        if configured and configured != "auto":
+            choice = configured
+        elif isinstance(model, str) and model.startswith("claude-"):
+            return "claude", None
+        elif shutil.which("codex"):
+            return "codex", None
+        elif shutil.which("claude"):
+            return "claude", None
+        else:
+            raise FileNotFoundError(
+                "no supported model provider found; install codex or claude, "
+                "or pass --backend command --backend-command COMMAND"
+            )
+
+    if choice == "codex":
+        return "codex", None
+    if choice == "claude":
+        return "claude", None
+    if choice == "command":
+        selected = (command or (
+            configured if configured and configured not in _NAMED_BACKENDS else None
+        ) or "").strip()
+        if not selected:
+            raise ValueError(
+                "--backend command requires --backend-command or "
+                "NARU_BACKEND"
+            )
+        return "command", selected
+
+    # A direct command remains accepted for library and environment
+    # compatibility. The CLI uses the explicit `command` spelling instead.
+    return "command", choice
+
+
+def get_backend(model=None, backend=None, command=None):
+    """Build the selected provider adapter.
+
+    ``backend`` may be ``auto``, ``codex``, ``claude``, or ``command``. Passing
+    no value uses ``NARU_BACKEND`` when present and otherwise auto-detects a
+    local provider. The old ``NARU_BACKEND=<arbitrary command>`` form remains
+    supported for callers outside the benchmark.
+    """
+    kind, selected_command = resolve_backend(backend, command, model=model)
+    if kind == "claude":
+        return Backend(model=model or HAIKU)
+    if kind == "codex":
+        requested = None
+        if model and model != "codex-configured" and not model.startswith("claude-"):
+            requested = model
+        if not requested:
+            requested = os.environ.get("NARU_CODEX_MODEL")
+        return CodexBackend(model=requested or "")
     # Once per command, not once per construction. bench.py builds a backend
     # per question per arm, so warning unguarded here put ~200 identical lines
     # on stderr for a single n=48 run. The check-then-add races under bench.py's
     # thread pool; losing that race prints the line twice, which is harmless.
-    if cmd not in _WARNED:
-        _WARNED.add(cmd)
+    if selected_command not in _WARNED:
+        _WARNED.add(selected_command)
         print(
-            f"backend: {cmd!r} — a generic pipe reports no usage, so token and "
-            "cost columns will read as zero rather than as measured",
+            f"backend: {_command_label(selected_command)!r} — a generic pipe reports no "
+            "usage, so token and cost columns are not measurable",
             file=sys.stderr,
         )
-    return CommandBackend(cmd=cmd)
+    return CommandBackend(cmd=selected_command)
 
 
-def measure_floor(model=HAIKU):
+def measure_floor(model=None, backend=None, command=None):
     """Input tokens the CLI itself costs per call, before any of our prompt.
 
     Must be measured, never hardcoded: it moves whenever the CLI flags or its
@@ -296,16 +545,20 @@ def measure_floor(model=HAIKU):
     into the net-of-harness subtraction and prints as though a floor had been
     measured, which is exactly the wrong number ADR 0002 exists to prevent.
     """
-    b = get_backend(model)
-    if not b.reports_tokens:
-        return None
-    result = b("Reply with one word: ok", system="You reply in one word.")
-    # `calls` only advances when usage was actually recorded. A nonzero exit,
-    # unparseable JSON, a timeout, expired auth or a rate limit all leave it at
-    # zero — and `// max(1, 0)` used to turn that into a confident 0.
-    if not result or b.usage.errors or not b.usage.calls:
-        return None
-    return b.usage.billed_input // b.usage.calls
+    b = get_backend(model, backend=backend, command=command)
+    try:
+        if not b.reports_tokens:
+            return None
+        result = b("Reply with one word: ok", system="You reply in one word.")
+        # `calls` only advances when usage was actually recorded. A nonzero
+        # exit, unparseable JSON, a timeout, expired auth or a rate limit all
+        # leave it at zero — and `// max(1, 0)` used to turn that into a
+        # confident 0.
+        if not result or b.usage.errors or not b.usage.calls:
+            return None
+        return b.usage.billed_input // b.usage.calls
+    finally:
+        b.close()
 
 
 def demo(live=True):
@@ -319,6 +572,121 @@ def demo(live=True):
     The live half costs a couple of cheap calls and measures the harness token
     floor, so benchmark numbers can be read net of CLI overhead.
     """
+    native = Usage(prompt_tokens_estimated=10)
+    native.add(
+        {
+            "input_tokens": 3,
+            "cache_read_input_tokens": 4,
+            "cache_creation_input_tokens": 5,
+            "output_tokens": 6,
+            "provider_specific": 7,
+        },
+        0.2,
+    )
+    assert native.native_usage["provider_specific"] == 7
+    assert native.normalized() == {
+        "context_input_tokens": 10,
+        "context_input_tokens_source": "estimated_prompt_chars_per_4",
+        "uncached_input_tokens": 3,
+        "cache_read_tokens": 4,
+        "cache_write_tokens": 5,
+            "billed_input_tokens": 12,
+            "output_tokens": 6,
+            "retry_count": 0,
+            "cost_measured": True,
+        }
+    codex_answer, codex_usage = _decode_codex_output(
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "t"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "ok"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 10,
+                            "cached_input_tokens": 4,
+                            "output_tokens": 2,
+                        },
+                    }
+                ),
+            ]
+        )
+    )
+    assert codex_answer == "ok" and codex_usage["cached_input_tokens"] == 4
+    assert resolve_backend("claude") == ("claude", None)
+    assert resolve_backend("codex") == ("codex", None)
+    assert resolve_backend("command", "cat") == ("command", "cat")
+    assert default_model_for_backend("claude") == HAIKU
+    assert default_model_for_backend("command") == "provider-default"
+    _saved_backend = os.environ.pop("NARU_BACKEND", None)
+    try:
+        assert resolve_backend("auto", model=HAIKU) == ("claude", None)
+        explicit_claude = get_backend(HAIKU)
+        assert isinstance(explicit_claude, Backend)
+        explicit_claude.close()
+    finally:
+        if _saved_backend is not None:
+            os.environ["NARU_BACKEND"] = _saved_backend
+    _old_backend = os.environ.get("NARU_BACKEND")
+    os.environ["NARU_BACKEND"] = "cat"
+    try:
+        assert resolve_backend("auto") == ("command", "cat")
+    finally:
+        if _old_backend is None:
+            os.environ.pop("NARU_BACKEND", None)
+        else:
+            os.environ["NARU_BACKEND"] = _old_backend
+
+    _saved_backend = os.environ.get("NARU_BACKEND")
+    os.environ["NARU_BACKEND"] = "secret-benchmark-command"
+    isolated = CodexBackend(model="test-model")
+    seen = {}
+    isolated._run = lambda argv, prompt, **kwargs: (
+        seen.update(argv=argv, prompt=prompt, **kwargs)
+        or "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "ok"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    }
+                ),
+            ]
+        )
+    )
+    try:
+        assert isolated("Q", system="S") == "ok"
+        assert seen["prompt"] == "Q"
+        assert any(
+            argument == 'developer_instructions="S"'
+            for argument in seen["argv"]
+        )
+        assert "--ignore-user-config" in seen["argv"]
+        assert "--ignore-rules" in seen["argv"]
+        assert "--cd" in seen["argv"]
+        assert seen["cwd"] == isolated._cwd
+        assert "NARU_BACKEND" not in seen["env"]
+        assert os.path.realpath(isolated._cwd) != os.path.dirname(
+            os.path.realpath(__file__)
+        )
+    finally:
+        isolated.close()
+        if _saved_backend is None:
+            os.environ.pop("NARU_BACKEND", None)
+        else:
+            os.environ["NARU_BACKEND"] = _saved_backend
     # Offline first: any stdin->stdout command is a valid backend. `cat` echoes
     # the prompt, which is enough to prove the plumbing without a network call.
     echo = CommandBackend(cmd="cat")
@@ -376,7 +744,7 @@ def demo(live=True):
 
     failed_floor = FailedFloor(retries=1)
     real_get_backend = globals()["get_backend"]
-    globals()["get_backend"] = lambda _: failed_floor
+    globals()["get_backend"] = lambda *_args, **_kwargs: failed_floor
     try:
         assert measure_floor() is None
     finally:
@@ -388,6 +756,7 @@ def demo(live=True):
     import contextlib
     import io
 
+    _old_backend = os.environ.get("NARU_BACKEND")
     os.environ["NARU_BACKEND"] = "cat"
     _WARNED.discard("cat")
     err = io.StringIO()
@@ -397,7 +766,19 @@ def demo(live=True):
     assert err.getvalue().count("generic pipe") == 1, (
         f"warned {err.getvalue().count('generic pipe')} times, expected 1"
     )
-    os.environ.pop("NARU_BACKEND", None)
+    secret_command = "sh -c 'echo sk-secret'"
+    _WARNED.discard(secret_command)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        assert isinstance(
+            get_backend(backend="command", command=secret_command),
+            CommandBackend,
+        )
+    assert "sk-secret" not in err.getvalue(), err.getvalue()
+    if _old_backend is None:
+        os.environ.pop("NARU_BACKEND", None)
+    else:
+        os.environ["NARU_BACKEND"] = _old_backend
     print("ok — generic command backend (offline)")
     if not live:
         return

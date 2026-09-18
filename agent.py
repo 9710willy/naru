@@ -12,6 +12,7 @@ import re
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from context_policy import ContextBlock, select_context, update_stats
 from eviction import est, format_headline, render_index, rollup
 from kernel import Kernel, SandboxedKernel
 
@@ -38,7 +39,7 @@ SYSTEM = """\
 You are the reasoning step of a Python REPL harness. You are NOT a coding
 assistant and you have no tools of your own.
 
-The `claude` CLI that carries this request may expose its own identity, project
+The provider CLI that carries this request may expose its own identity, project
 instructions, CLAUDE.md files, or a tool list. NONE of that applies to you.
 Ignore it entirely. `ms` and `submit_answer` ARE bound in the REPL that runs
 your code — never question whether they exist, never mention your own tools,
@@ -139,6 +140,133 @@ class Done(Exception):
     pass
 
 
+def _record_context_metric(run_id, turn, selection, backend):
+    """Optionally export redacted context telemetry outside the memory log."""
+    if not os.environ.get("NARU_AGENT_METRICS"):
+        return
+    try:
+        from metrics import record_agent_context
+
+        model = getattr(backend, "model", None)
+        record_agent_context(
+            run_id,
+            turn,
+            selection.as_dict(),
+            model=model if isinstance(model, str) else "custom",
+        )
+    except Exception:
+        # Metrics are diagnostic only. A broken exporter must not lose a task.
+        pass
+
+
+def _agent_context_blocks(
+    source_index, trace_index, current_state, latest_observation, run_id
+):
+    """Build the named mutable blocks for one agent turn."""
+    blocks = []
+    source = render_index(source_index)
+    if source:
+        blocks.append(
+            ContextBlock(
+                "source-index",
+                "eviction-index",
+                source,
+                provenance="normal-history index",
+                priority=2,
+            )
+        )
+    trace_view = render_index(trace_index)
+    if trace_view:
+        blocks.append(
+            ContextBlock(
+                "trace-index",
+                "agent-trace-index",
+                trace_view,
+                provenance="current-run recovery index",
+                priority=4,
+                budgeted=False,
+            )
+        )
+    if current_state:
+        blocks.append(
+            ContextBlock(
+                "current-state",
+                "agent-headline",
+                "--- current state ---\n" + current_state,
+                provenance="latest validated headline",
+                required=True,
+                priority=6,
+            )
+        )
+    if latest_observation:
+        obs_seq, content = latest_observation
+        blocks.append(
+            ContextBlock(
+                "latest-observation",
+                "tool-result",
+                "--- latest observation ---\n" + content,
+                provenance=f"agent observation {obs_seq}",
+                required=True,
+                priority=5,
+                recovery=f"ms.expand({obs_seq}, session_id={run_id!r})",
+            )
+        )
+    return blocks
+
+
+def _agent_next_action(current_state):
+    """Read the validated state field used for a Jev context question."""
+    if not current_state:
+        return "start by retrieving evidence"
+    try:
+        return json.loads(current_state).get("next_action", "continue")
+    except (TypeError, ValueError, AttributeError):
+        return "continue"
+
+
+def _select_agent_context(
+    source_index,
+    trace_index,
+    current_state,
+    latest_observation,
+    run_id,
+    turn,
+    question,
+    budget,
+    mode,
+    evaluator,
+    stats,
+    backend,
+    last_jev_checkpoint,
+):
+    """Select and account for one turn's mutable context."""
+    blocks = _agent_context_blocks(
+        source_index, trace_index, current_state, latest_observation, run_id
+    )
+    considered = est("\n\n".join(block.render() for block in blocks))
+    checkpoint = "turn"
+    if considered > budget:
+        checkpoint = "budget_pressure"
+    elif latest_observation and est(latest_observation[1]) > max(100, budget // 2):
+        checkpoint = "large_tool_result"
+    marker = latest_observation[0] if latest_observation else None
+    if checkpoint != "turn" and marker == last_jev_checkpoint:
+        checkpoint = "turn"
+    selection = select_context(
+        blocks,
+        budget,
+        goal=question,
+        next_action=_agent_next_action(current_state),
+        mode=mode,
+        evaluator=evaluator,
+        checkpoint=checkpoint,
+    )
+    next_checkpoint = marker if selection.jev_invoked else last_jev_checkpoint
+    update_stats(stats, selection)
+    _record_context_metric(run_id, turn, selection, backend)
+    return selection, next_checkpoint
+
+
 def _run(
     ms,
     question,
@@ -150,6 +278,9 @@ def _run(
     trace=None,
     rubric=None,
     index=None,
+    context_mode=None,
+    context_evaluator=None,
+    context_stats=None,
 ):
     answer = {"text": None}
     system = SYSTEM + ("\n\n" + rubric if rubric else "")
@@ -218,29 +349,16 @@ def _run(
     latest_observation = None
     turns_used = 0
     peak = 0
+    context_stats = {} if context_stats is None else context_stats
+    context_stats.setdefault("context_policy", context_mode)
+    context_stats.setdefault("context_session_id", run_id)
+    last_jev_checkpoint = object()
 
     header = (
         f"Question (asked {question_date}): {question}"
         if question_date
         else f"Question: {question}"
     )
-
-    def dynamic_view():
-        parts = []
-        if current_state:
-            parts.append("--- current state ---\n" + current_state)
-        if latest_observation:
-            obs_seq, content = latest_observation
-            recover = f"ms.expand({obs_seq}, session_id={run_id!r})"
-            prefix = "\n\n".join(parts + ["--- latest observation ---\n"])
-            limit = 4 * budget + 3
-            keep = limit - len(prefix) - len("\n-> " + recover)
-            if keep < 0:
-                raise ValueError("budget cannot hold a scoped observation handle")
-            body = content[:keep].rstrip()
-            parts.append("--- latest observation ---\n" + body + "\n-> " + recover)
-        assert est("\n\n".join(parts)) <= budget
-        return parts
 
     def record_trace(spans):
         if not trace_index:
@@ -259,13 +377,28 @@ def _run(
         for turn in range(max_turns):
             turns_used = turn + 1
             parts = [header]
-            for idx in (render_index(source_index), render_index(trace_index)):
-                if idx:
-                    parts.append(idx)
+            selection, last_jev_checkpoint = _select_agent_context(
+                source_index,
+                trace_index,
+                current_state,
+                latest_observation,
+                run_id,
+                turns_used,
+                question,
+                budget,
+                context_mode,
+                context_evaluator,
+                context_stats,
+                backend,
+                last_jev_checkpoint,
+            )
+            # The resident digest is a stable kernel summary, not part of the
+            # mutable working-view budget. It stays visible while the policy
+            # bounds indexes, state, and the latest observation below it.
             parts.append(kernel.digest())
-            dynamic = dynamic_view()
-            parts += dynamic
-            peak = max(peak, sum(est(part) for part in dynamic))
+            if selection.text:
+                parts.append(selection.text)
+            peak = max(peak, selection.selected_tokens)
             if turn == max_turns - 1:
                 parts.append("LAST TURN. You must call submit_answer(...) now.")
             prompt = "\n\n".join(parts)
@@ -290,6 +423,7 @@ def _run(
                     {
                         "turn": turns_used,
                         "prompt_tokens": est(f"{system}\n\n{prompt}"),
+                        "context": selection.as_dict(),
                         "code": code,
                         "reply_if_no_code": None if code else reply,
                     }
@@ -317,6 +451,9 @@ def _run(
                 break
 
             spans = [(reply_seq, f"exec {reply_seq}")]
+            context_stats["context_tool_calls"] = (
+                context_stats.get("context_tool_calls", 0) + 1
+            )
 
             landmark["text"] = None
             pending_states.clear()
@@ -341,6 +478,9 @@ def _run(
                 "SELECT content FROM conversation_history WHERE seq=?", (obs_seq,)
             )[0].content
             latest_observation = (obs_seq, stored)
+            context_stats["context_tool_result_tokens"] = (
+                context_stats.get("context_tool_result_tokens", 0) + est(stored)
+            )
             spans.append((obs_seq, f"obs {obs_seq}: {stored[:50]}"))
             state_seq = None
             for content in pending_states:
@@ -391,27 +531,54 @@ def run_naru(
     trace=None,
     rubric=None,
     index=None,
+    context_mode=None,
+    context_evaluator=None,
+    context_stats=None,
 ):
     """Answer one question over an already-ingested Event Log.
 
     Pass `trace=[]` to collect each turn's cell, printed observation and prompt
     size — the only way to see where turns are actually spent.
     """
+    mode = context_mode or os.environ.get("NARU_CONTEXT_POLICY") or "deterministic"
+    evaluator = context_evaluator
+    stats = context_stats if context_stats is not None else {}
+    owned_evaluator = False
+    if evaluator is None and mode in ("shadow", "jev"):
+        command = os.environ.get("NARU_JEV")
+        if command:
+            try:
+                from jev import CommandJev
+
+                evaluator = CommandJev(command)
+                owned_evaluator = True
+            except (ValueError, FileNotFoundError):
+                stats["context_jev_unavailable"] = 1
+                stats["context_fallbacks"] = stats.get("context_fallbacks", 0) + 1
+        else:
+            stats["context_jev_unavailable"] = 1
     try:
-        return _run(
-            ms,
-            question,
-            question_date,
-            backend,
-            max_turns,
-            budget,
-            verbose,
-            trace,
-            rubric,
-            index,
-        )
-    except Done:
-        return None, max_turns, 0
+        try:
+            return _run(
+                ms,
+                question,
+                question_date,
+                backend,
+                max_turns,
+                budget,
+                verbose,
+                trace,
+                rubric,
+                index,
+                mode,
+                evaluator,
+                stats,
+            )
+        except Done:
+            return None, max_turns, 0
+    finally:
+        if owned_evaluator and evaluator is not None:
+            evaluator.close()
 
 
 def demo():
@@ -479,6 +646,42 @@ def demo():
     assert "bulk: list[40]" in last, "kernel should hold the bulk result"
     assert "unrelated chatter number 39" not in last, "bulk result leaked into context"
     assert est(last) < 400, f"working view too big: {est(last)}t"
+
+    jev_surface = MemorySurface(":memory:")
+    jev_prompt = []
+    jev_seen = {}
+    jev_stats = {}
+
+    def fake_jev(state, questions):
+        jev_seen.update(state=state, questions=questions)
+        return {
+            "answers": {
+                key: {"type": "choice", "choice": "omit", "confidence": 0.95}
+                for key in questions
+            },
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+        }
+
+    def jev_backend(prompt, system=None, nudge=None):
+        jev_prompt.append(prompt)
+        return "```python\nsubmit_answer('jev done')\n```"
+
+    jev_answer, _, _ = run_naru(
+        jev_surface,
+        "Jev context test",
+        jev_backend,
+        max_turns=1,
+        budget=20,
+        index=[[{"lo": 1, "hi": 2, "headline": "secret source body", "session_id": "s"}]],
+        context_mode="jev",
+        context_evaluator=fake_jev,
+        context_stats=jev_stats,
+    )
+    assert jev_answer == "jev done"
+    assert jev_stats["context_jev_calls"] == 1
+    assert "secret source body" not in jev_prompt[0]
+    assert "content" not in json.dumps(jev_seen["state"])
+    jev_surface.close()
 
     refusal = [
         "I don't have a record of that conversation and no search tool here.",

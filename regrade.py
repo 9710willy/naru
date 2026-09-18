@@ -57,17 +57,40 @@ def main(paths, model=HAIKU, workers=6):
             new = judge(q, r.get("answer") or "", be)
             return r, new, be.usage
 
-        changed, cost = 0, 0.0
+        changed, cost, cost_measured = 0, 0.0, True
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for r, new, usage in ex.map(one, rows):
-                cost += usage.cost_usd
+                if getattr(usage, "cost_measured", True):
+                    cost += usage.cost_usd
+                else:
+                    cost_measured = False
                 if bool(r["correct"]) != new:
                     changed += 1
                 r["correct"] = new
-                r["judge_cost"] = round(usage.cost_usd, 4)
+                r["judge_cost"] = (
+                    round(usage.cost_usd, 4)
+                    if getattr(usage, "cost_measured", True)
+                    else None
+                )
                 r["judge_errors"] = usage.errors
                 r["judge_call_retries"] = usage.call_retries
                 r["judge_empty_retries"] = usage.empty_retries
+                r["task_success"] = bool(
+                    r["correct"] and not r.get("errors") and not usage.errors
+                )
+                base_cost = r.get("cost", 0)
+                r["task_cost_usd"] = (
+                    round(base_cost + r["judge_cost"], 4)
+                    if isinstance(base_cost, (int, float))
+                    and not isinstance(base_cost, bool)
+                    and isinstance(r["judge_cost"], (int, float))
+                    and not isinstance(r["judge_cost"], bool)
+                    else None
+                )
+                if hasattr(usage, "native_usage"):
+                    r["judge_provider_usage"] = dict(usage.native_usage)
+                if hasattr(usage, "normalized"):
+                    r["judge_usage_normalized"] = usage.normalized()
 
         d.setdefault("config", {})["judge_model"] = model
         d["config"]["result_format"] = RESULT_FORMAT
@@ -83,7 +106,7 @@ def main(paths, model=HAIKU, workers=6):
             )
         print(
             f"  {'':26} {changed} verdict(s) changed vs the original grading "
-            f"| ${cost:.2f}\n"
+            f"| {'$%.2f' % cost if cost_measured else 'cost unknown'}\n"
         )
 
     print("regraded files:")
@@ -132,6 +155,8 @@ def demo():
         row = result["rows"][0]
         assert row["correct"] and row["answer"] == answer
         assert row["judge_errors"] == 0 and row["judge_cost"] == 0.25
+        assert row["task_success"]
+        assert row["task_cost_usd"] == 0.25
         assert result["config"]["result_format"] == RESULT_FORMAT
         assert result["config"]["judge_model"] == HAIKU
 

@@ -97,6 +97,15 @@ def load(chat_root=BEAM_CHATS, n=None, qtype=None):
 def summary(rows):
     """Small JSON-safe totals. Per-row data stays available for audit."""
     n = len(rows)
+    costs = [
+        value
+        for row in rows
+        for value in (row.get("cost"), row.get("judge_cost"))
+    ]
+    cost_measured = all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        for value in costs
+    )
     return {
         "questions": n,
         "correct": sum(row["correct"] for row in rows),
@@ -111,7 +120,8 @@ def summary(rows):
         "mean_backend_calls": sum(row.get("backend_calls", 0) for row in rows) / n if n else 0.0,
         "billed_input": sum(row["billed_input"] for row in rows),
         "fresh_input": sum(row["fresh_input"] for row in rows),
-        "cost": round(sum(row["cost"] + row["judge_cost"] for row in rows), 4),
+        "cost": round(sum(costs), 4) if cost_measured else None,
+        "cost_measured": cost_measured,
         "errors": sum(row["errors"] + row.get("judge_errors", 0) for row in rows),
     }
 

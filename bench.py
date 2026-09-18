@@ -14,6 +14,7 @@ Reports accuracy, tokens billed, and cost for each.
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import io
 import json
 import math
@@ -26,12 +27,24 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
 
 from agent import LONGMEMEVAL_RUBRIC, run_naru
-from backend import HAIKU, Usage, get_backend, measure_floor
+from backend import (
+    BACKEND_CHOICES,
+    HAIKU,
+    Usage,
+    backend_fingerprint,
+    default_model_for_backend,
+    get_backend,
+    measure_floor,
+    resolve_backend,
+)
+from context_policy import CONTEXT_POLICIES
 from eviction import est, rollup
+from jev import CommandJev, host_stdio_evaluator
 from ms import MemorySurface
 
 # One owner for the p-value ADR 0006 publishes. noise.py had it first and
@@ -42,19 +55,43 @@ DATA = pathlib.Path(__file__).parent / "data"
 DATE_RE = re.compile(r"(\d{4})/(\d{2})/(\d{2})")
 # One owner for the arm names: main() validates against it, demo() asserts on it.
 ARMS = ("full", "rag", "naru", "rsm")
-RESULT_FORMAT = 2
+RESULT_FORMAT = 3
+
+
+class _ParentExecutor:
+    """Future-compatible thread pool for parent-owned host MCP calls."""
+
+    def __init__(self, max_workers=None):
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self._executor.__exit__(exc_type, exc_value, traceback)
+
+    def submit(self, function, *args, **kwargs) -> Future:
+        return self._executor.submit(function, *args, **kwargs)
 
 
 def backend_label(cmd):
     """Provenance for a run: the program that answered, never its arguments.
 
-    NARU_BACKEND is documented as any command reading a prompt on stdin, so it
-    can carry a credential (`sh -c 'curl -H "Authorization: Bearer ..."'`).
+    NARU_BACKEND may be any command reading a prompt on stdin, so it can carry
+    a credential (`sh -c 'curl -H "Authorization: Bearer ..."'`).
     results/published/ is committed to a public history, where rotating a key
     that already shipped does not undo it. argv[0] is all the provenance the
-    field is for — telling a `cat` run apart from a real one.
+    field is for — telling a `cat` run apart from a real one. No configured
+    command means the provider resolver chose automatically.
     """
-    return (shlex.split(cmd) or ["claude-cli"])[0] if cmd else "claude-cli"
+    return (shlex.split(cmd) or ["auto"])[0] if cmd else "auto"
+
+
+def telemetry_id(value):
+    """Stable short identifier for telemetry without copying task text."""
+    if value is None:
+        return None
+    return hashlib.sha256(str(value).encode()).hexdigest()[:16]
 
 
 def _worker_pid(_):
@@ -524,6 +561,96 @@ def build_prompt(
     return _question_prompt(q, body)
 
 
+def _result_status(be, judge_usage, error, judge_failure, correct=False):
+    """Return task status fields without treating harness errors as misses."""
+    errors = be.usage.errors + int(error is not None and not judge_failure)
+    judge_errors = (judge_usage.errors if judge_usage else 0) + int(
+        error is not None and judge_failure
+    )
+    if error is not None:
+        failure_class = "judge" if judge_failure else "harness"
+    elif be.usage.errors:
+        failure_class = "model"
+    elif judge_usage is not None and judge_usage.errors:
+        failure_class = "judge"
+    else:
+        failure_class = None
+    return {
+        "errors": errors,
+        "judge_errors": judge_errors,
+        "task_success": bool(correct and not errors and not judge_errors),
+        "failure_class": failure_class,
+    }
+
+
+def _context_result_fields(context_stats, jev_bridge):
+    """Return bounded Jev and context telemetry for one result row."""
+    usage = getattr(jev_bridge, "usage", None)
+    return {
+        "context_policy": context_stats["context_policy"],
+        "context_considered_tokens": context_stats.get(
+            "context_considered_tokens", 0
+        ),
+        "context_selected_tokens": context_stats.get("context_selected_tokens", 0),
+        "context_dropped_tokens": context_stats.get("context_dropped_tokens", 0),
+        "context_peak_selected_tokens": context_stats.get(
+            "context_peak_selected_tokens", 0
+        ),
+        "context_selected_blocks": context_stats.get("context_selected_blocks", []),
+        "context_omitted_blocks": context_stats.get("context_omitted_blocks", []),
+        "context_jev_calls": context_stats.get("context_jev_calls", 0),
+        "context_jev_attempts": getattr(
+            usage, "attempts", context_stats.get("context_jev_calls", 0)
+        ),
+        "context_jev_input_tokens": context_stats.get(
+            "context_jev_input_tokens", 0
+        ),
+        "context_jev_cache_read_tokens": context_stats.get(
+            "context_jev_cache_read_tokens", 0
+        ),
+        "context_jev_cache_write_tokens": context_stats.get(
+            "context_jev_cache_write_tokens", 0
+        ),
+        "context_jev_output_tokens": context_stats.get(
+            "context_jev_output_tokens", 0
+        ),
+        "context_jev_latency_ms": round(
+            context_stats.get("context_jev_latency_ms", 0.0), 3
+        ),
+        "context_jev_startup_latency_ms": round(
+            getattr(usage, "startup_latency_ms", 0.0), 3
+        ),
+        "context_jev_provider_latency_ms": round(
+            getattr(usage, "provider_latency_ms", 0.0), 3
+        ),
+        "context_jev_transport_overhead_ms": round(
+            max(
+                0.0,
+                getattr(usage, "latency_ms", 0.0)
+                - getattr(usage, "provider_latency_ms", 0.0),
+            ),
+            3,
+        ),
+        "context_jev_transport": getattr(usage, "transport", None),
+        "context_jev_errors": context_stats.get("context_jev_errors", 0),
+        "context_fallbacks": context_stats.get("context_fallbacks", 0),
+        "context_jev_unavailable": context_stats.get(
+            "context_jev_unavailable", 0
+        ),
+        "tool_call_count": context_stats.get("context_tool_calls", 0),
+        "tool_result_tokens": context_stats.get("context_tool_result_tokens", 0),
+        "model_switch": False,
+        "subagent_call_count": 0,
+        "cost_includes_jev": not bool(context_stats.get("context_jev_calls")),
+        "jev_provider_usage": dict(getattr(usage, "native_usage", {})),
+        "jev_usage": (
+            usage.as_dict()
+            if usage is not None and hasattr(usage, "as_dict")
+            else {}
+        ),
+    }
+
+
 def one(
     q,
     arm,
@@ -541,10 +668,31 @@ def one(
     rsm_budget=4000,
     rsm_argv=None,
     trace=None,
+    context_policy="deterministic",
+    jev_command=None,
+    jev_evaluator=None,
 ):
     """Run a single question through one arm. Returns a result record."""
     be = get_backend(model)
     t0 = time.time()
+    context_stats = {
+        "context_policy": context_policy if arm == "naru" else "not_applicable"
+    }
+    jev_bridge = None
+    owns_jev_bridge = False
+    if arm == "naru" and context_policy in ("shadow", "jev"):
+        if jev_evaluator is not None:
+            jev_bridge = jev_evaluator
+        elif jev_command or os.environ.get("NARU_JEV"):
+            configured = jev_command or os.environ.get("NARU_JEV")
+            try:
+                jev_bridge = CommandJev(configured)
+                owns_jev_bridge = True
+            except (ValueError, FileNotFoundError):
+                context_stats["context_jev_unavailable"] = 1
+                context_stats["context_fallbacks"] = 1
+        else:
+            context_stats["context_jev_unavailable"] = 1
 
     def result(
         answer, turns, peak, correct=False, judge_backend=None, error=None,
@@ -552,10 +700,40 @@ def one(
     ):
         candidate = (answer or "").strip()[:2000]
         judge_usage = judge_backend.usage if judge_backend is not None else None
+        model_usage = be.usage.normalized()
+        judge_normalized = (
+            judge_usage.normalized()
+            if judge_usage is not None and hasattr(judge_usage, "normalized")
+            else {}
+        )
+        model_cost = (
+            round(be.usage.cost_usd, 4) if be.usage.cost_measured else None
+        )
+        judge_cost = (
+            round(judge_usage.cost_usd, 4)
+            if judge_usage is not None and judge_usage.cost_measured
+            else None
+        )
+        cost_measured = be.usage.cost_measured and (
+            judge_usage is None or judge_usage.cost_measured
+        )
+        status = _result_status(
+            be, judge_usage, error, judge_failure, correct=correct
+        )
         row = {
+            "task_id": telemetry_id(q["question_id"]),
+            "session_id": context_stats.get("context_session_id") if arm == "naru" else None,
+            "turn_id": None,
+            "model": model,
             "qid": q["question_id"],
             "type": q["question_type"],
             "arm": arm,
+            "backend": getattr(be, "label", model),
+            "judge_backend": (
+                getattr(judge_backend, "label", judge_model)
+                if judge_backend is not None
+                else None
+            ),
             "correct": correct,
             "gold": q["answer"],
             "answer": (
@@ -573,19 +751,44 @@ def one(
             "cache_creation": be.usage.cache_creation,
             "cache_read": be.usage.cache_read,
             "output": be.usage.output_tokens,
-            "cost": round(be.usage.cost_usd, 4),
-            "judge_cost": round(judge_usage.cost_usd, 4) if judge_usage else 0,
-            "errors": be.usage.errors + int(error is not None and not judge_failure),
-            "judge_errors": (judge_usage.errors if judge_usage else 0)
-            + int(error is not None and judge_failure),
+            "cost": model_cost,
+            "judge_cost": judge_cost,
+            "errors": status["errors"],
+            "judge_errors": status["judge_errors"],
             "call_retries": be.usage.call_retries,
             "empty_retries": be.usage.empty_retries,
+            "latency_ms": round((time.time() - t0) * 1000, 3),
+            "pricing_version": os.environ.get("NARU_PRICING_VERSION") or None,
+            "task_cost_usd": (
+                round(
+                    be.usage.cost_usd
+                    + (judge_usage.cost_usd if judge_usage else 0),
+                    4,
+                )
+                if cost_measured
+                else None
+            ),
+            "provider_usage": dict(getattr(be.usage, "native_usage", {})),
+            "judge_provider_usage": dict(
+                getattr(judge_usage, "native_usage", {})
+            ),
         }
+        row.update(status)
+        row.update(_context_result_fields(context_stats, jev_bridge))
+        row.update(model_usage)
+        if judge_normalized:
+            row["judge_usage_normalized"] = judge_normalized
         if trace is not None:
             row["trace"] = trace
         if error is not None and judge_failure:
             row["judge_error"] = f"HARNESS: {error}"
         row.update(rsm)
+        if owns_jev_bridge and jev_bridge is not None:
+            jev_bridge.close()
+        for backend_instance in (be, judge_backend):
+            close = getattr(backend_instance, "close", None)
+            if callable(close):
+                close()
         return row
 
     rsm = {}
@@ -604,6 +807,9 @@ def one(
                     trace=trace,
                     rubric=LONGMEMEVAL_RUBRIC if rubric else None,
                     index=index,
+                    context_mode=context_policy,
+                    context_evaluator=jev_bridge,
+                    context_stats=context_stats,
                 )
             finally:
                 discard_log(ms)
@@ -656,7 +862,7 @@ def wilson(k, n, z=1.96):
 def report(rows, label, floor, measured=True):
     """Print one arm's results. `measured` is the backend's own reports_tokens:
     a generic pipe never touches the token counters, so billed-in and cost are
-    zeros that would otherwise read as measurements."""
+    reported as not measurable rather than as zero."""
     if not rows:
         return
     n = len(rows)
@@ -676,9 +882,25 @@ def report(rows, label, floor, measured=True):
         if floor is None
         else sum(max(0, r["billed_input"] - floor * r["turns"]) for r in rows)
     )
-    model_cost = sum(r["cost"] for r in rows)
-    judge_cost = sum(r["judge_cost"] for r in rows)
+    cost_measured = all(
+        isinstance(r.get("cost"), (int, float))
+        and not isinstance(r.get("cost"), bool)
+        and isinstance(r.get("judge_cost"), (int, float))
+        and not isinstance(r.get("judge_cost"), bool)
+        for r in rows
+    )
+    model_cost = sum(r["cost"] for r in rows) if cost_measured else 0
+    judge_cost = sum(r["judge_cost"] for r in rows) if cost_measured else 0
     cost = model_cost + judge_cost
+    successful = sum(
+        bool(
+            r.get(
+                "task_success",
+                r.get("correct") and not r.get("errors") and not r.get("judge_errors"),
+            )
+        )
+        for r in rows
+    )
     bar = "#" * round(acc * 28) + "." * (28 - round(acc * 28))
     lo, hi = wilson(n_correct, n)
     # The interval is printed on the same line as the accuracy on purpose. A
@@ -712,7 +934,11 @@ def report(rows, label, floor, measured=True):
     print(
         f"           out {sum(r['output'] for r in rows) / n:>7,.0f}/q   "
         f"turns {sum(r['turns'] for r in rows) / n:>4.1f}   calls {calls:>4.1f}   "
-        + (f"${cost:.2f} total" if measured else "cost not measurable")
+        + (
+            f"${cost:.2f} total"
+            if measured and cost_measured
+            else "cost not measurable"
+        )
     )
     print(
         f"           prompt-est total {prompt_total:>8,.0f}t/q   "
@@ -723,7 +949,7 @@ def report(rows, label, floor, measured=True):
             f"           dynamic-view peak "
             f"{sum(r['peak_view_tokens'] for r in rows) / n:>6,.0f}t/q"
         )
-    if measured:
+    if measured and cost_measured:
         # The arm's own dollars, and the cache share that makes a token ratio
         # and a money ratio disagree. Both are published columns; printing
         # only a combined total left them hand-computed and unreproducible.
@@ -733,6 +959,25 @@ def report(rows, label, floor, measured=True):
             f"judge ${judge_cost / n:.4f}/q   "
             f"cache-read {100 * cr / max(1, bi):.0f}% of billed input"
         )
+        task_costs = [r.get("task_cost_usd") for r in rows]
+        if successful and all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in task_costs
+        ):
+            task_total = sum(task_costs)
+            suffix = (
+                " (Jev cost omitted; wall overhead measured)"
+                if any(r.get("context_jev_calls") for r in rows)
+                else ""
+            )
+            print(
+                f"           task cost / successful task "
+                f"${task_total / successful:.4f}{suffix}  ({successful}/{n} successful)"
+            )
+        elif successful:
+            print("           task cost / successful task not measurable")
+        else:
+            print("           task cost / successful task not measurable (0 successes)")
     if label == "rsm":
         selected = sum(r.get("rsm_selected_members", 0) for r in rows) / n
         source = sum(r.get("rsm_context_tokens", 0) for r in rows) / n
@@ -746,6 +991,21 @@ def report(rows, label, floor, measured=True):
             f"source {source:.0f}t/q"
         )
         print("           model cost excludes embedding-provider cost")
+    if label == "naru":
+        selected = sum(r.get("context_selected_tokens", 0) for r in rows) / n
+        dropped = sum(r.get("context_dropped_tokens", 0) for r in rows) / n
+        jev_calls = sum(r.get("context_jev_calls", 0) for r in rows)
+        jev_fallbacks = sum(r.get("context_fallbacks", 0) for r in rows)
+        jev_latency = sum(r.get("context_jev_latency_ms", 0) for r in rows)
+        jev_startup = sum(
+            r.get("context_jev_startup_latency_ms", 0) for r in rows
+        )
+        print(
+            f"           context selected {selected:,.0f}t/q  "
+            f"dropped {dropped:,.0f}t/q  Jev calls {jev_calls}  "
+            f"fallbacks {jev_fallbacks}  "
+            f"Jev wall {jev_latency:,.1f}ms  startup {jev_startup:,.1f}ms"
+        )
     errs = sum(r["errors"] for r in rows)
     cretries = sum(r.get("call_retries", 0) for r in rows)
     # Rows written before judge_errors existed have no such key. Summing them
@@ -884,12 +1144,31 @@ def main():
     ap.add_argument(
         "--rsm-budget", type=int, default=4000, help="RSM packed-context token budget"
     )
-    ap.add_argument("--model", default=HAIKU)
-    ap.add_argument("--judge-model", default=HAIKU)
+    ap.add_argument(
+        "--model",
+        default=None,
+        help="answerer model; defaults to the resolved provider's configured model",
+    )
+    ap.add_argument(
+        "--judge-model",
+        default=None,
+        help="judge model; defaults to the answerer model",
+    )
     ap.add_argument("--max-turns", type=int, default=8)
     ap.add_argument("--budget", type=int, default=6000)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--qtype", default=None)
+    ap.add_argument(
+        "--backend",
+        choices=BACKEND_CHOICES,
+        default="auto",
+        help="main and judge runtime; auto prefers Codex, then Claude",
+    )
+    ap.add_argument(
+        "--backend-command",
+        default=None,
+        help="stdin provider command when --backend command is selected",
+    )
     ap.add_argument(
         "--harness-floor",
         type=int,
@@ -906,15 +1185,64 @@ def main():
         action="store_true",
         help="ablate the ingestion-time eviction index (CLAUDE.md, ADR 0003)",
     )
+    ap.add_argument(
+        "--context-policy",
+        choices=CONTEXT_POLICIES,
+        default=os.environ.get("NARU_CONTEXT_POLICY", "deterministic"),
+        help=(
+            "Naru mutable-context policy; Jev modes require --jev-command, "
+            "NARU_JEV, or --jev-host-stdio"
+        ),
+    )
+    ap.add_argument(
+        "--jev-command",
+        default=None,
+        help="JSON stdin/stdout adapter for mcp__jev__evaluate",
+    )
+    ap.add_argument(
+        "--jev-host-stdio",
+        action="store_true",
+        help="broker Jev requests through the host MCP binding on stdin",
+    )
     a = ap.parse_args()
+    if a.backend_command and a.backend != "command":
+        sys.exit("--backend-command requires --backend command")
+    try:
+        backend_kind, backend_command = resolve_backend(
+            a.backend, a.backend_command, model=a.model
+        )
+    except (ValueError, FileNotFoundError) as error:
+        sys.exit(str(error))
+    # Workers inherit one resolved provider. Keep the environment bridge for
+    # existing callers, while the resolver gives the CLI a general boundary.
+    os.environ["NARU_BACKEND"] = backend_command or backend_kind
+    a.model = a.model or default_model_for_backend(backend_kind)
+    a.judge_model = a.judge_model or a.model
+    if a.jev_host_stdio:
+        if a.context_policy not in ("shadow", "jev"):
+            sys.exit("--jev-host-stdio requires --context-policy shadow or jev")
+        if a.jev_command or os.environ.get("NARU_JEV"):
+            sys.exit(
+                "--jev-host-stdio cannot be combined with --jev-command or NARU_JEV"
+            )
+        print(
+            "host MCP Jev mode: model jobs use a parent thread pool; Jev requests "
+            "are serialized",
+            file=sys.stderr,
+        )
 
     # A typo'd arm would otherwise run as `full` and quietly corrupt the run.
-    # Checked before the backend is touched and before a 277MB split is read,
-    # so a typo costs nothing.
+    # Checked before the data split is read or any paid model call is made, so
+    # a typo costs nothing.
     arms = a.arms.split(",")
     unknown = unknown_arms(arms)
     if unknown:
         sys.exit(f"unknown arm(s): {unknown} — pick from {', '.join(ARMS)}")
+    if a.context_policy not in CONTEXT_POLICIES:
+        sys.exit(
+            f"unknown context policy {a.context_policy!r} — pick from "
+            f"{', '.join(CONTEXT_POLICIES)}"
+        )
     if len(set(arms)) != len(arms):
         sys.exit("--arms must not contain duplicates")
     # SQLite reads a negative LIMIT as NO limit, so --rag-k -1 pastes the whole
@@ -931,6 +1259,13 @@ def main():
         sys.exit(f"--rsm-chunk-turns must be >= 1, got {a.rsm_chunk_turns}")
     if a.rsm_budget < 1:
         sys.exit(f"--rsm-budget must be >= 1, got {a.rsm_budget}")
+    if a.context_policy != "deterministic" and not (
+        a.jev_command or os.environ.get("NARU_JEV") or a.jev_host_stdio
+    ):
+        print(
+            f"context policy {a.context_policy!r} requested without a Jev adapter; "
+            "Naru will use deterministic fallback"
+        )
     rsm_argv = None
     if "rsm" in arms:
         try:
@@ -938,20 +1273,25 @@ def main():
         except (ValueError, FileNotFoundError) as e:
             sys.exit(str(e))
 
-    measured = get_backend(a.model).reports_tokens
+    probe_backend = get_backend(a.model)
+    try:
+        measured = probe_backend.reports_tokens
+    finally:
+        probe_backend.close()
     if a.harness_floor is None:
         a.harness_floor = measure_floor(a.model)
         if a.harness_floor is None:
             print(
                 "harness floor NOT measurable with this backend — token columns "
-                "will read as zero and net-of-harness is omitted, not reported as 0"
+                "are marked not measurable and net-of-harness is omitted"
             )
         else:
             print(f"measured harness floor: {a.harness_floor:,} input tok/call")
 
     qs = load(a.split, a.n, qtype=a.qtype)
     print(
-        f"LongMemEval-{a.split}  n={len(qs)}  arms={arms}  model={a.model}  "
+        f"LongMemEval-{a.split}  n={len(qs)}  arms={arms}  "
+        f"backend={backend_kind}  model={a.model}  "
         f"judge={a.judge_model}  budget={a.budget}t  max_turns={a.max_turns}"
     )
     avg_hist = sum(est(history_text(q)) for q in qs) / len(qs)
@@ -959,7 +1299,9 @@ def main():
 
     jobs = [(q, arm) for arm in arms for q in qs]
     rows = []
-    with ProcessPoolExecutor(max_workers=a.workers) as ex:
+    host_jev = host_stdio_evaluator() if a.jev_host_stdio else None
+    executor = _ParentExecutor if a.jev_host_stdio else ProcessPoolExecutor
+    with executor(max_workers=a.workers) as ex:
         futs = {
             ex.submit(
                 one,
@@ -980,6 +1322,15 @@ def main():
                 rsm_chunk_turns=a.rsm_chunk_turns,
                 rsm_budget=a.rsm_budget,
                 rsm_argv=rsm_argv,
+                context_policy=a.context_policy,
+                jev_command=a.jev_command,
+                jev_evaluator=(
+                    host_jev
+                    if a.jev_host_stdio
+                    and arm == "naru"
+                    and a.context_policy in ("shadow", "jev")
+                    else None
+                ),
             ): (q, arm)
             for q, arm in jobs
         }
@@ -989,9 +1340,17 @@ def main():
             except Exception as e:
                 q, arm = futs[f]
                 r = {
+                    "task_id": telemetry_id(q["question_id"]),
+                    "session_id": None,
+                    "turn_id": None,
+                    "model": a.model,
                     "qid": q["question_id"],
                     "type": q["question_type"],
                     "arm": arm,
+                    "backend": backend_label(os.environ.get("NARU_BACKEND")),
+                    "judge_backend": backend_label(
+                        os.environ.get("NARU_BACKEND")
+                    ),
                     "correct": False,
                     "gold": q["answer"],
                     "answer": f"HARNESS: {e}",
@@ -1003,11 +1362,50 @@ def main():
                     "seconds": 0,
                     "billed_input": 0,
                     "fresh_input": 0,
+                    "cache_creation": 0,
+                    "cache_read": 0,
                     "output": 0,
                     "cost": 0,
                     "judge_cost": 0,
                     "errors": 1,
                     "judge_errors": 0,
+                    "call_retries": 0,
+                    "empty_retries": 0,
+                    "context_policy": a.context_policy if arm == "naru" else "not_applicable",
+                    "context_considered_tokens": 0,
+                    "context_selected_tokens": 0,
+                    "context_dropped_tokens": 0,
+                    "context_peak_selected_tokens": 0,
+                    "context_selected_blocks": [],
+                    "context_omitted_blocks": [],
+                    "context_jev_calls": 0,
+                    "context_jev_attempts": 0,
+                    "context_jev_input_tokens": 0,
+                    "context_jev_cache_read_tokens": 0,
+                    "context_jev_cache_write_tokens": 0,
+                    "context_jev_output_tokens": 0,
+                    "context_jev_latency_ms": 0,
+                    "context_jev_startup_latency_ms": 0,
+                    "context_jev_provider_latency_ms": 0,
+                    "context_jev_transport_overhead_ms": 0,
+                    "context_jev_transport": None,
+                    "context_jev_errors": 0,
+                    "context_fallbacks": 0,
+                    "context_jev_unavailable": 0,
+                    "tool_call_count": 0,
+                    "tool_result_tokens": 0,
+                    "model_switch": False,
+                    "subagent_call_count": 0,
+                    "latency_ms": 0,
+                    "task_success": False,
+                    "failure_class": "harness",
+                    "pricing_version": os.environ.get("NARU_PRICING_VERSION") or None,
+                    "task_cost_usd": 0,
+                    "cost_includes_jev": True,
+                    "provider_usage": {},
+                    "judge_provider_usage": {},
+                    "jev_provider_usage": {},
+                    "jev_usage": {},
                 }
                 if arm == "rsm":
                     r.update(
@@ -1026,6 +1424,8 @@ def main():
                 end="",
                 flush=True,
             )
+    if host_jev is not None:
+        host_jev.close()
     print()
 
     for arm in arms:
@@ -1034,14 +1434,31 @@ def main():
 
     out = DATA.parent / "results" / f"{a.tag}_{a.split}_n{len(qs)}.json"
     out.parent.mkdir(exist_ok=True)
-    # vars(a) records --model even when NARU_BACKEND replaced it, which made a
-    # `NARU_BACKEND=cat` run byte-identical to a real Haiku run that cost
-    # nothing. Stamp what actually answered, and whether the numbers are real.
+    # vars(a) records the requested settings. Stamp the provider that actually
+    # answered, and keep it separate from the model name for auditability.
     cfg = dict(vars(a))
     cfg["result_format"] = RESULT_FORMAT
+    cfg["resolved_backend"] = backend_kind
     cfg["backend"] = backend_label(os.environ.get("NARU_BACKEND"))
+    cfg["backend_fingerprint"] = backend_fingerprint(
+        backend_kind, backend_command
+    )
+    cfg["judge_resolved_backend"] = backend_kind
+    cfg["judge_backend"] = backend_label(os.environ.get("NARU_BACKEND"))
+    cfg["judge_backend_fingerprint"] = backend_fingerprint(
+        backend_kind, backend_command
+    )
+    # Command arguments can carry credentials. Keep only the safe executable
+    # label in result metadata and the one-way fingerprint above.
+    cfg["backend_command"] = (
+        backend_label(backend_command) if backend_command else None
+    )
+    cfg["jev_command"] = backend_label(
+        a.jev_command or os.environ.get("NARU_JEV")
+    ) if (a.jev_command or os.environ.get("NARU_JEV")) else None
     cfg["rsm_embedder"] = rsm_argv[0] if rsm_argv else None
     cfg["tokens_measured"] = measured
+    cfg["pricing_version"] = os.environ.get("NARU_PRICING_VERSION") or None
     cfg["prompt_tokens_estimated"] = True
     json.dump({"config": cfg, "rows": rows}, open(out, "w"), indent=1)
     print(f"\nwrote {out}")
@@ -1247,6 +1664,12 @@ def demo():
     assert saved["prompt_tokens_estimated"] == expected_prompt
     assert saved["peak_prompt_tokens_estimated"] == expected_prompt
     assert saved["backend_calls"] == 1 and saved["peak_view_tokens"] == 0
+    assert saved["task_id"] == "b3cc0475bb78a502" and saved["turn_id"] is None
+    assert saved["model"] == HAIKU and saved["context_policy"] == "not_applicable"
+    assert saved["backend"] == "cat" and saved["judge_backend"] == "cat"
+    assert saved["context_input_tokens"] == expected_prompt
+    assert saved["context_input_tokens_source"] == "estimated_prompt_chars_per_4"
+    assert "provider_usage" in saved and "failure_class" in saved
 
     class KnownUsageBackend:
         def __init__(self):
@@ -1293,6 +1716,9 @@ def demo():
     with ProcessPoolExecutor(max_workers=2) as ex:
         worker_pids = list(ex.map(_worker_pid, range(4)))
     assert all(pid != os.getpid() for pid in worker_pids), worker_pids
+    with _ParentExecutor(max_workers=4) as ex:
+        parent_future = ex.submit(lambda: "parent result")
+    assert parent_future.result() == "parent result"
 
     # RSM groups chronological Event Log chunks by atom. The query ranks the
     # later alpha chunk first, but the packer must restore seq order inside
@@ -1464,8 +1890,8 @@ def demo():
     leaky = "sh -c 'curl -H \"Authorization: Bearer sk-secret\"'"
     assert backend_label(leaky) == "sh", backend_label(leaky)
     assert "sk-secret" not in backend_label(leaky)
-    assert backend_label(None) == "claude-cli"
-    assert backend_label("   ") == "claude-cli", "blank must not IndexError"
+    assert backend_label(None) == "auto"
+    assert backend_label("   ") == "auto", "blank must not IndexError"
     assert backend_label("cat") == "cat"
     # arms sharing no question ids must say so rather than divide by zero
     disjoint = rows_for("full", 2, 3) + [
@@ -1522,6 +1948,36 @@ def demo():
         env={**embed_env, "NARU_BACKEND": "definitely-not-a-real-backend"},
     )
     assert r.returncode != 0 and "unknown arm" in r.stderr, (r.returncode, r.stderr)
+    command_env = dict(os.environ)
+    command_env.pop("NARU_BACKEND", None)
+    r = subprocess.run(
+        [
+            sys.executable,
+            __file__,
+            "--backend",
+            "command",
+            "--backend-command",
+            "cat",
+            "--arms",
+            "nauru",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=command_env,
+    )
+    assert r.returncode != 0 and "unknown arm" in r.stderr, (r.returncode, r.stderr)
+    r = subprocess.run(
+        [sys.executable, __file__, "--backend", "command", "--arms", "nauru"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=command_env,
+    )
+    assert r.returncode != 0 and "requires --backend-command" in r.stderr, (
+        r.returncode,
+        r.stderr,
+    )
 
     print(
         "ok — bench checks passed "

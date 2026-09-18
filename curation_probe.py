@@ -83,12 +83,14 @@ def score(case, answer):
 
 
 def usage_dict(usage):
+    measured = getattr(usage, "cost_measured", True)
     return {
         "attempts": usage.attempts,
         "calls": usage.calls,
         "billed_input": usage.billed_input,
         "output_tokens": usage.output_tokens,
-        "cost_usd": usage.cost_usd,
+        "cost_usd": usage.cost_usd if measured else None,
+        "cost_measured": measured,
         "prompt_tokens_estimated": usage.prompt_tokens_estimated,
         "peak_prompt_tokens_estimated": usage.peak_prompt_tokens_estimated,
         "errors": usage.errors,
@@ -112,6 +114,10 @@ def run_arm(case, arm, doc, model, backend_factory):
 
 
 def summarize(rows):
+    def cost_total(selected, arm):
+        costs = [row[arm]["usage"]["cost_usd"] for row in selected]
+        return None if any(value is None for value in costs) else sum(costs)
+
     out = {}
     for kind in ("fact", "control", "all"):
         selected = (
@@ -138,12 +144,8 @@ def summarize(rows):
             "naru_errors": sum(row["naru"]["usage"]["errors"] for row in selected),
             "plain_seconds": sum(row["plain"]["seconds"] for row in selected),
             "naru_seconds": sum(row["naru"]["seconds"] for row in selected),
-            "plain_cost_usd": sum(
-                row["plain"]["usage"]["cost_usd"] for row in selected
-            ),
-            "naru_cost_usd": sum(
-                row["naru"]["usage"]["cost_usd"] for row in selected
-            ),
+            "plain_cost_usd": cost_total(selected, "plain"),
+            "naru_cost_usd": cost_total(selected, "naru"),
             "plain_prompt_tokens_estimated": sum(
                 row["plain"]["usage"]["prompt_tokens_estimated"] for row in selected
             ),
@@ -203,12 +205,22 @@ def print_summary(result):
             )
     print(f"harmful carryover: {result['summary']['harmful_carryover']}")
     totals = result["summary"]["all"]
+    plain_cost = (
+        "unknown"
+        if totals["plain_cost_usd"] is None
+        else f"${totals['plain_cost_usd']:.4f}"
+    )
+    naru_cost = (
+        "unknown"
+        if totals["naru_cost_usd"] is None
+        else f"${totals['naru_cost_usd']:.4f}"
+    )
     print(
         "resources: "
         f"plain {totals['plain_prompt_tokens_estimated']:,} estimated prompt tokens, "
-        f"${totals['plain_cost_usd']:.4f}, {totals['plain_seconds']:.1f}s  "
+        f"{plain_cost}, {totals['plain_seconds']:.1f}s  "
         f"naru {totals['naru_prompt_tokens_estimated']:,} estimated prompt tokens, "
-        f"${totals['naru_cost_usd']:.4f}, {totals['naru_seconds']:.1f}s"
+        f"{naru_cost}, {totals['naru_seconds']:.1f}s"
     )
 
 

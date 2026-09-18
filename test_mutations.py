@@ -41,6 +41,9 @@ COPY = (
     "curation_probe.py",
     "regrade.py",
     "beam.py",
+    "context_policy.py",
+    "jev.py",
+    "experiment.py",
 )
 
 ISOLATION_MUTATIONS = [
@@ -63,6 +66,142 @@ ISOLATION_MUTATIONS = [
 # change behaviour here and is reported n/a rather than counted a survivor.
 MUTATIONS = ISOLATION_MUTATIONS + [
     (
+        "context policy drops the recovery handle",
+        "context_policy.py",
+        '        if self.recovery:\n            body += "\\n-> " + self.recovery',
+        '        if False:\n            body += "\\n-> " + self.recovery',
+    ),
+    (
+        "low-confidence Jev choices change context",
+        "context_policy.py",
+        '                    if answer and answer["confidence"] >= MIN_JEV_CONFIDENCE:',
+        '                    if answer and answer["confidence"] <= MIN_JEV_CONFIDENCE:',
+    ),
+    (
+        "metadata evaluator receives raw block content",
+        "context_policy.py",
+        '            "token_count": self.token_count,\n            "provenance":',
+        '            "token_count": self.token_count,\n            "content": self.content,\n            "provenance":',
+    ),
+    (
+        "malformed Jev response bypasses deterministic fallback",
+        "context_policy.py",
+        "        except Exception as error:\n            jev_errors = 1",
+        "        except Exception as error:\n            raise",
+    ),
+    (
+        "trace index consumes the mutable context budget",
+        "context_policy.py",
+        "        (i, block) for i, block in enumerate(blocks) if not block.budgeted",
+        "        (i, block) for i, block in enumerate(blocks) if False",
+    ),
+    (
+        "Jev bridge accepts an untyped response",
+        "jev.py",
+        '    if isinstance(value.get("answers"), dict):',
+        "    if True:",
+    ),
+    (
+        "regrade leaves task success stale",
+        "regrade.py",
+        (
+            '                r["task_success"] = bool(\n'
+            '                    r["correct"] and not r.get("errors") and not usage.errors\n'
+            "                )"
+        ),
+        '                r["task_success"] = False',
+    ),
+    (
+        "regrade leaves task cost stale",
+        "regrade.py",
+        '                base_cost = r.get("cost", 0)',
+        '                base_cost = None',
+    ),
+    (
+        "agent context metrics record prompt payloads",
+        "metrics.py",
+        '        "fallback_reason",\n    )',
+        '        "fallback_reason",\n        "prompt",\n    )',
+    ),
+    (
+        "Jev bridge leaks command stderr",
+        "jev.py",
+        '            raise JevError("command_failed")',
+        "            raise JevError(process.stderr)",
+    ),
+    (
+        "persistent Jev pays startup per decision",
+        "jev.py",
+        "        if process is None or process.poll() is not None:",
+        "        if True:",
+    ),
+    (
+        "Jev bridge accepts an MCP error result",
+        "jev.py",
+        '    if value.get("isError") is True:',
+        "    if False:",
+    ),
+    (
+        "MCP JSON-RPC result is not decoded",
+        "jev.py",
+        '    if "result" in value and value.get("result") is not None:',
+        "    if False:",
+    ),
+    (
+        "host Jev bridge loses its request marker",
+        "jev.py",
+        '        output_stream.write(f"\\n{prefix}{encoded}\\n")',
+        "        output_stream.write(encoded)",
+    ),
+    (
+        "Jev ignores its input-size safety cap",
+        "context_policy.py",
+        "        and jev_request_tokens <= JEV_INPUT_TOKEN_BUDGET\n",
+        "        and True\n",
+    ),
+    (
+        "telemetry copies task identifiers",
+        "bench.py",
+        '    return hashlib.sha256(str(value).encode()).hexdigest()[:16]',
+        "    return str(value)",
+    ),
+    (
+        "first Jev checkpoint is skipped",
+        "agent.py",
+        "    last_jev_checkpoint = object()",
+        "    last_jev_checkpoint = None",
+    ),
+    (
+        "normalized usage loses cache reads",
+        "backend.py",
+        '            "cache_read_tokens": self.cache_read,',
+        '            "cache_read_tokens": 0,',
+    ),
+    (
+        "Jev usage loses cache reads",
+        "jev.py",
+        '            "cache_read_tokens": self.cache_read_tokens,',
+        '            "cache_read_tokens": 0,',
+    ),
+    (
+        "paired experiment accepts different question sets",
+        "experiment.py",
+        '    if set(left) != set(right):',
+        "    if False:",
+    ),
+    (
+        "paired experiment trusts unmeasured provider cost",
+        "experiment.py",
+        '    return bool(run["config"].get("tokens_measured") is True) and all(',
+        "    return bool(True) and all(",
+    ),
+    (
+        "paired experiment omits Jev cost from adoption",
+        "experiment.py",
+        '    if calls and not row.get("cost_includes_jev", False):',
+        "    if False:",
+    ),
+    (
         "rag falls through to full",
         "bench.py",
         'if arm == "rag":\n        ms, _ = ingest(q, build_index=False, db=":memory:")',
@@ -71,7 +210,7 @@ MUTATIONS = ISOLATION_MUTATIONS + [
     (
         "benchmark jobs share process stdout",
         "bench.py",
-        "from concurrent.futures import ProcessPoolExecutor, as_completed",
+        "from concurrent.futures import Future, ProcessPoolExecutor, as_completed",
         (
             "from concurrent.futures import ThreadPoolExecutor as "
             "ProcessPoolExecutor, as_completed"
@@ -170,8 +309,8 @@ MUTATIONS = ISOLATION_MUTATIONS + [
     (
         "run config records the backend's arguments",
         "bench.py",
-        'return (shlex.split(cmd) or ["claude-cli"])[0] if cmd else "claude-cli"',
-        'return cmd if cmd else "claude-cli"',
+        'return (shlex.split(cmd) or ["auto"])[0] if cmd else "auto"',
+        'return cmd if cmd else "auto"',
     ),
     (
         "prompt estimates omit the system text",
@@ -604,6 +743,9 @@ def selfcheck_command(target):
         "backend.py": ["backend.py", "--selfcheck"],
         "regrade.py": ["regrade.py", "--selfcheck"],
         "beam.py": ["beam.py", "--selfcheck"],
+        "context_policy.py": ["context_policy.py"],
+        "jev.py": ["jev.py"],
+        "experiment.py": ["experiment.py", "--selfcheck"],
     }.get(target, ["bench.py", "--selfcheck"])
 
 
